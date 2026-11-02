@@ -679,6 +679,7 @@ def snapshots(metas: list[dict]) -> list[dict]:
     rows = [snapshot(m, slurm) for m in metas]
     by_id = {r["id"]: r for r in rows}
     for row in rows:
+        row["after_names"] = [(by_id.get(d) or read_json(_file(d, ".json"), {}) or {}).get("name", d) for d in row["after"]]
         if row["status"] == "waiting":
             deps = [by_id.get(d) or snapshot_or_none(d, slurm) for d in row["after"]]
             row["waiting_for"] = [f"{d['name']}" + ("" if d["status"] in ACTIVE else f" ({d['status']})")
@@ -777,21 +778,21 @@ def fmt_progress(row: dict) -> str:
     return stage + fmt_count(row["done"])
 
 
-def chained(rows: list[dict]):
-    """(row, depth) with follow-up jobs (--after) right below the job they wait for."""
-    ids = {r["id"] for r in rows}
-    children: dict[str | None, list[dict]] = {}
-    for r in rows:
-        parent = next((d for d in r.get("after") or [] if d in ids), None)
-        children.setdefault(parent, []).append(r)
+def dependency_order(rows: list[dict]) -> list[dict]:
+    """Rows in their order, except that every job comes after the listed jobs it waits for (--after)."""
+    by_id, placed, ordered = {r["id"]: r for r in rows}, set(), []
 
-    def walk(r, depth):
-        yield r, depth
-        for child in children.get(r["id"], []):
-            yield from walk(child, depth + 1)
+    def place(row):
+        if row["id"] not in placed:
+            placed.add(row["id"])
+            for dep in row.get("after") or []:
+                if dep in by_id:
+                    place(by_id[dep])
+            ordered.append(row)
 
-    for root in children.get(None, []):
-        yield from walk(root, 0)
+    for row in rows:
+        place(row)
+    return ordered
 
 
 def visible(row: dict, days: float | None) -> bool:
@@ -926,20 +927,19 @@ def cmd_ls(args) -> int:
                       "finishing" if r.get("finishing") else fmt_eta(r["eta"]), fmt_duration(r["elapsed_s"]), where))
 
     by_name = {g["name"]: g for g in groups}
-    for r, depth in chained([r for r in rows if not r.get("group") or r["group"] in by_name]):
+    for r in dependency_order(rows):
         group = r.get("group")
-        if group and group in by_name and depth == 0:
+        if group and group in by_name:
             g = by_name.pop(group)
             line(g, "group", f"{group[:36]} ({g['finished']}/{g['jobs']} jobs)")
-            members = list(chained([m for m in rows if m.get("group") == group]))
+            members = dependency_order([m for m in rows if m.get("group") == group])
         elif group:
             continue
         else:
-            members = [(r, depth)]
-        for member, level in members:
+            members = [r]
+        for member in members:
             where = (member["host"] or "") + (f" slurm:{member['slurm_id']}" if member["slurm_id"] else "")
-            indent = ("  " if group else "") + ("  " * (level - 1) + "↳ " if level else "")
-            line(member, member["id"], indent + (member["name"] or "")[:40], where.strip())
+            line(member, member["id"], ("  " if group else "") + (member["name"] or "")[:40], where.strip())
     widths = [max(len(row[i]) for row in table) for i in range(len(table[0]))]
     for row in table:
         print("  ".join(cell.ljust(w) for cell, w in zip(row, widths)).rstrip())

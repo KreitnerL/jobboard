@@ -120,7 +120,7 @@ function tooltip(job) {
     ['rate', rate(job.rate_per_s)], ['ETA', job.eta && new Date(job.eta * 1000).toLocaleString()],
     ['last progress', job.progress_at && `${new Date(job.progress_at * 1000).toLocaleString()} (${duration(Date.now() / 1000 - job.progress_at)} ago)`],
     ['cwd', job.cwd], ['log', job.log],
-    ['waits for', (job.waiting_for || []).join(', ')], ['skipped', job.reason],
+    ['after', (job.after_names || []).join(', ')], ['skipped', job.reason],
   ];
   for (const [key, value] of rows) if (value) md.appendMarkdown(`${key}: \`${value}\`  \n`);
   if (job.finishing) md.appendMarkdown('\n*At or past its total but still running: a final phase the progress pattern does not count, or a too small total.*\n\n');
@@ -215,27 +215,27 @@ class JobsProvider {
     }
     if (element.entries) {
       const groups = element.entries.filter(e => e.members);
-      return [...groups.map(groupItem), ...nest(element.entries.filter(e => !e.members)).map(jobItem)];
+      return [...groups.map(groupItem), ...dependencyOrder(element.entries.filter(e => !e.members)).map(jobItem)];
     }
-    if (element.group) return nest(element.group.members).map(jobItem);
-    if (element.job) {
-      return [...stageItems(element.job), ...(element.job.followUps || []).map(jobItem), ...detailItems(element.job)];
-    }
+    if (element.group) return dependencyOrder(element.group.members).map(jobItem);
+    if (element.job) return [...stageItems(element.job), ...detailItems(element.job)];
     return [];
   }
 }
 
-// Follow-up jobs (--after) go under the first job they wait for when both are in the same list.
-function nest(jobs) {
-  const ids = new Set(jobs.map(job => job.id));
+// Flat list; a job that waits for others (--after) comes after them, so a chain reads top to bottom.
+function dependencyOrder(jobs) {
   const byId = new Map(jobs.map(job => [job.id, job]));
-  for (const job of jobs) job.followUps = [];
-  const roots = [];
-  for (const job of jobs) {
-    const parent = (job.after || []).find(id => ids.has(id));
-    (parent ? byId.get(parent).followUps : roots).push(job);
-  }
-  return roots;
+  const placed = new Set();
+  const ordered = [];
+  const place = job => {
+    if (placed.has(job.id)) return;
+    placed.add(job.id);
+    for (const dep of job.after || []) if (byId.has(dep)) place(byId.get(dep));
+    ordered.push(job);
+  };
+  jobs.forEach(place);
+  return ordered;
 }
 
 function stageItems(job) {
@@ -286,7 +286,7 @@ function jobItem(job) {
 function detailItems(job) {
   const where = [job.host, job.slurm_id && `slurm ${job.slurm_id}`, job.pid && `pid ${job.pid}`].filter(Boolean).join(', ');
   const details = [
-    ['id', job.id, 'tag'], ['where', where, 'server'], ['started', job.started && new Date(job.started * 1000).toLocaleString(), 'calendar'],
+    ['id', job.id, 'tag'], ['after', (job.after_names || []).join(', '), 'debug-step-into'], ['where', where, 'server'], ['started', job.started && new Date(job.started * 1000).toLocaleString(), 'calendar'],
     ['cmd', job.cmd, 'terminal'], ['cwd', job.cwd, 'folder'], ['log', job.log, 'output'], ['last', job.last_line, 'note'],
   ];
   return details.filter(([, value]) => value).map(([key, value, icon]) => {

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "jobboard"
-version = "0.2.0"
+version = "0.2.1"
 description = "Track long-running jobs (local, background, Slurm) with progress, rate and ETA; VS Code dashboard included."
 readme = "README.md"
 license = { text = "MIT" }

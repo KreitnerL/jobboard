@@ -10,7 +10,7 @@ JOBS                                                        ⟳  ⌫
     ▾ ⟳ prepare n100      2/2 convert · ██████░░░░ 58% · 58/100 · 2.1/min · ETA 16:40 · 31m
         ✓ 1. download     100/100 · 12m03s
         ⟳ 2. convert      58/100 · 19m10s
-        ⏸ tune ilp        waiting for prepare n100
+    ▸ ⏸ tune ilp          waiting for prepare n100
   ▸ ⟳ train unet fold0    █████████░ 91% · 91/100 · 4.2/h · ETA 17:05 · 21h40m        ⎘  ■
 ▾ Finished (1)
   ▸ ✓ eval baseline       done · 600/600 · 12m03s · ended 13:58
@@ -111,7 +111,7 @@ jobrun run --name "tune ilp" --after "prepare n100" -- python tune.py ilp.yml
 ```
 
 The second job is **waiting** (no elapsed time) until the first one succeeds, then starts; if the first one fails,
-it is **skipped**. The dashboard shows it under the job it waits for. `--after` takes ids or names, repeatable or
+it is **skipped**. The dashboard lists it right after the job it waits for, on the same level. `--after` takes ids or names, repeatable or
 comma-separated. With `jobrun sbatch --after <slurm job>`, Slurm's own `--dependency=afterok` is used.
 
 ## Slurm

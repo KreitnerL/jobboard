@@ -289,8 +289,12 @@ def test_after_waits_then_starts(jobrun, monkeypatch):
     jobrun("run", "--group", "chain", "--name", "first", "--", "sleep 2")
     jobrun("run", "--group", "chain", "--name", "second", "--after", "first", "--", "echo '[1/1] ok'")
     second = wait_for(jobrun, "second", "waiting")
-    assert second["waiting_for"] == ["first"] and second["elapsed_s"] is None and second["after"]
-    assert "↳ second" in jobrun("ls").stdout
+    assert second["waiting_for"] == ["first"] and second["elapsed_s"] is None and second["after_names"] == ["first"]
+    listing_lines = jobrun("ls").stdout.splitlines()
+    first_line = next(i for i, l in enumerate(listing_lines) if " first" in l)
+    second_line = next(i for i, l in enumerate(listing_lines) if " second" in l)
+    assert second_line == first_line + 1 and "waiting for first" in listing_lines[second_line]
+    assert listing_lines[second_line].index("second") == listing_lines[first_line].index("first")  # same level
     first = wait_for(jobrun, "first", "done")
     second = wait_for(jobrun, "second", "done")
     assert second["started"] >= first["ended"] - 0.5 and second["done"] == 1
