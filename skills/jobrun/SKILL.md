@@ -13,13 +13,20 @@ The user watches all long jobs on a dashboard fed by `jobrun`. A job that is not
    `jobrun sbatch`. Adopt jobs that are already running with `jobrun track`.
 2. Always pass a short, specific `--name` (variant, dataset, N), and `--group "<what> <YYYY-MM-DD>"` for a set of
    related jobs. Use one job per independently running process (e.g. one per tuning variant).
-3. Measure progress in the unit the user would ask about (completed trials, cases, epochs), not inner steps.
-   Use count mode (`--count-regex ... --total N`) for items that finish out of order, e.g. parallel trials.
-   Cover every phase: check what the script does after its main loop (re-timing, final evaluation, export)
-   and count those lines too, e.g. `--count-regex 'Trial \d+ (completed|re-timed)' --total 105` for 100 trials
-   plus 5 re-timed finalists. A job at 100% that keeps running shows as "finishing" on the dashboard.
-4. If no existing log line fits, make the script print `JOBRUN_PROGRESS <done>/<total>` throttled by time
-   (at most every ~10 s), never once per step of a fast loop.
+3. Do not research a program's internals to register it: name + group is enough. Progress is detected
+   automatically (tqdm bars, `[12/100]` counters, `JOBRUN_STAGE` / `JOBRUN_PROGRESS` lines). Add
+   `--count-regex '...' --total N` only when the progress line is obvious from the log (e.g. `Trial 7 completed`,
+   finishing out of order). A job past its total shows as "finishing"; that is fine.
+4. Multi-step work:
+   - One script with several phases: it prints `JOBRUN_STAGE <name> [i/n]` before each phase (shell:
+     `echo "JOBRUN_STAGE freeze 2/3"`); progress and ETA then apply per stage. Optional `--stages a,b,c` lists
+     planned stages before they start.
+   - Separate commands that depend on each other: one job each, chained with `--after <id or name>`. Never write
+     polling loops (`while pgrep ...`); jobrun waits (status "waiting", no elapsed time), starts the job when the
+     dependency succeeded, and marks it "skipped" if the dependency failed.
+   - If a program you will run repeatedly prints no usable progress, propose adding marker lines to its code once
+     (`print(f"JOBRUN_PROGRESS {done}/{total}", flush=True)`, throttled to ~10 s in fast loops) instead of
+     encoding its internals in regexes.
 5. After launching, tell the user the job id (or group). To check on jobs use `jobrun ls` / `jobrun show ID`
    instead of reading logs.
 6. To wait for completion, run `jobrun wait ID` (or `--group G`) in the background; the job keeps running and
@@ -29,9 +36,9 @@ The user watches all long jobs on a dashboard fed by `jobrun`. A job that is not
 ## Commands
 
 ```bash
-jobrun run --name NAME [--group G] [progress options] -- CMD ...   # detached; prints id and log path
+jobrun run --name NAME [--group G] [--after JOB] [--stages a,b] -- CMD ...   # detached; prints id + log
 jobrun run --fg ...                                                # foreground, output also on stdout
-jobrun sbatch --name NAME [--group G] [--log PATTERN] -- SBATCH_ARGS... SCRIPT
+jobrun sbatch --name NAME [--group G] [--after SLURM_JOB] [--log PATTERN] -- SBATCH_ARGS... SCRIPT
 jobrun track --pid PID [--log FILE] | --slurm ID                   # adopt a running job
 jobrun ls | show ID | wait ID | log ID [-f] | stop ID | stop --group G | rm ID
 ```
@@ -53,6 +60,10 @@ for v in ilp slogs2d smac; do
   jobrun run --group "tuning 2026-11-02" --name "$v" \
     --count-regex 'Trial \d+ completed' --total 100 -- python tune.py --variant "$v"
 done
+
+# Dataset (two stages printed by the script) -> tuning that needs it
+jobrun run --group "wp3 2026-11-02" --name "prepare n100" -- python prepare.py --n 100
+jobrun run --group "wp3 2026-11-02" --name "tune ilp" --after "prepare n100" -- python tune.py ilp.yml
 
 # Slurm
 jobrun sbatch --name "train unet fold0" -- job.sbatch

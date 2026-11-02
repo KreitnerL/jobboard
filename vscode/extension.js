@@ -7,9 +7,10 @@ const os = require('os');
 const path = require('path');
 
 const JSON_SCHEMA = 1;  // newest `jobrun ls --json` format this extension understands
-const ACTIVE = new Set(['starting', 'pending', 'running', 'unknown']);
+const ACTIVE = new Set(['starting', 'waiting', 'pending', 'running', 'unknown']);
 const ICONS = {
   starting: ['loading~spin', undefined],
+  waiting: ['debug-pause', 'charts.yellow'],
   pending: ['clock', 'charts.yellow'],
   running: ['sync~spin', 'charts.blue'],
   unknown: ['question', 'charts.yellow'],
@@ -20,6 +21,7 @@ const ICONS = {
   oom: ['error', 'testing.iconFailed'],
   ended: ['circle-large-outline', undefined],
   lost: ['warning', 'charts.orange'],
+  skipped: ['debug-step-over', 'disabledForeground'],
 };
 
 function config() {
@@ -77,9 +79,17 @@ function bar(fraction, width = 10) {
   return '█'.repeat(filled) + '░'.repeat(width - filled);
 }
 
+function progressText(item) {
+  if (item.done == null) return '';
+  return item.total ? `${count(item.done)}/${count(item.total)}` : `${count(item.done)} done`;
+}
+
 function describe(job) {
   const parts = [];
   if (job.jobs) parts.push(`${job.finished}/${job.jobs} jobs${job.failed ? ` (${job.failed} failed)` : ''}`);
+  if (job.status === 'waiting') return `waiting for ${(job.waiting_for || []).join(', ') || 'dependencies'}`;
+  if (job.reason) return `${job.status}: ${job.reason}`;
+  if (job.stage) parts.push(`${job.stage_no}/${job.stage_of || '?'} ${job.stage}`);
   if (ACTIVE.has(job.status)) {
     if (job.fraction != null) parts.push(`${bar(job.fraction)} ${Math.round(job.fraction * 100)}%`, `${count(job.done)}/${count(job.total)}`);
     else if (job.done != null) parts.push(`${count(job.done)} done`);
@@ -92,7 +102,7 @@ function describe(job) {
     parts.push(duration(job.elapsed_s));
   } else {
     parts.push(job.exit_code != null && job.status !== 'done' ? `${job.status} (${job.exit_code})` : job.status);
-    if (job.done != null) parts.push(job.total ? `${count(job.done)}/${count(job.total)}` : `${count(job.done)} done`);
+    if (job.done != null) parts.push(progressText(job));
     parts.push(duration(job.elapsed_s));
     if (job.ended) parts.push(`ended ${clock(job.ended)}`);
   }
@@ -110,6 +120,7 @@ function tooltip(job) {
     ['rate', rate(job.rate_per_s)], ['ETA', job.eta && new Date(job.eta * 1000).toLocaleString()],
     ['last progress', job.progress_at && `${new Date(job.progress_at * 1000).toLocaleString()} (${duration(Date.now() / 1000 - job.progress_at)} ago)`],
     ['cwd', job.cwd], ['log', job.log],
+    ['waits for', (job.waiting_for || []).join(', ')], ['skipped', job.reason],
   ];
   for (const [key, value] of rows) if (value) md.appendMarkdown(`${key}: \`${value}\`  \n`);
   if (job.finishing) md.appendMarkdown('\n*At or past its total but still running: a final phase the progress pattern does not count, or a too small total.*\n\n');
@@ -202,11 +213,42 @@ class JobsProvider {
         .sort((a, b) => (b.ended || b.started) - (a.ended || a.started));
       return [section('Running', active, true), section('Finished', finished, false)];
     }
-    if (element.entries) return element.entries.map(e => (e.members ? groupItem(e) : jobItem(e)));
-    if (element.group) return element.group.members.map(jobItem);
-    if (element.job) return detailItems(element.job);
+    if (element.entries) {
+      const groups = element.entries.filter(e => e.members);
+      return [...groups.map(groupItem), ...nest(element.entries.filter(e => !e.members)).map(jobItem)];
+    }
+    if (element.group) return nest(element.group.members).map(jobItem);
+    if (element.job) {
+      return [...stageItems(element.job), ...(element.job.followUps || []).map(jobItem), ...detailItems(element.job)];
+    }
     return [];
   }
+}
+
+// Follow-up jobs (--after) go under the first job they wait for when both are in the same list.
+function nest(jobs) {
+  const ids = new Set(jobs.map(job => job.id));
+  const byId = new Map(jobs.map(job => [job.id, job]));
+  for (const job of jobs) job.followUps = [];
+  const roots = [];
+  for (const job of jobs) {
+    const parent = (job.after || []).find(id => ids.has(id));
+    (parent ? byId.get(parent).followUps : roots).push(job);
+  }
+  return roots;
+}
+
+function stageItems(job) {
+  const now = Date.now() / 1000;
+  return (job.stages || []).map((stage, index) => {
+    const item = new vscode.TreeItem(`${index + 1}. ${stage.name}`);
+    item.id = `${job.id}-stage-${index}`;
+    const time = stage.started ? duration((stage.ended || now) - stage.started) : '';
+    item.description = stage.status === 'pending' ? 'pending' : [progressText(stage), time].filter(Boolean).join(' · ');
+    const [icon, color] = stage.status === 'pending' ? ['circle-outline', undefined] : ICONS[stage.status] || ['circle-outline'];
+    item.iconPath = new vscode.ThemeIcon(icon, color && new vscode.ThemeColor(color));
+    return item;
+  });
 }
 
 function section(label, entries, expanded) {

@@ -6,7 +6,11 @@ progress, rate and ETA, right in the VS Code sidebar.**
 ```
 JOBS                                                        ⟳  ⌫
 ▾ Running (2)
-  ▸ ◫ tuning 2026-11-02   1/3 jobs · ██████░░░░ 58% · 174/300 · 2.1/min · ETA 16:40 · 1h22m
+  ▾ ◫ wp3 2026-11-02      0/2 jobs · 1/2 prepare n100
+    ▾ ⟳ prepare n100      2/2 convert · ██████░░░░ 58% · 58/100 · 2.1/min · ETA 16:40 · 31m
+        ✓ 1. download     100/100 · 12m03s
+        ⟳ 2. convert      58/100 · 19m10s
+        ⏸ tune ilp        waiting for prepare n100
   ▸ ⟳ train unet fold0    █████████░ 91% · 91/100 · 4.2/h · ETA 17:05 · 21h40m        ⎘  ■
 ▾ Finished (1)
   ▸ ✓ eval baseline       done · 600/600 · 12m03s · ended 13:58
@@ -16,7 +20,8 @@ JOBS                                                        ⟳  ⌫
 - **Anything that runs.** Local commands, processes that are already running, Slurm jobs.
 - **Survives everything.** State lives in small files, not in the editor, so jobs stay tracked when VS Code
   closes, an SSH session drops or an agent's watcher dies.
-- **Groups.** Run a sweep as a group and watch total progress, with an ETA set by the slowest job.
+- **Groups, stages, dependencies.** Watch a whole sweep at once, see which stage of a pipeline a job is in, and
+  chain jobs so one starts when the other has finished.
 - **Tiny.** A single Python file that needs nothing beyond the standard library, plus a VS Code extension
   written in plain JavaScript.
 - **Agent-friendly.** Comes with a skill, so Claude Code, Codex or Cursor register every job they start.
@@ -85,6 +90,30 @@ jobrun stop --group "sweep 2026-11-02"
 The sidebar shows one row per group: jobs finished, progress summed over all jobs, combined rate, and the ETA of
 the slowest job. You get one notification when the group finishes, plus one for each job that fails.
 
+## Stages
+
+A program announces its phases with one line each; progress, rate and ETA then apply per stage, and the
+dashboard lists finished stages with their durations:
+
+```bash
+echo "JOBRUN_STAGE download 1/2"     # shell; in Python: print("JOBRUN_STAGE download 1/2", flush=True)
+...
+echo "JOBRUN_STAGE convert 2/2"
+```
+
+`--stages download,convert` lists planned stages before they are reached.
+
+## Dependencies
+
+```bash
+jobrun run --name "prepare n100" -- python prepare.py --n 100
+jobrun run --name "tune ilp" --after "prepare n100" -- python tune.py ilp.yml
+```
+
+The second job is **waiting** (no elapsed time) until the first one succeeds, then starts; if the first one fails,
+it is **skipped**. The dashboard shows it under the job it waits for. `--after` takes ids or names, repeatable or
+comma-separated. With `jobrun sbatch --after <slurm job>`, Slurm's own `--dependency=afterok` is used.
+
 ## Slurm
 
 ```bash
@@ -138,7 +167,7 @@ asking you to look.
 | `stop ID` / `--group G` | SIGTERM to the whole process tree, then SIGKILL after 10 s; `scancel` for Slurm |
 | `rm ID` · `clean [--days 7]` | Remove from the list (with the logs jobrun wrote) |
 
-Common options: `--name`, `--group`, `--log`, `--count-regex`, `--progress-regex`, `--total`.
+Common options: `--name`, `--group`, `--after`, `--stages`, `--log`, `--count-regex`, `--progress-regex`, `--total`.
 
 ## How it works
 
@@ -147,9 +176,10 @@ nodes show up too.
 
 - A small **supervisor** process starts the command, writes its output to the log, writes a heartbeat file every
   30 s and records the exit code. It uses about 13 MB of memory and practically no CPU.
+- The supervisor also reads the log's new lines every 2 s for stages and progress, so stage times are right even
+  when no dashboard is open. For tracked and Slurm jobs, the readers do this.
 - **Readers** (`jobrun ls`, the sidebar every 10 s) work out status and progress: from the pid or heartbeat, from
-  `sacct`, and from the last 256 KB of the log. Finished jobs are cached. One refresh with 200 jobs takes about
-  0.06 s of CPU.
+  `sacct`, and from the log. Finished jobs are cached. One refresh with 200 jobs takes about 0.06 s of CPU.
 - A job whose supervisor disappears without recording an exit (e.g. after a reboot) shows as **lost** instead of
   running forever.
 

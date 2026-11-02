@@ -176,17 +176,17 @@ def test_log_is_trimmed_and_count_survives_trimming(jobrun):
     assert 20 <= row["done"] <= 30  # lines written between two refreshes may be trimmed unseen
 
 
-def test_count_mode_reads_large_logs_in_bounded_chunks(jobrun, tmp_path, monkeypatch):
+def test_count_mode_reads_large_logs_in_bounded_chunks(tmp_path, monkeypatch):
     log = tmp_path / "huge.log"
     log.write_text("step done\n" * 200000)
     monkeypatch.setattr(jobrun_module, "COUNT_CHUNK_BYTES", 64 * 1024)
     monkeypatch.setattr(jobrun_module, "COUNT_BUDGET_BYTES", 1 << 20)
-    meta, state = {"id": "x", "log": str(log), "count_regex": "done", "total": None}, {}
-    done, _, _ = jobrun_module.parse_progress(meta, state)
-    assert done < 200000 and state["offset"] <= 1 << 20
-    while done < 200000:
-        done, _, _ = jobrun_module.parse_progress(meta, state)
-    assert done == 200000
+    meta, scan = {"id": "x", "log": str(log), "count_regex": "done", "total": None, "started": 0}, {}
+    jobrun_module.scan_log(meta, scan, 1.0)
+    assert scan["stages"][-1]["done"] < 200000 and scan["offset"] <= 1 << 20
+    while scan["stages"][-1]["done"] < 200000:
+        jobrun_module.scan_log(meta, scan, 1.0)
+    assert scan["stages"][-1]["done"] == 200000
 
 
 def test_sbatch_output_detection(tmp_path):
@@ -257,3 +257,80 @@ def test_job_past_its_total_is_finishing(jobrun):
     row = rows(jobrun)["tail"]
     assert (row["done"], row["finishing"], row["eta"]) == (2, True, None) and row["progress_at"]
     assert "finishing" in jobrun("ls").stdout
+
+
+def test_stages_track_progress_per_stage(jobrun):
+    script = ("echo preamble; echo 'JOBRUN_STAGE download 1/2'; echo '[3/3] file'; sleep 0.6; "
+              "echo 'JOBRUN_STAGE convert 2/2'; echo '[2/5] sample'; sleep 300")
+    jobrun("run", "--name", "prep", "--", script)
+    deadline = time.time() + 10
+    while (row := rows(jobrun)["prep"])["stage"] != "convert" and time.time() < deadline:
+        time.sleep(0.3)
+    assert (row["stage"], row["stage_no"], row["stage_of"], row["done"], row["total"]) == ("convert", 2, 2, 2, 5)
+    download, convert = row["stages"]
+    assert (download["name"], download["status"], download["done"], download["total"]) == ("download", "done", 3, 3)
+    assert convert["status"] == "running" and download["ended"] >= download["started"]
+    assert "[2/2 convert]" in jobrun("ls").stdout
+
+
+def test_planned_stages_and_count_reset_per_stage(jobrun):
+    jobrun("run", "--name", "plan", "--stages", "a,b,c", "--count-regex", "item", "--total", "4", "--",
+           "echo 'JOBRUN_STAGE a'; echo item; echo item; echo 'JOBRUN_STAGE b'; echo item; sleep 300")
+    deadline = time.time() + 10
+    while (row := rows(jobrun)["plan"])["stage"] != "b" and time.time() < deadline:
+        time.sleep(0.3)
+    assert (row["stage_no"], row["stage_of"], row["done"], row["total"]) == (2, 3, 1, 4)
+    assert [(s["name"], s["status"], s["done"]) for s in row["stages"]] == [
+        ("a", "done", 2), ("b", "running", 1), ("c", "pending", None)]
+
+
+def test_after_waits_then_starts(jobrun, monkeypatch):
+    monkeypatch.setenv("JOBRUN_WAIT_POLL_S", "0.5")
+    jobrun("run", "--group", "chain", "--name", "first", "--", "sleep 2")
+    jobrun("run", "--group", "chain", "--name", "second", "--after", "first", "--", "echo '[1/1] ok'")
+    second = wait_for(jobrun, "second", "waiting")
+    assert second["waiting_for"] == ["first"] and second["elapsed_s"] is None and second["after"]
+    assert "↳ second" in jobrun("ls").stdout
+    first = wait_for(jobrun, "first", "done")
+    second = wait_for(jobrun, "second", "done")
+    assert second["started"] >= first["ended"] - 0.5 and second["done"] == 1
+
+
+def test_after_failed_dependency_skips(jobrun, monkeypatch):
+    monkeypatch.setenv("JOBRUN_WAIT_POLL_S", "0.5")
+    jobrun("run", "--name", "breaks", "--", "exit 3")
+    jobrun("run", "--name", "follow", "--after", "breaks", "--", "touch should-not-exist")
+    row = wait_for(jobrun, "follow", "skipped")
+    assert row["reason"] == "breaks failed" and row["elapsed_s"] is None
+    assert not (jobrun.home.parent / "should-not-exist").exists()
+
+
+def test_stop_waiting_job(jobrun, monkeypatch):
+    monkeypatch.setenv("JOBRUN_WAIT_POLL_S", "0.5")
+    jobrun("run", "--name", "long", "--", "sleep 300")
+    jobrun("run", "--name", "queued", "--after", "long", "--", "true")
+    supervisor = json.loads(next((jobrun.home / "jobs").glob("*.json")).read_text())  # any meta works for the dir
+    row = wait_for(jobrun, "queued", "waiting")
+    pid = json.loads((jobrun.home / "jobs" / f"{row['id']}.json").read_text())["supervisor_pid"]
+    jobrun("stop", "queued", "--grace", "2")
+    assert wait_for(jobrun, "queued", "killed")["reason"] == "stopped while waiting"
+    time.sleep(0.5)
+    assert not jobrun_module.pid_alive(pid) and supervisor
+
+
+def test_sbatch_after_requires_slurm_dependencies(jobrun):
+    jobrun("run", "--name", "local", "--", "true")
+    out = jobrun("sbatch", "--after", "local", "--", "--wrap", "true", check=False)
+    assert out.returncode != 0 and "must be Slurm jobs" in out.stderr
+
+
+def test_jobs_from_older_supervisors_are_scanned_by_readers(jobrun):
+    log = jobrun.home.parent / "old.log"
+    log.write_text("JOBRUN_STAGE trials\n[7/10] x\n")
+    (jobrun.home / "jobs").mkdir(parents=True)
+    meta = {"id": "261101-aaaa", "name": "old", "kind": "process", "cmd": ["x"], "host": "elsewhere",
+            "log": str(log), "started": time.time() - 5, "pid": 1}  # no supervisor_scans flag
+    (jobrun.home / "jobs" / "261101-aaaa.json").write_text(json.dumps(meta))
+    (jobrun.home / "jobs" / "261101-aaaa.hb").touch()
+    row = rows(jobrun)["old"]
+    assert (row["status"], row["stage"], row["done"], row["total"]) == ("running", "trials", 7, 10)

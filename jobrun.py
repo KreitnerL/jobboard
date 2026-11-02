@@ -39,24 +39,26 @@ HOST = socket.gethostname()
 
 HEARTBEAT_S = float(os.environ.get("JOBRUN_HEARTBEAT_S", 30))
 STALE_S = 5 * HEARTBEAT_S
-CHECK_S = min(HEARTBEAT_S, 5)  # supervisor wake-up: heartbeat and log size check
+CHECK_S = min(HEARTBEAT_S, 2)  # supervisor wake-up: log scan (stages, progress), heartbeat, log size check
 MAX_LOG_MB = float(os.environ.get("JOBRUN_MAX_LOG_MB", 512))  # cap for logs jobrun writes; 0 disables
 TRIM_KEEP_BYTES = 1 << 20  # tail kept when a log is trimmed
-TAIL_BYTES = 256 * 1024
+LAST_LINE_BYTES = 16 * 1024  # tail read for the last log line
+WAIT_POLL_S = float(os.environ.get("JOBRUN_WAIT_POLL_S", 15))  # dependency checks of a waiting job
 COUNT_CHUNK_BYTES = 8 << 20  # count mode reads in chunks ...
 COUNT_BUDGET_BYTES = 256 << 20  # ... and at most this much per refresh
 SACCT_TTL_S = 30
 RATE_WINDOW_S = 15 * 60
 JSON_SCHEMA = 1  # version of `ls --json`; bump on incompatible changes (the VS Code extension checks it)
-ACTIVE = ("starting", "pending", "running", "unknown")
+ACTIVE = ("starting", "waiting", "pending", "running", "unknown")
 # "lost" may recover (NFS hiccup, supervisor between child exit and exit file), so it is never cached.
-FINAL = ("done", "failed", "killed", "timeout", "oom", "ended")
+FINAL = ("done", "failed", "killed", "timeout", "oom", "ended", "skipped")
 
 PROGRESS_PATTERNS = [
     re.compile(r"JOBRUN_PROGRESS\s+(?P<done>\d+)\s*/\s*(?P<total>\d+)"),
     re.compile(r"(?P<done>\d+)/(?P<total>\d+)\s*\[\d"),  # tqdm: " 412/1000 [01:23<04:56, 3.21it/s]"
     re.compile(r"\[(?:[^\[\]]*\s)?(?P<done>\d+)/(?P<total>\d+)\]"),  # "[412/1000] ..." or "[cfg 412/1000] ..."
 ]
+STAGE_MARKER = re.compile(r"JOBRUN_STAGE\s+(?P<name>.+?)(?:\s+(?P<index>\d+)/(?P<of>\d+))?\s*$")
 ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 INTERPRETERS = {"uv", "run", "bash", "sh", "srun", "nohup", "env", "time", "exec"}
 SLURM_STATES = {
@@ -305,10 +307,61 @@ def trim_log(job_id: str, log: str, max_bytes: int) -> None:
         pass
 
 
+def _beat(job_id: str) -> None:
+    try:  # registry trouble (NFS, a removed folder) must never kill the supervisor
+        _file(job_id, ".hb").touch()
+    except OSError:
+        pass
+
+
+def _finish(job_id: str, info: dict) -> None:
+    try:
+        write_json(_file(job_id, ".exit.json"), {"ended": time.time(), **info})
+    except OSError:
+        pass
+
+
+def wait_for_dependencies(job_id: str, meta: dict) -> str | None:
+    """Block until every job in meta["after"] is done. Returns why the job must not start, or None."""
+    stop = []
+    for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(signum, lambda *_: stop.append(True))
+    while True:
+        _beat(job_id)
+        if stop:
+            return "stopped while waiting"
+        deps = [read_json(_file(dep, ".json")) for dep in meta["after"]]
+        if not all(deps):
+            return "a dependency was removed"
+        rows = snapshots(deps)
+        bad = next((r for r in rows if r["status"] not in ACTIVE and r["status"] != "done"), None)
+        if bad:
+            return f"{bad['name']} {bad['status']}"
+        if all(r["status"] == "done" for r in rows):
+            return None
+        for _ in range(int(WAIT_POLL_S / 0.5)):  # sleep, but react to stop quickly
+            if stop:
+                break
+            time.sleep(0.5)
+
+
 def supervise(job_id: str, tee: bool = False) -> int:
-    """Run the job's command, keep a heartbeat, record its exit. With tee, also copy output to stdout."""
+    """Wait for dependencies, run the job's command, keep a heartbeat, scan its log, record its exit.
+
+    With tee, also copy output to stdout. The supervisor owns the job's log scan (stages, progress), so stage
+    times stay accurate while no dashboard is open.
+    """
     meta_path = _file(job_id, ".json")
     meta = read_json(meta_path)
+    meta.update(supervisor_pid=os.getpid(), supervisor_scans=True)
+    if meta.get("after"):
+        meta["waiting"] = True
+        write_json(meta_path, meta)
+        reason = wait_for_dependencies(job_id, meta)
+        if reason:
+            _finish(job_id, {"exit_code": None, "skipped": reason})
+            return 1
+        meta.update(waiting=False, started=time.time())
     cmd = meta["cmd"]
     env = dict(os.environ, JOBRUN_ID=job_id, PYTHONUNBUFFERED="1")
     with open(meta["log"], "ab", buffering=0) as log:
@@ -319,9 +372,9 @@ def supervise(job_id: str, tee: bool = False) -> int:
                                     start_new_session=True)
         except OSError as exc:
             log.write(f"jobrun: cannot start {cmd}: {exc}\n".encode())
-            write_json(_file(job_id, ".exit.json"), {"exit_code": 127, "ended": time.time()})
+            _finish(job_id, {"exit_code": 127})
             return 127
-        meta.update(pid=proc.pid, pgid=proc.pid, proc_start=proc_start(proc.pid), supervisor_pid=os.getpid())
+        meta.update(pid=proc.pid, pgid=proc.pid, proc_start=proc_start(proc.pid))
         write_json(meta_path, meta)
 
         def forward(signum, _frame):
@@ -347,13 +400,10 @@ def supervise(job_id: str, tee: bool = False) -> int:
             pump = threading.Thread(target=copy, daemon=True)
             pump.start()
 
-        heartbeat = _file(job_id, ".hb")
         max_bytes = meta.get("max_log_bytes") or 0
         while True:
-            try:  # registry trouble (NFS, a removed folder) must never kill the supervisor
-                heartbeat.touch()
-            except OSError:
-                pass
+            _beat(job_id)
+            update_scan(meta)  # before trimming, so no stage marker is trimmed unseen
             if max_bytes:
                 trim_log(job_id, meta["log"], max_bytes)
             try:
@@ -363,10 +413,8 @@ def supervise(job_id: str, tee: bool = False) -> int:
                 pass
         if pump:
             pump.join(timeout=5)
-    try:
-        write_json(_file(job_id, ".exit.json"), {"exit_code": code, "ended": time.time()})
-    except OSError:
-        pass
+    update_scan(meta, final=True)
+    _finish(job_id, {"exit_code": code})
     return code if code >= 0 else 128 - code
 
 
@@ -379,21 +427,30 @@ def job_status(meta: dict, slurm: dict, now: float) -> tuple[str, float | None, 
     exit_info = read_json(_file(job_id, ".exit.json"))
     if exit_info:
         code = exit_info.get("exit_code")
-        status = "done" if code == 0 else "killed" if stopped or (code or 0) < 0 else "failed"
+        if exit_info.get("skipped"):
+            status = "killed" if stopped else "skipped"
+        else:
+            status = "done" if code == 0 else "killed" if stopped or (code or 0) < 0 else "failed"
         return status, exit_info.get("ended"), code
     kind, pid = meta.get("kind"), meta.get("pid")
     if kind == "slurm":
         info = slurm.get(str(meta.get("slurm_id")))
-        return (info["status"], info["ended"], info["exit_code"]) if info else ("unknown", None, None)
+        if not info:
+            return "unknown", None, None
+        status = "waiting" if info["status"] == "pending" and meta.get("after") else info["status"]
+        return status, info["ended"], info["exit_code"]
     if kind == "process":
         heartbeat = _file(job_id, ".hb")
-        if pid is None:
-            return ("starting" if now - (meta.get("started") or 0) < STALE_S else "lost"), None, None
         if meta.get("host") == HOST:
-            alive = pid_alive(pid, meta.get("proc_start"))
+            alive = (pid_alive(pid, meta.get("proc_start")) if pid is not None
+                     else bool(meta.get("supervisor_pid")) and pid_alive(meta["supervisor_pid"]))
         else:
             beat = _mtime(heartbeat)
             alive = beat is not None and now - beat < STALE_S
+        if pid is None:
+            if meta.get("waiting") and alive:
+                return "waiting", None, None
+            return ("starting" if now - (meta.get("started") or 0) < STALE_S else "lost"), None, None
         if alive:
             return "running", None, None
         return ("killed" if stopped else "lost"), _mtime(heartbeat), None
@@ -414,60 +471,118 @@ def _match(match: re.Match, total: int | None) -> tuple[int, int | None]:
     return int(done), int(found) if found else total
 
 
-def parse_progress(meta: dict, state: dict) -> tuple[int | None, int | None, str | None]:
-    """(done, total, last log line). Count mode scans the log incrementally, the rest reads its tail."""
-    total = meta.get("total")
+def _new_stage(name: str | None, started: float, index=None, of=None) -> dict:
+    return {"name": name, "index": index, "of": of, "started": started, "ended": None, "done": None, "total": None}
+
+
+def scan_log(meta: dict, scan: dict, now: float, final: bool = False) -> None:
+    """Advance over the log's new lines: stage markers, count-mode matches and progress lines (newest wins).
+
+    scan = {"offset": logical bytes read, "stages": [...]}; progress always belongs to the current (last) stage.
+    Lines end at \\n or \\r, so tqdm updates count before the bar finishes. The unfinished last line still
+    updates progress (without being consumed); with final, it is consumed like any other line.
+    """
+    stages = scan.setdefault("stages", [])
+    if not stages:
+        stages.append(_new_stage(None, meta.get("started") or now))
     path = meta.get("progress_file") or meta.get("log")
     if not path:
-        return None, total, None
+        return
     try:
         handle = open(path, "rb")
     except OSError:
-        return None, total, None
-    done = None
-    with handle:
-        size = os.fstat(handle.fileno()).st_size
-        if meta.get("count_regex"):
-            pattern = re.compile(meta["count_regex"])
-            dropped = dropped_bytes(meta["id"]) if meta.get("log_owned") and path == meta.get("log") else 0
-            position, count = max(0, state.get("offset", 0) - dropped), state.get("count", 0)
-            if position > size:  # replaced by a shorter file
-                position, count = 0, 0
-            handle.seek(position)
-            budget = COUNT_BUDGET_BYTES
-            while budget > 0:
-                chunk = handle.read(min(COUNT_CHUNK_BYTES, budget))
-                complete = chunk.rfind(b"\n") + 1
-                if not complete:
-                    if len(chunk) < COUNT_CHUNK_BYTES:
-                        break  # partial last line, count it once it is complete
-                    complete = len(chunk)  # one enormous line: skip it
-                count += sum(1 for line in chunk[:complete].decode(errors="replace").splitlines()
-                             if pattern.search(line))
-                position += complete
-                budget -= complete
-                handle.seek(position)
-            state.update(offset=position + dropped, count=count)
-            done = count
-        handle.seek(max(0, size - TAIL_BYTES))
-        tail = handle.read().decode(errors="replace")
-    lines = [line for line in (ANSI.sub("", raw).strip() for raw in re.split(r"[\r\n]+", tail)) if line]
-    if done is None:
-        patterns = [re.compile(meta["progress_regex"])] if meta.get("progress_regex") else PROGRESS_PATTERNS
-        for line in reversed(lines):
+        return
+    count = re.compile(meta["count_regex"]) if meta.get("count_regex") else None
+    patterns = [re.compile(meta["progress_regex"])] if meta.get("progress_regex") else PROGRESS_PATTERNS
+    default_total = meta.get("total")
+
+    def handle_line(line: str) -> None:
+        stage = stages[-1]
+        if "JOBRUN_STAGE" in line:
+            marker = STAGE_MARKER.search(ANSI.sub("", line))
+            if marker:
+                index, of = marker.group("index"), marker.group("of")
+                new = _new_stage(marker.group("name"), now, int(index) if index else None, int(of) if of else None)
+                if stage["name"] is None and stage["done"] is None:
+                    stages[-1] = new  # nothing happened before the first marker
+                else:
+                    stage["ended"] = now
+                    stages.append(new)
+                return
+        if count:
+            if count.search(line):
+                stage["done"], stage["total"] = (stage["done"] or 0) + 1, default_total
+        elif patterns is not PROGRESS_PATTERNS or "/" in line:  # every default pattern contains a slash
             match = next((m for m in (p.search(line) for p in patterns) if m), None)
             if match:
-                done, total = _match(match, total)
-                break
-    return done, total, lines[-1][:300] if lines else None
+                stage["done"], stage["total"] = _match(match, default_total)
+
+    with handle:
+        size = os.fstat(handle.fileno()).st_size
+        dropped = dropped_bytes(meta["id"]) if meta.get("log_owned") and path == meta.get("log") else 0
+        position = max(0, scan.get("offset", 0) - dropped)
+        if position > size:  # replaced by a shorter file: start over
+            position, stages[:] = 0, [_new_stage(None, meta.get("started") or now)]
+        handle.seek(position)
+        budget = COUNT_BUDGET_BYTES
+        while budget > 0:
+            chunk = handle.read(min(COUNT_CHUNK_BYTES, budget))
+            complete = max(chunk.rfind(b"\n"), chunk.rfind(b"\r")) + 1
+            if final and len(chunk) < COUNT_CHUNK_BYTES:
+                complete = len(chunk)
+            if not complete:
+                if len(chunk) < COUNT_CHUNK_BYTES:
+                    break  # partial last line, consumed once it is complete
+                complete = len(chunk)  # one enormous line: skip it
+            for line in re.split(r"[\r\n]+", chunk[:complete].decode(errors="replace")):
+                if line:
+                    handle_line(line)
+            position += complete
+            budget -= complete
+            handle.seek(position)
+            if complete < len(chunk) and not count and len(chunk) - complete <= LAST_LINE_BYTES:
+                partial = ANSI.sub("", chunk[complete:].decode(errors="replace"))
+                match = "JOBRUN_STAGE" not in partial and next((m for m in (p.search(partial) for p in patterns) if m), None)
+                if match:
+                    stages[-1]["done"], stages[-1]["total"] = _match(match, default_total)
+        scan["offset"] = position + dropped
+    if stages[-1]["total"] is None and default_total:
+        stages[-1]["total"] = default_total
 
 
-def update_rate(state: dict, done: int, total: int | None, now: float, started: float) -> float | None:
-    """Items per second over the last RATE_WINDOW_S, or the run average until the window has data."""
+def update_scan(meta: dict, final: bool = False) -> dict:
+    """Scan new log lines and persist the result; returns the scan."""
+    path = _file(meta["id"], ".scan.json")
+    scan = read_json(path, {}) or {}
+    before = json.dumps(scan, sort_keys=True)
+    scan_log(meta, scan, time.time(), final)
+    if json.dumps(scan, sort_keys=True) != before:  # most wake-ups see no new output: skip the NFS write
+        try:
+            write_json(path, scan)
+        except OSError:
+            pass
+    return scan
+
+
+def last_log_line(meta: dict) -> str | None:
+    path = meta.get("progress_file") or meta.get("log")
+    try:
+        with open(path, "rb") as handle:
+            handle.seek(max(0, os.fstat(handle.fileno()).st_size - LAST_LINE_BYTES))
+            tail = handle.read().decode(errors="replace")
+    except (OSError, TypeError):
+        return None
+    lines = [line for line in (ANSI.sub("", raw).strip() for raw in re.split(r"[\r\n]+", tail)) if line]
+    return lines[-1][:300] if lines else None
+
+
+def update_rate(state: dict, stage_key: int, done: int, total: int | None, now: float,
+                started: float) -> float | None:
+    """Items per second over the last RATE_WINDOW_S of the current stage, or its average until then."""
     samples = state.get("samples") or []
-    if samples and (done < samples[-1][1] or total != state.get("total")):
+    if samples and (state.get("stage") != stage_key or done < samples[-1][1] or total != state.get("total")):
         samples = []
-    state["total"] = total
+    state.update(stage=stage_key, total=total)
     if not samples or samples[-1][1] != done:
         samples.append([now, done])
         state["progress_at"] = now
@@ -478,6 +593,23 @@ def update_rate(state: dict, done: int, total: int | None, now: float, started: 
     if now - first_t >= 60 and done > first_done:
         return (done - first_done) / (now - first_t)
     return done / (now - started) if done and now > started else None
+
+
+def stage_rows(meta: dict, stages: list[dict], status: str, ended: float | None) -> list[dict]:
+    """Stages for display: finished, current, and planned (--stages) ones not reached yet."""
+    if len(stages) == 1 and stages[0]["name"] is None and not meta.get("stages"):
+        return []
+    rows = []
+    for stage in stages:
+        last = stage is stages[-1]
+        state = "done" if not last else "running" if status in ACTIVE else status
+        rows.append({"name": stage["name"] or "(start)", "status": state, "done": stage["done"],
+                     "total": stage["total"], "started": stage["started"],
+                     "ended": stage["ended"] if not last else None if status in ACTIVE else ended})
+    reached = {s["name"] for s in stages}
+    rows += [{"name": name, "status": "pending", "done": None, "total": None, "started": None, "ended": None}
+             for name in meta.get("stages") or [] if name not in reached]
+    return rows
 
 
 def snapshot(meta: dict, slurm: dict) -> dict:
@@ -491,22 +623,37 @@ def snapshot(meta: dict, slurm: dict) -> dict:
     status, ended, exit_code = job_status(meta, slurm, now)
     slurm_info = (slurm.get(str(meta.get("slurm_id"))) or {}) if meta.get("kind") == "slurm" else {}
     started = slurm_info.get("started") or meta.get("started") or now
-    done, total, last_line = parse_progress(meta, state)
+    if meta.get("supervisor_scans"):  # the supervisor keeps the scan current
+        scan = read_json(_file(job_id, ".scan.json"), {}) or {}
+        scan.setdefault("stages", [_new_stage(None, started)])
+    else:
+        scan = update_scan(meta)
+    stages = scan["stages"]
+    current = stages[-1]
+    done, total = current["done"], current["total"]
     rate = state.get("rate")
     if done is not None and status in ACTIVE:
-        rate = state["rate"] = update_rate(state, done, total, now, started)
+        rate = state["rate"] = update_rate(state, len(stages), done, total, now, max(started, current["started"]))
     eta = None
     if status in ACTIVE and rate and total and done is not None and done < total:
         eta = now + (total - done) / rate
+    planned = meta.get("stages") or []
+    stage_list = stage_rows(meta, stages, status, ended)
     row = {key: meta.get(key) for key in ("id", "name", "group", "kind", "host", "slurm_id", "pid", "cwd", "log")}
-    row["log_owned"] = bool(meta.get("log_owned"))
     row.update(
-        cmd=shlex.join(meta.get("cmd") or []), status=status, exit_code=exit_code, started=started,
-        ended=ended, elapsed_s=(ended or now) - started, done=done, total=total,
-        fraction=done / total if done is not None and total else None, rate_per_s=rate, eta=eta,
-        last_line=last_line, progress_at=state.get("progress_at"),
+        log_owned=bool(meta.get("log_owned")), after=meta.get("after") or [],
+        cmd=shlex.join(meta.get("cmd") or []), status=status, exit_code=exit_code, started=started, ended=ended,
+        elapsed_s=None if status == "waiting" or (meta.get("after") and meta.get("pid") is None and
+                                                   meta.get("kind") == "process") else (ended or now) - started,
+        done=done, total=total, fraction=done / total if done is not None and total else None,
+        rate_per_s=rate, eta=eta, last_line=last_log_line(meta), progress_at=state.get("progress_at"),
         # at or past the total but still running: an untracked final phase (or a too small --total)
         finishing=status in ACTIVE and bool(total) and done is not None and done >= total,
+        stage=current["name"] if stage_list else None,
+        stage_no=(current["index"] or (planned.index(current["name"]) + 1 if current["name"] in planned
+                                       else len(stages))) if stage_list else None,
+        stage_of=(current["of"] or len(planned) or None) if stage_list else None,
+        stages=stage_list, reason=(read_json(_file(job_id, ".exit.json"), {}) or {}).get("skipped"),
     )
     row["host"] = slurm_info.get("host") or row["host"]
     if status in FINAL:
@@ -528,9 +675,20 @@ def snapshots(metas: list[dict]) -> list[dict]:
                 meta.update({k: v for k, v in fresh.items() if not meta.get(k) or k == "name" and
                              meta["name"] == f"slurm-{meta['slurm_id']}"})
                 write_json(_file(meta["id"], ".json"), meta)
-    open_slurm = [str(m["slurm_id"]) for m in open_slurm]
-    slurm = query_slurm(open_slurm)
-    return [snapshot(m, slurm) for m in metas]
+    slurm = query_slurm([str(m["slurm_id"]) for m in open_slurm])
+    rows = [snapshot(m, slurm) for m in metas]
+    by_id = {r["id"]: r for r in rows}
+    for row in rows:
+        if row["status"] == "waiting":
+            deps = [by_id.get(d) or snapshot_or_none(d, slurm) for d in row["after"]]
+            row["waiting_for"] = [f"{d['name']}" + ("" if d["status"] in ACTIVE else f" ({d['status']})")
+                                  for d in deps if d and d["status"] != "done"]
+    return rows
+
+
+def snapshot_or_none(job_id: str, slurm: dict) -> dict | None:
+    meta = read_json(_file(job_id, ".json"))
+    return snapshot(meta, slurm) if meta else None
 
 
 def group_rows(rows: list[dict]) -> list[dict]:
@@ -544,12 +702,13 @@ def group_rows(rows: list[dict]) -> list[dict]:
         active = [r for r in jobs if r["status"] in ACTIVE]
         bad = [r for r in jobs if r["status"] not in ACTIVE and r["status"] != "done"]
         if active:
-            status = "running" if any(r["status"] == "running" for r in active) else active[0]["status"]
+            status = next((s for s in ("running", "waiting", "pending", "starting") if any(r["status"] == s for r in active)),
+                          active[0]["status"])
         else:
             status = ("killed" if all(r["status"] == "killed" for r in bad) else "failed") if bad else "done"
-        known = [r for r in jobs if r["done"] is not None]
-        done = sum(min(r["done"], r["total"] or r["done"]) for r in known) if known else None
+        # summing only makes sense when every member counts the same kind of thing towards a known total
         total = sum(r["total"] for r in jobs) if all(r["total"] for r in jobs) else None
+        done = sum(min(r["done"] or 0, r["total"]) for r in jobs) if total else None
         etas = [r["eta"] for r in active if r["eta"]]
         started = min(r["started"] for r in jobs)
         ended = None if active else max(r["ended"] or r["started"] for r in jobs)
@@ -604,11 +763,35 @@ def fmt_eta(eta: float | None) -> str:
 
 
 def fmt_progress(row: dict) -> str:
+    if row.get("status") == "waiting":
+        return "waiting for " + ", ".join(row.get("waiting_for") or ["dependencies"])
+    if row.get("reason"):
+        return row["reason"]
+    stage = ""
+    if row.get("stage"):
+        stage = f"[{row['stage_no']}/{row['stage_of'] or '?'} {row['stage']}] "
     if row["done"] is None:
-        return ""
+        return stage.strip()
     if row["fraction"] is not None:
-        return f"{row['fraction'] * 100:3.0f}% {fmt_count(row['done'])}/{fmt_count(row['total'])}"
-    return fmt_count(row["done"])
+        return f"{stage}{row['fraction'] * 100:3.0f}% {fmt_count(row['done'])}/{fmt_count(row['total'])}"
+    return stage + fmt_count(row["done"])
+
+
+def chained(rows: list[dict]):
+    """(row, depth) with follow-up jobs (--after) right below the job they wait for."""
+    ids = {r["id"] for r in rows}
+    children: dict[str | None, list[dict]] = {}
+    for r in rows:
+        parent = next((d for d in r.get("after") or [] if d in ids), None)
+        children.setdefault(parent, []).append(r)
+
+    def walk(r, depth):
+        yield r, depth
+        for child in children.get(r["id"], []):
+            yield from walk(child, depth + 1)
+
+    for root in children.get(None, []):
+        yield from walk(root, 0)
 
 
 def visible(row: dict, days: float | None) -> bool:
@@ -621,7 +804,13 @@ def visible(row: dict, days: float | None) -> bool:
 
 def progress_options(args) -> dict:
     return {"group": args.group, "progress_regex": args.progress_regex, "count_regex": args.count_regex,
-            "total": args.total}
+            "total": args.total, "stages": [s.strip() for s in args.stages.split(",")] if args.stages else None}
+
+
+def dependencies(args) -> list[str]:
+    """Job ids from --after (repeatable, comma-separated ids or names)."""
+    keys = [k.strip() for value in args.after or [] for k in value.split(",") if k.strip()]
+    return [m["id"] for m in resolve(keys)] if keys else []
 
 
 def cmd_run(args) -> int:
@@ -636,7 +825,7 @@ def cmd_run(args) -> int:
             "slurm_id": os.environ.get("SLURM_JOB_ID"), "log_owned": True,
             "max_log_bytes": int(args.max_log_mb * (1 << 20)),
             "progress_file": str(Path(args.progress_file).expanduser().resolve()) if args.progress_file else None,
-            **progress_options(args)}
+            "after": dependencies(args), **progress_options(args)}
     write_json(_file(job_id, ".json"), meta)
     if args.fg:
         print(f"jobrun: {job_id}  {meta['name']}  log: {log}", file=sys.stderr, flush=True)
@@ -648,7 +837,7 @@ def cmd_run(args) -> int:
     return 0
 
 
-def cmd_track(args, job_id: str | None = None, log_owned: bool = False) -> int:
+def cmd_track(args, job_id: str | None = None, log_owned: bool = False, after: list[str] | None = None) -> int:
     job_id = job_id or allocate_id()
     if args.pid is not None:
         pid = args.pid
@@ -667,7 +856,7 @@ def cmd_track(args, job_id: str | None = None, log_owned: bool = False) -> int:
         pattern = str(Path(args.log).expanduser().resolve()) if args.log else None
         meta = slurm_meta(str(args.slurm), log_pattern=pattern)
         meta["log_pattern"] = pattern
-    meta.update(id=job_id, log_owned=log_owned, **progress_options(args))
+    meta.update(id=job_id, log_owned=log_owned, after=after or [], **progress_options(args))
     if args.name:
         meta["name"] = args.name
     write_json(_file(job_id, ".json"), meta)
@@ -695,6 +884,12 @@ def _sets_output(sbatch_args: list[str]) -> bool:
 def cmd_sbatch(args) -> int:
     """Submit and track; without a chosen --output the Slurm log goes to the registry and is jobrun's."""
     rest = args.sbatch_args[1:] if args.sbatch_args[:1] == ["--"] else args.sbatch_args
+    after = dependencies(args)
+    if after:
+        slurm_ids = [str((read_json(_file(dep, ".json")) or {}).get("slurm_id") or "") for dep in after]
+        if not all(slurm_ids):
+            sys.exit("jobrun sbatch --after: dependencies must be Slurm jobs (use `jobrun run --after` otherwise)")
+        rest = [f"--dependency=afterok:{':'.join(slurm_ids)}", *rest]
     job_id, owned = allocate_id(), not _sets_output(rest)
     if owned:
         LOGS.mkdir(parents=True, exist_ok=True)
@@ -705,7 +900,7 @@ def cmd_sbatch(args) -> int:
         return out.returncode
     args.slurm, args.pid = out.stdout.strip().split(";")[0], None
     print(f"Submitted batch job {args.slurm}")
-    return cmd_track(args, job_id, log_owned=owned)
+    return cmd_track(args, job_id, log_owned=owned, after=after)
 
 
 def visible_rows(days: float | None) -> list[dict]:
@@ -731,16 +926,20 @@ def cmd_ls(args) -> int:
                       "finishing" if r.get("finishing") else fmt_eta(r["eta"]), fmt_duration(r["elapsed_s"]), where))
 
     by_name = {g["name"]: g for g in groups}
-    for r in rows:
+    for r, depth in chained([r for r in rows if not r.get("group") or r["group"] in by_name]):
         group = r.get("group")
-        if group and group in by_name:
+        if group and group in by_name and depth == 0:
             g = by_name.pop(group)
             line(g, "group", f"{group[:36]} ({g['finished']}/{g['jobs']} jobs)")
+            members = list(chained([m for m in rows if m.get("group") == group]))
         elif group:
             continue
-        for member in ([m for m in rows if m.get("group") == group] if group else [r]):
+        else:
+            members = [(r, depth)]
+        for member, level in members:
             where = (member["host"] or "") + (f" slurm:{member['slurm_id']}" if member["slurm_id"] else "")
-            line(member, member["id"], ("  " if group else "") + (member["name"] or "")[:40], where.strip())
+            indent = ("  " if group else "") + ("  " * (level - 1) + "↳ " if level else "")
+            line(member, member["id"], indent + (member["name"] or "")[:40], where.strip())
     widths = [max(len(row[i]) for row in table) for i in range(len(table[0]))]
     for row in table:
         print("  ".join(cell.ljust(w) for cell, w in zip(row, widths)).rstrip())
@@ -792,6 +991,8 @@ def cmd_stop(args) -> int:
             print(f"{meta['id']} is not running ({row['status']})")
             continue
         _file(meta["id"], ".stopped").touch()
+        if row["status"] == "waiting" and meta.get("kind") == "process":  # only the supervisor exists yet
+            meta = {**meta, "pid": meta.get("supervisor_pid"), "pgid": None, "proc_start": None}
         if meta.get("kind") == "slurm" or (meta.get("slurm_id") and meta.get("host") != HOST):
             cmd = ["scancel", str(meta["slurm_id"])]
             (HOME / "sacct-cache.json").unlink(missing_ok=True)
@@ -822,7 +1023,7 @@ def cmd_stop(args) -> int:
 
 def remove(meta: dict, keep_log: bool = False) -> None:
     """Drop a job from the registry, with the log if jobrun wrote it; logs it only read are kept."""
-    for suffix in (".json", ".exit.json", ".hb", ".stopped", ".state.json", ".trim"):
+    for suffix in (".json", ".exit.json", ".hb", ".stopped", ".state.json", ".scan.json", ".trim"):
         _file(meta["id"], suffix).unlink(missing_ok=True)
     log = meta.get("log")
     if log and not keep_log and (meta.get("log_owned") or Path(log).parent == LOGS):
@@ -884,9 +1085,12 @@ def main(argv: list[str] | None = None) -> int:
         p.add_argument("--count-regex", help="progress = number of log lines matching this regex")
         p.add_argument("--total", type=int, help="total for --count-regex or a done-only --progress-regex")
         p.add_argument("--group", help="group name; the dashboard sums progress over a group's jobs")
+        p.add_argument("--stages", help="planned stage names, comma-separated (shown before they are reached)")
 
     p = sub.add_parser("run", help="run a command under supervision (detached unless --fg)")
     progress_args(p)
+    p.add_argument("--after", action="append", metavar="JOB",
+                   help="start only after these jobs (ids or names, comma-separated) finished successfully")
     p.add_argument("--progress-file", help="parse progress from this file instead of the log")
     p.add_argument("--max-log-mb", type=float, default=MAX_LOG_MB,
                    help=f"trim the log to its last MB beyond this size (default {MAX_LOG_MB:g}, 0: never)")
@@ -903,6 +1107,8 @@ def main(argv: list[str] | None = None) -> int:
 
     p = sub.add_parser("sbatch", help="submit with sbatch and track the job")
     progress_args(p)
+    p.add_argument("--after", action="append", metavar="JOB",
+                   help="start only after these jobs (ids or names, comma-separated) finished successfully")
     p.add_argument("sbatch_args", nargs=argparse.REMAINDER)
     p.set_defaults(func=cmd_sbatch)
 
