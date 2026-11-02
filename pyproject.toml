@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "jobboard"
+version = "0.1.0"
+description = "Track long-running jobs (local, background, Slurm) with progress, rate and ETA; VS Code dashboard included."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.9"
+dependencies = []
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Operating System :: POSIX :: Linux",
+  "Topic :: System :: Monitoring",
+]
+
+[project.urls]
+Homepage = "https://github.com/KreitnerL/jobboard"
+
+[project.scripts]
+jobrun = "jobrun:main"
+
+[tool.setuptools]
+py-modules = ["jobrun"]

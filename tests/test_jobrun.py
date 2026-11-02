@@ -221,3 +221,18 @@ def test_supervisor_survives_registry_removal(jobrun):
     assert jobrun_module.pid_alive(row["pid"])  # the command keeps running under its supervisor
     time.sleep(1.5)
     assert not jobrun_module.pid_alive(supervisor) and not jobrun_module.pid_alive(row["pid"])
+
+
+def test_wait_blocks_until_done_and_reports_failure(jobrun):
+    jobrun("run", "--group", "w", "--name", "ok", "--", "sleep 0.5")
+    jobrun("run", "--group", "w", "--name", "bad", "--", "sleep 0.8; exit 1")
+    out = jobrun("wait", "--group", "w", "--interval", "0.2", check=False)
+    assert out.returncode == 1
+    assert "done" in out.stdout and "failed" in out.stdout
+    assert jobrun("wait", "ok", "--interval", "0.2").returncode == 0
+
+
+def test_slurm_log_pattern_expansion():
+    info = {"JobIDRaw": "42", "JobID": "42", "JobName": "train", "NodeList": "atlas", "WorkDir": "/w", "StdOut": ""}
+    assert jobrun_module._slurm_log("/logs/%x-%j.err", info) == "/logs/train-42.err"
+    assert jobrun_module._slurm_log("", info) == "/w/slurm-42.out"

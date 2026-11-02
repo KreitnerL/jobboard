@@ -245,8 +245,11 @@ def _slurm_log(pattern: str, info: dict) -> str:
     return os.path.join(info["WorkDir"] or "", expanded)
 
 
-def slurm_meta(slurm_id: str, attempts: int = 10) -> dict:
-    """Metadata from sacct (scontrol is disabled on client machines); retries until the job shows up."""
+def slurm_meta(slurm_id: str, attempts: int = 10, log_pattern: str | None = None) -> dict:
+    """Metadata from sacct (scontrol is disabled on some clusters); retries until the job shows up.
+
+    The log is the job's StdOut, or log_pattern (sbatch patterns like %x-%j.err) to follow e.g. stderr.
+    """
     fields = ["JobIDRaw", "JobID", "JobName", "StdOut", "WorkDir", "NodeList", "Submit", "SubmitLine"]
     for attempt in range(attempts):
         out = subprocess.run(["sacct", "-X", "-n", "-P", "-j", slurm_id, "-o", ",".join(fields)],
@@ -257,7 +260,8 @@ def slurm_meta(slurm_id: str, attempts: int = 10) -> dict:
             return {
                 "kind": "slurm", "slurm_id": slurm_id, "name": info["JobName"],
                 "cmd": [info["SubmitLine"]] if info["SubmitLine"] else [], "cwd": info["WorkDir"],
-                "log": _slurm_log(info["StdOut"], info), "started": _slurm_time(info["Submit"]) or time.time(),
+                "log": _slurm_log(log_pattern or info["StdOut"], info),
+                "started": _slurm_time(info["Submit"]) or time.time(),
             }
         if attempt + 1 < attempts:
             time.sleep(0.5)
@@ -512,7 +516,7 @@ def snapshots(metas: list[dict]) -> list[dict]:
                   if m.get("kind") == "slurm" and not (read_json(_file(m["id"], ".state.json"), {}) or {}).get("final")]
     for meta in open_slurm:
         if not meta.get("log"):  # sacct had no record yet at registration
-            fresh = slurm_meta(str(meta["slurm_id"]), attempts=1)
+            fresh = slurm_meta(str(meta["slurm_id"]), attempts=1, log_pattern=meta.get("log_pattern"))
             if fresh.get("log"):
                 meta.update({k: v for k, v in fresh.items() if not meta.get(k) or k == "name" and
                              meta["name"] == f"slurm-{meta['slurm_id']}"})
@@ -652,9 +656,9 @@ def cmd_track(args, job_id: str | None = None, log_owned: bool = False) -> int:
                 "log": str(Path(log).expanduser().resolve()) if log else None,
                 "started": proc_started_at(pid), "pid": pid, "proc_start": proc_start(pid)}
     else:
-        meta = slurm_meta(str(args.slurm))
-        if args.log:
-            meta["log"] = str(Path(args.log).expanduser().resolve())
+        pattern = str(Path(args.log).expanduser().resolve()) if args.log else None
+        meta = slurm_meta(str(args.slurm), log_pattern=pattern)
+        meta["log_pattern"] = pattern
     meta.update(id=job_id, log_owned=log_owned, **progress_options(args))
     if args.name:
         meta["name"] = args.name
@@ -838,6 +842,19 @@ def cmd_clean(args) -> int:
     return 0
 
 
+def cmd_wait(args) -> int:
+    """Block until the selected jobs finish; exit 0 only if all of them are done."""
+    ids = [m["id"] for m in select(args)]
+    while True:
+        rows = snapshots([m for m in (read_json(_file(i, ".json")) for i in ids) if m])
+        if all(r["status"] not in ACTIVE for r in rows):
+            break
+        time.sleep(args.interval)
+    for r in rows:
+        print(f"{r['id']}  {r['status']:<7} {r['name']}  {fmt_progress(r)}  {fmt_duration(r['elapsed_s'])}".rstrip())
+    return 0 if rows and all(r["status"] == "done" for r in rows) else 1
+
+
 def cmd_log(args) -> int:
     log = resolve([args.id])[0].get("log")
     if not log:
@@ -908,6 +925,12 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("clean", help="remove finished jobs older than --days")
     p.add_argument("--days", type=float, default=7)
     p.set_defaults(func=cmd_clean)
+
+    p = sub.add_parser("wait", help="block until jobs finish (exit 1 if any did not succeed)")
+    p.add_argument("ids", nargs="*")
+    p.add_argument("--group", help="all jobs of this group")
+    p.add_argument("--interval", type=float, default=30, help="seconds between checks (default 30)")
+    p.set_defaults(func=cmd_wait)
 
     p = sub.add_parser("log", help="tail a job's log")
     p.add_argument("id")
