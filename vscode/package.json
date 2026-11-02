@@ -3,7 +3,7 @@
   "displayName": "Job Board",
   "description": "Running and finished jobs from the jobrun registry: progress, rate, ETA, logs, stop.",
   "publisher": "kreitner",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "license": "MIT",
   "engines": {
     "vscode": "^1.80.0"

@@ -84,8 +84,11 @@ function describe(job) {
     if (job.fraction != null) parts.push(`${bar(job.fraction)} ${Math.round(job.fraction * 100)}%`, `${count(job.done)}/${count(job.total)}`);
     else if (job.done != null) parts.push(`${count(job.done)} done`);
     else parts.push(job.status);
-    if (job.rate_per_s) parts.push(rate(job.rate_per_s));
-    if (job.eta) parts.push(`ETA ${clock(job.eta)}`);
+    if (job.rate_per_s && !job.finishing) parts.push(rate(job.rate_per_s));
+    if (job.finishing) {
+      const idle = job.progress_at ? ` · last step ${duration(Date.now() / 1000 - job.progress_at)} ago` : '';
+      parts.push(`finishing${idle}`);
+    } else if (job.eta) parts.push(`ETA ${clock(job.eta)}`);
     parts.push(duration(job.elapsed_s));
   } else {
     parts.push(job.exit_code != null && job.status !== 'done' ? `${job.status} (${job.exit_code})` : job.status);
@@ -105,9 +108,11 @@ function tooltip(job) {
     ['ended', job.ended && new Date(job.ended * 1000).toLocaleString()], ['elapsed', duration(job.elapsed_s)],
     ['progress', job.done != null ? `${job.done}${job.total ? ` / ${job.total}` : ''}` : ''],
     ['rate', rate(job.rate_per_s)], ['ETA', job.eta && new Date(job.eta * 1000).toLocaleString()],
+    ['last progress', job.progress_at && `${new Date(job.progress_at * 1000).toLocaleString()} (${duration(Date.now() / 1000 - job.progress_at)} ago)`],
     ['cwd', job.cwd], ['log', job.log],
   ];
   for (const [key, value] of rows) if (value) md.appendMarkdown(`${key}: \`${value}\`  \n`);
+  if (job.finishing) md.appendMarkdown('\n*At or past its total but still running: a final phase the progress pattern does not count, or a too small total.*\n\n');
   if (job.cmd) md.appendCodeblock(job.cmd, 'shell');
   if (job.last_line) md.appendCodeblock(job.last_line, 'text');
   return md;

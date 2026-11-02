@@ -15,6 +15,9 @@ The user watches all long jobs on a dashboard fed by `jobrun`. A job that is not
    related jobs. Use one job per independently running process (e.g. one per tuning variant).
 3. Measure progress in the unit the user would ask about (completed trials, cases, epochs), not inner steps.
    Use count mode (`--count-regex ... --total N`) for items that finish out of order, e.g. parallel trials.
+   Cover every phase: check what the script does after its main loop (re-timing, final evaluation, export)
+   and count those lines too, e.g. `--count-regex 'Trial \d+ (completed|re-timed)' --total 105` for 100 trials
+   plus 5 re-timed finalists. A job at 100% that keeps running shows as "finishing" on the dashboard.
 4. If no existing log line fits, make the script print `JOBRUN_PROGRESS <done>/<total>` throttled by time
    (at most every ~10 s), never once per step of a fast loop.
 5. After launching, tell the user the job id (or group). To check on jobs use `jobrun ls` / `jobrun show ID`

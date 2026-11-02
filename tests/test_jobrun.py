@@ -247,3 +247,13 @@ def test_rm_is_idempotent_and_json_is_versioned(jobrun):
     assert jobrun("rm", "--group", "g").returncode == 0
     assert jobrun("stop", "nonexistent", check=False).returncode != 0  # stop stays strict
     assert listing(jobrun)["schema"] == jobrun_module.JSON_SCHEMA
+
+
+def test_job_past_its_total_is_finishing(jobrun):
+    jobrun("run", "--name", "tail", "--count-regex", "completed", "--total", "2", "--",
+           "echo 'Trial 1 completed'; echo 'Trial 0 completed'; sleep 300")
+    row = wait_for(jobrun, "tail", "running")
+    time.sleep(0.3)
+    row = rows(jobrun)["tail"]
+    assert (row["done"], row["finishing"], row["eta"]) == (2, True, None) and row["progress_at"]
+    assert "finishing" in jobrun("ls").stdout

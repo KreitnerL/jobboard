@@ -470,6 +470,7 @@ def update_rate(state: dict, done: int, total: int | None, now: float, started: 
     state["total"] = total
     if not samples or samples[-1][1] != done:
         samples.append([now, done])
+        state["progress_at"] = now
     older = [s for s in samples if now - s[0] > RATE_WINDOW_S]
     samples = older[-1:] + [s for s in samples if now - s[0] <= RATE_WINDOW_S]
     state["samples"] = samples
@@ -503,7 +504,9 @@ def snapshot(meta: dict, slurm: dict) -> dict:
         cmd=shlex.join(meta.get("cmd") or []), status=status, exit_code=exit_code, started=started,
         ended=ended, elapsed_s=(ended or now) - started, done=done, total=total,
         fraction=done / total if done is not None and total else None, rate_per_s=rate, eta=eta,
-        last_line=last_line,
+        last_line=last_line, progress_at=state.get("progress_at"),
+        # at or past the total but still running: an untracked final phase (or a too small --total)
+        finishing=status in ACTIVE and bool(total) and done is not None and done >= total,
     )
     row["host"] = slurm_info.get("host") or row["host"]
     if status in FINAL:
@@ -556,6 +559,7 @@ def group_rows(rows: list[dict]) -> list[dict]:
             "fraction": done / total if done is not None and total else None,
             "rate_per_s": sum(r["rate_per_s"] or 0 for r in active) or None,
             "eta": max(etas) if etas else None, "started": started, "ended": ended,
+            "finishing": bool(active) and all(r.get("finishing") for r in active),
             "elapsed_s": (ended or time.time()) - started,
         })
     return groups
@@ -724,7 +728,7 @@ def cmd_ls(args) -> int:
 
     def line(r, job_id, name, where=""):
         table.append((job_id, r["status"], name, fmt_progress(r), fmt_rate(r["rate_per_s"]),
-                      fmt_eta(r["eta"]), fmt_duration(r["elapsed_s"]), where))
+                      "finishing" if r.get("finishing") else fmt_eta(r["eta"]), fmt_duration(r["elapsed_s"]), where))
 
     by_name = {g["name"]: g for g in groups}
     for r in rows:
