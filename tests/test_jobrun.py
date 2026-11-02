@@ -7,6 +7,9 @@ from pathlib import Path
 
 import pytest
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import jobrun as jobrun_module  # noqa: E402
+
 JOBRUN = Path(__file__).resolve().parents[1] / "jobrun.py"
 
 
@@ -22,11 +25,20 @@ def jobrun(tmp_path, monkeypatch):
         return out
 
     call.home = tmp_path / "registry"
-    return call
+    yield call
+    # never leak processes, also when a test fails half-way
+    active = [r["id"] for r in json.loads(call("ls", "--json", "--all").stdout)["jobs"]
+              if r["status"] in ("starting", "running")]
+    if active:
+        call("stop", *active, "--force", check=False)
+
+
+def listing(jobrun):
+    return json.loads(jobrun("ls", "--json", "--all").stdout)
 
 
 def rows(jobrun):
-    return {r["name"]: r for r in json.loads(jobrun("ls", "--json", "--all").stdout)}
+    return {r["name"]: r for r in listing(jobrun)["jobs"]}
 
 
 def wait_for(jobrun, name, status, timeout=10):
@@ -118,3 +130,94 @@ def test_rm_and_clean(jobrun):
     assert set(rows(jobrun)) == {"b"}
     jobrun("clean", "--days", "0")
     assert rows(jobrun) == {}
+
+
+def test_group_sums_progress_and_stops_together(jobrun):
+    for name in ("v1", "v2"):
+        jobrun("run", "--group", "sweep", "--name", name, "--count-regex", "Trial .* completed", "--total", "100",
+               "--", "echo 'Trial 1 completed'; echo 'Trial 2 completed'; sleep 300")
+    jobrun("run", "--group", "sweep", "--name", "v3", "--count-regex", "completed", "--total", "100", "--", "true")
+    wait_for(jobrun, "v1", "running")
+    wait_for(jobrun, "v3", "done")
+    time.sleep(0.3)
+    group = listing(jobrun)["groups"][0]
+    assert (group["name"], group["status"], group["jobs"], group["finished"]) == ("sweep", "running", 3, 1)
+    assert (group["done"], group["total"]) == (4, 300)
+    assert "sweep (1/3 jobs)" in jobrun("ls").stdout
+    jobrun("stop", "--group", "sweep", "--grace", "2")
+    group = listing(jobrun)["groups"][0]
+    assert (group["status"], group["finished"]) == ("killed", 3)
+
+
+def test_rm_deletes_only_logs_jobrun_wrote(jobrun, tmp_path):
+    own = tmp_path / "out" / "own.log"
+    jobrun("run", "--name", "owned", "--log", str(own), "--", "echo hi")
+    borrowed = tmp_path / "worker.log"
+    borrowed.write_text("[1/2] x\n")
+    proc = subprocess.Popen(["sleep", "0.5"])
+    jobrun("track", "--pid", str(proc.pid), "--name", "borrowed", "--log", str(borrowed))
+    proc.wait()
+    wait_for(jobrun, "owned", "done")
+    wait_for(jobrun, "borrowed", "ended")
+    jobrun("rm", "owned", "borrowed")
+    assert not own.exists() and borrowed.exists()
+
+
+def test_log_is_trimmed_and_count_survives_trimming(jobrun):
+    script = ("import time\nfor i in range(30):\n print('completed ' + 'x' * 100000, flush=True); time.sleep(0.05)\n"
+              "time.sleep(1.5)")
+    jobrun("run", "--name", "big", "--max-log-mb", "1", "--count-regex", "^completed", "--total", "30",
+           "--", sys.executable, "-c", script)
+    time.sleep(0.8)
+    rows(jobrun)  # count part of the log before it is trimmed
+    row = wait_for(jobrun, "big", "done")
+    assert os.path.getsize(row["log"]) < 2 << 20
+    assert "jobrun: log exceeded" in Path(row["log"]).read_text()
+    assert 20 <= row["done"] <= 30  # lines written between two refreshes may be trimmed unseen
+
+
+def test_count_mode_reads_large_logs_in_bounded_chunks(jobrun, tmp_path, monkeypatch):
+    log = tmp_path / "huge.log"
+    log.write_text("step done\n" * 200000)
+    monkeypatch.setattr(jobrun_module, "COUNT_CHUNK_BYTES", 64 * 1024)
+    monkeypatch.setattr(jobrun_module, "COUNT_BUDGET_BYTES", 1 << 20)
+    meta, state = {"id": "x", "log": str(log), "count_regex": "done", "total": None}, {}
+    done, _, _ = jobrun_module.parse_progress(meta, state)
+    assert done < 200000 and state["offset"] <= 1 << 20
+    while done < 200000:
+        done, _, _ = jobrun_module.parse_progress(meta, state)
+    assert done == 200000
+
+
+def test_sbatch_output_detection(tmp_path):
+    script = tmp_path / "job.sbatch"
+    script.write_text("#!/bin/bash\n#SBATCH --time=1\n#SBATCH -o out/%j.log\npython x.py\n")
+    plain = tmp_path / "plain.sbatch"
+    plain.write_text("#!/bin/bash\n#SBATCH --time=1\npython x.py\n#SBATCH -o ignored.log\n")
+    assert jobrun_module._sets_output([str(script)])
+    assert not jobrun_module._sets_output([str(plain)])
+    assert jobrun_module._sets_output(["--output=x.log", str(plain)])
+    assert not jobrun_module._sets_output(["--wrap", "echo hi"])
+
+
+def test_compact_counts():
+    assert [jobrun_module.fmt_count(n) for n in (999, 12345, 4_120_000, 1_000_000_000)] == ["999", "12.3k", "4.12M", "1G"]
+
+
+def test_exact_name_beats_id_substring(jobrun):
+    jobrun("run", "--name", "a", "--", "true")
+    job_id = rows(jobrun)["a"]["id"]
+    jobrun("run", "--name", job_id[-2:], "--", "true")  # a name that is also a substring of an id
+    assert json.loads(jobrun("show", job_id[-2:]).stdout)["name"] == job_id[-2:]
+
+
+def test_supervisor_survives_registry_removal(jobrun):
+    import shutil
+    jobrun("run", "--name", "survivor", "--", "sleep", "1.5")
+    row = wait_for(jobrun, "survivor", "running")
+    supervisor = json.loads((jobrun.home / "jobs" / f"{row['id']}.json").read_text())["supervisor_pid"]
+    shutil.rmtree(jobrun.home)
+    time.sleep(1)
+    assert jobrun_module.pid_alive(row["pid"])  # the command keeps running under its supervisor
+    time.sleep(1.5)
+    assert not jobrun_module.pid_alive(supervisor) and not jobrun_module.pid_alive(row["pid"])

@@ -39,7 +39,13 @@ HOST = socket.gethostname()
 
 HEARTBEAT_S = float(os.environ.get("JOBRUN_HEARTBEAT_S", 30))
 STALE_S = 5 * HEARTBEAT_S
+CHECK_S = min(HEARTBEAT_S, 5)  # supervisor wake-up: heartbeat and log size check
+MAX_LOG_MB = float(os.environ.get("JOBRUN_MAX_LOG_MB", 512))  # cap for logs jobrun writes; 0 disables
+TRIM_KEEP_BYTES = 1 << 20  # tail kept when a log is trimmed
 TAIL_BYTES = 256 * 1024
+COUNT_CHUNK_BYTES = 8 << 20  # count mode reads in chunks ...
+COUNT_BUDGET_BYTES = 256 << 20  # ... and at most this much per refresh
+SACCT_TTL_S = 30
 RATE_WINDOW_S = 15 * 60
 ACTIVE = ("starting", "pending", "running", "unknown")
 # "lost" may recover (NFS hiccup, supervisor between child exit and exit file), so it is never cached.
@@ -108,12 +114,12 @@ def load_jobs() -> list[dict]:
 
 
 def resolve(keys: list[str]) -> list[dict]:
-    """Jobs by exact id, unique id substring, or exact name."""
+    """Jobs by exact id, exact name, or unique id substring."""
     metas = load_jobs()
     found = []
     for key in keys:
-        hits = ([m for m in metas if m["id"] == key] or [m for m in metas if key in m["id"]]
-                or [m for m in metas if m.get("name") == key])
+        hits = ([m for m in metas if m["id"] == key] or [m for m in metas if m.get("name") == key]
+                or [m for m in metas if key in m["id"]])
         if len(hits) != 1:
             listing = "".join(f"\n  {m['id']}  {m.get('name')}" for m in hits)
             sys.exit(f"jobrun: {key!r} matches {len(hits)} jobs{listing}")
@@ -195,8 +201,13 @@ def _slurm_time(value: str | None) -> float | None:
 
 
 def query_slurm(ids: list[str]) -> dict[str, dict]:
+    """sacct states, cached for SACCT_TTL_S across all readers so open dashboards don't hammer slurmdbd."""
     if not ids or not shutil.which("sacct"):
         return {}
+    cache_path = HOME / "sacct-cache.json"
+    cache = read_json(cache_path, {}) or {}
+    if time.time() - cache.get("time", 0) < SACCT_TTL_S and set(ids) <= set(cache.get("info", {})):
+        return cache["info"]
     try:
         out = subprocess.run(["sacct", "-X", "-n", "-P", "-j", ",".join(ids),
                               "-o", "JobIDRaw,State,ExitCode,Start,End,NodeList"],
@@ -217,6 +228,10 @@ def query_slurm(ids: list[str]) -> dict[str, dict]:
             "ended": None if status in ACTIVE else _slurm_time(end),
             "host": None if nodes in ("", "None assigned") else nodes,
         }
+    try:
+        write_json(cache_path, {"time": time.time(), "info": info})
+    except OSError:
+        pass
     return info
 
 
@@ -250,6 +265,37 @@ def slurm_meta(slurm_id: str, attempts: int = 10) -> dict:
 
 
 # ---------------------------------------------------------------- supervisor
+
+def dropped_bytes(job_id: str) -> int:
+    """Bytes trimmed from the head of the job's log so far (logical offset = physical + dropped)."""
+    try:
+        return int(_file(job_id, ".trim").read_text())
+    except (OSError, ValueError):
+        return 0
+
+
+def trim_log(job_id: str, log: str, max_bytes: int) -> None:
+    """Keep only the last TRIM_KEEP_BYTES of whole lines once the log exceeds max_bytes.
+
+    The command writes with O_APPEND, so it keeps appending at the new end; output written between
+    reading the tail and truncating is lost, which is acceptable for a log that big.
+    """
+    try:
+        size = os.path.getsize(log)
+        if size <= max_bytes:
+            return
+        with open(log, "r+b") as handle:
+            handle.seek(max(0, size - TRIM_KEEP_BYTES))
+            tail = handle.read(TRIM_KEEP_BYTES)
+            tail = tail[tail.find(b"\n") + 1:]
+            marker = f"jobrun: log exceeded {max_bytes >> 20} MB, dropped the oldest {size - len(tail)} bytes\n".encode()
+            handle.truncate(0)
+        with open(log, "ab") as handle:
+            handle.write(marker + tail)
+        _file(job_id, ".trim").write_text(str(dropped_bytes(job_id) + size - len(tail) - len(marker)))
+    except OSError:
+        pass
+
 
 def supervise(job_id: str, tee: bool = False) -> int:
     """Run the job's command, keep a heartbeat, record its exit. With tee, also copy output to stdout."""
@@ -294,16 +340,25 @@ def supervise(job_id: str, tee: bool = False) -> int:
             pump.start()
 
         heartbeat = _file(job_id, ".hb")
+        max_bytes = meta.get("max_log_bytes") or 0
         while True:
-            heartbeat.touch()
+            try:  # registry trouble (NFS, a removed folder) must never kill the supervisor
+                heartbeat.touch()
+            except OSError:
+                pass
+            if max_bytes:
+                trim_log(job_id, meta["log"], max_bytes)
             try:
-                code = proc.wait(timeout=HEARTBEAT_S)
+                code = proc.wait(timeout=CHECK_S)
                 break
             except subprocess.TimeoutExpired:
                 pass
         if pump:
             pump.join(timeout=5)
-    write_json(_file(job_id, ".exit.json"), {"exit_code": code, "ended": time.time()})
+    try:
+        write_json(_file(job_id, ".exit.json"), {"exit_code": code, "ended": time.time()})
+    except OSError:
+        pass
     return code if code >= 0 else 128 - code
 
 
@@ -366,15 +421,25 @@ def parse_progress(meta: dict, state: dict) -> tuple[int | None, int | None, str
         size = os.fstat(handle.fileno()).st_size
         if meta.get("count_regex"):
             pattern = re.compile(meta["count_regex"])
-            offset, count = state.get("offset", 0), state.get("count", 0)
-            if size < offset:
-                offset, count = 0, 0
-            handle.seek(offset)
-            chunk = handle.read(size - offset)
-            complete = chunk.rfind(b"\n") + 1
-            count += sum(1 for line in chunk[:complete].decode(errors="replace").splitlines()
-                         if pattern.search(line))
-            state.update(offset=offset + complete, count=count)
+            dropped = dropped_bytes(meta["id"]) if meta.get("log_owned") and path == meta.get("log") else 0
+            position, count = max(0, state.get("offset", 0) - dropped), state.get("count", 0)
+            if position > size:  # replaced by a shorter file
+                position, count = 0, 0
+            handle.seek(position)
+            budget = COUNT_BUDGET_BYTES
+            while budget > 0:
+                chunk = handle.read(min(COUNT_CHUNK_BYTES, budget))
+                complete = chunk.rfind(b"\n") + 1
+                if not complete:
+                    if len(chunk) < COUNT_CHUNK_BYTES:
+                        break  # partial last line, count it once it is complete
+                    complete = len(chunk)  # one enormous line: skip it
+                count += sum(1 for line in chunk[:complete].decode(errors="replace").splitlines()
+                             if pattern.search(line))
+                position += complete
+                budget -= complete
+                handle.seek(position)
+            state.update(offset=position + dropped, count=count)
             done = count
         handle.seek(max(0, size - TAIL_BYTES))
         tail = handle.read().decode(errors="replace")
@@ -424,7 +489,8 @@ def snapshot(meta: dict, slurm: dict) -> dict:
     eta = None
     if status in ACTIVE and rate and total and done is not None and done < total:
         eta = now + (total - done) / rate
-    row = {key: meta.get(key) for key in ("id", "name", "kind", "host", "slurm_id", "pid", "cwd", "log")}
+    row = {key: meta.get(key) for key in ("id", "name", "group", "kind", "host", "slurm_id", "pid", "cwd", "log")}
+    row["log_owned"] = bool(meta.get("log_owned"))
     row.update(
         cmd=shlex.join(meta.get("cmd") or []), status=status, exit_code=exit_code, started=started,
         ended=ended, elapsed_s=(ended or now) - started, done=done, total=total,
@@ -456,7 +522,47 @@ def snapshots(metas: list[dict]) -> list[dict]:
     return [snapshot(m, slurm) for m in metas]
 
 
+def group_rows(rows: list[dict]) -> list[dict]:
+    """One summary per group: progress summed over members, ETA of the slowest active member."""
+    members: dict[str, list[dict]] = {}
+    for row in rows:
+        if row.get("group"):
+            members.setdefault(row["group"], []).append(row)
+    groups = []
+    for name, jobs in members.items():
+        active = [r for r in jobs if r["status"] in ACTIVE]
+        bad = [r for r in jobs if r["status"] not in ACTIVE and r["status"] != "done"]
+        if active:
+            status = "running" if any(r["status"] == "running" for r in active) else active[0]["status"]
+        else:
+            status = ("killed" if all(r["status"] == "killed" for r in bad) else "failed") if bad else "done"
+        known = [r for r in jobs if r["done"] is not None]
+        done = sum(min(r["done"], r["total"] or r["done"]) for r in known) if known else None
+        total = sum(r["total"] for r in jobs) if all(r["total"] for r in jobs) else None
+        etas = [r["eta"] for r in active if r["eta"]]
+        started = min(r["started"] for r in jobs)
+        ended = None if active else max(r["ended"] or r["started"] for r in jobs)
+        groups.append({
+            "name": name, "status": status, "jobs": len(jobs), "finished": len(jobs) - len(active),
+            "failed": len(bad), "ids": [r["id"] for r in jobs], "done": done, "total": total,
+            "fraction": done / total if done is not None and total else None,
+            "rate_per_s": sum(r["rate_per_s"] or 0 for r in active) or None,
+            "eta": max(etas) if etas else None, "started": started, "ended": ended,
+            "elapsed_s": (ended or time.time()) - started,
+        })
+    return groups
+
+
 # ---------------------------------------------------------------- formatting
+
+def fmt_count(n: int | None) -> str:
+    if n is None:
+        return ""
+    for suffix, scale in (("G", 1e9), ("M", 1e6), ("k", 1e3)):
+        if n >= 10 * scale if suffix == "k" else n >= scale:
+            return f"{n / scale:.3g}{suffix}"
+    return str(n)
+
 
 def fmt_duration(seconds: float | None) -> str:
     if seconds is None:
@@ -489,8 +595,8 @@ def fmt_progress(row: dict) -> str:
     if row["done"] is None:
         return ""
     if row["fraction"] is not None:
-        return f"{row['fraction'] * 100:3.0f}% {row['done']}/{row['total']}"
-    return str(row["done"])
+        return f"{row['fraction'] * 100:3.0f}% {fmt_count(row['done'])}/{fmt_count(row['total'])}"
+    return fmt_count(row["done"])
 
 
 def visible(row: dict, days: float | None) -> bool:
@@ -502,7 +608,8 @@ def visible(row: dict, days: float | None) -> bool:
 # ---------------------------------------------------------------- commands
 
 def progress_options(args) -> dict:
-    return {"progress_regex": args.progress_regex, "count_regex": args.count_regex, "total": args.total}
+    return {"group": args.group, "progress_regex": args.progress_regex, "count_regex": args.count_regex,
+            "total": args.total}
 
 
 def cmd_run(args) -> int:
@@ -514,7 +621,8 @@ def cmd_run(args) -> int:
     log.parent.mkdir(parents=True, exist_ok=True)
     meta = {"id": job_id, "name": args.name or default_name(cmd), "kind": "process", "cmd": cmd,
             "cwd": os.getcwd(), "host": HOST, "log": str(log), "started": time.time(),
-            "slurm_id": os.environ.get("SLURM_JOB_ID"),
+            "slurm_id": os.environ.get("SLURM_JOB_ID"), "log_owned": True,
+            "max_log_bytes": int(args.max_log_mb * (1 << 20)),
             "progress_file": str(Path(args.progress_file).expanduser().resolve()) if args.progress_file else None,
             **progress_options(args)}
     write_json(_file(job_id, ".json"), meta)
@@ -528,8 +636,8 @@ def cmd_run(args) -> int:
     return 0
 
 
-def cmd_track(args) -> int:
-    job_id = allocate_id()
+def cmd_track(args, job_id: str | None = None, log_owned: bool = False) -> int:
+    job_id = job_id or allocate_id()
     if args.pid is not None:
         pid = args.pid
         if not pid_alive(pid):
@@ -547,7 +655,7 @@ def cmd_track(args) -> int:
         meta = slurm_meta(str(args.slurm))
         if args.log:
             meta["log"] = str(Path(args.log).expanduser().resolve())
-    meta.update(id=job_id, **progress_options(args))
+    meta.update(id=job_id, log_owned=log_owned, **progress_options(args))
     if args.name:
         meta["name"] = args.name
     write_json(_file(job_id, ".json"), meta)
@@ -555,32 +663,72 @@ def cmd_track(args) -> int:
     return 0
 
 
+def _sets_output(sbatch_args: list[str]) -> bool:
+    """Whether the command line or the batch script's #SBATCH header chooses the output file."""
+    if any(a == "-o" or a.startswith(("--output", "-o")) for a in sbatch_args):
+        return True
+    script = next((a for a in sbatch_args if not a.startswith("-") and os.path.isfile(a)), None)
+    if not script:
+        return False
+    with open(script, errors="replace") as handle:
+        for line in handle:
+            if line.startswith("#SBATCH"):
+                if re.search(r"\s(-o|--output)\b", line):
+                    return True
+            elif line.strip() and not line.startswith("#"):
+                break  # sbatch stops reading directives at the first command
+    return False
+
+
 def cmd_sbatch(args) -> int:
+    """Submit and track; without a chosen --output the Slurm log goes to the registry and is jobrun's."""
     rest = args.sbatch_args[1:] if args.sbatch_args[:1] == ["--"] else args.sbatch_args
+    job_id, owned = allocate_id(), not _sets_output(rest)
+    if owned:
+        LOGS.mkdir(parents=True, exist_ok=True)
+        rest = [f"--output={LOGS / job_id}.log", *rest]
     out = subprocess.run(["sbatch", "--parsable", *rest], capture_output=True, text=True)
     if out.returncode:
         sys.stderr.write(out.stderr)
         return out.returncode
     args.slurm, args.pid = out.stdout.strip().split(";")[0], None
     print(f"Submitted batch job {args.slurm}")
-    return cmd_track(args)
+    return cmd_track(args, job_id, log_owned=owned)
+
+
+def visible_rows(days: float | None) -> list[dict]:
+    """Rows to show; a group stays complete as long as any member is visible."""
+    rows = snapshots(load_jobs())
+    shown = {r.get("group") for r in rows if r.get("group") and visible(r, days)}
+    return [r for r in rows if visible(r, days) or r.get("group") in shown]
 
 
 def cmd_ls(args) -> int:
-    rows = [r for r in snapshots(load_jobs()) if visible(r, None if args.all else args.days)]
+    rows = visible_rows(None if args.all else args.days)
+    groups = group_rows(rows)
     if args.json:
-        print(json.dumps(rows))
+        print(json.dumps({"jobs": rows, "groups": groups}))
         return 0
     if not rows:
         print("no jobs")
         return 0
     table = [("ID", "STATUS", "NAME", "PROGRESS", "RATE", "ETA", "ELAPSED", "WHERE")]
+
+    def line(r, job_id, name, where=""):
+        table.append((job_id, r["status"], name, fmt_progress(r), fmt_rate(r["rate_per_s"]),
+                      fmt_eta(r["eta"]), fmt_duration(r["elapsed_s"]), where))
+
+    by_name = {g["name"]: g for g in groups}
     for r in rows:
-        where = r["host"] or ""
-        if r["slurm_id"]:
-            where += f" slurm:{r['slurm_id']}"
-        table.append((r["id"], r["status"], (r["name"] or "")[:40], fmt_progress(r), fmt_rate(r["rate_per_s"]),
-                      fmt_eta(r["eta"]), fmt_duration(r["elapsed_s"]), where.strip()))
+        group = r.get("group")
+        if group and group in by_name:
+            g = by_name.pop(group)
+            line(g, "group", f"{group[:36]} ({g['finished']}/{g['jobs']} jobs)")
+        elif group:
+            continue
+        for member in ([m for m in rows if m.get("group") == group] if group else [r]):
+            where = (member["host"] or "") + (f" slurm:{member['slurm_id']}" if member["slurm_id"] else "")
+            line(member, member["id"], ("  " if group else "") + (member["name"] or "")[:40], where.strip())
     widths = [max(len(row[i]) for row in table) for i in range(len(table[0]))]
     for row in table:
         print("  ".join(cell.ljust(w) for cell, w in zip(row, widths)).rstrip())
@@ -592,12 +740,25 @@ def cmd_show(args) -> int:
     return 0
 
 
-def kill_local(meta: dict, force: bool, grace: float) -> None:
+def select(args) -> list[dict]:
+    """Jobs named by ids and/or --group."""
+    metas = resolve(args.ids) if args.ids else []
+    if args.group:
+        members = [m for m in load_jobs() if m.get("group") == args.group]
+        if not members:
+            sys.exit(f"jobrun: no jobs in group {args.group!r}")
+        metas += [m for m in members if m["id"] not in {x["id"] for x in metas}]
+    if not metas:
+        sys.exit("jobrun: give job ids or --group")
+    return metas
+
+
+def signal_local(meta: dict, sig: int) -> list[int]:
+    """Signal a local job's process group and descendants; returns the signalled pids."""
     pid = meta["pid"]
     if not pid_alive(pid, meta.get("proc_start")):
-        return
+        return []
     targets = [pid] + descendants(pid)
-    sig = signal.SIGKILL if force else signal.SIGTERM
     if meta.get("pgid"):
         try:
             os.killpg(meta["pgid"], sig)
@@ -608,31 +769,25 @@ def kill_local(meta: dict, force: bool, grace: float) -> None:
             os.kill(target, sig)
         except ProcessLookupError:
             pass
-    deadline = time.time() + grace
-    while time.time() < deadline and any(pid_alive(t) for t in targets):
-        time.sleep(0.2)
-    for target in targets:
-        if pid_alive(target):
-            try:
-                os.kill(target, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+    return targets
 
 
 def cmd_stop(args) -> int:
-    rc = 0
-    for meta, row in zip(metas := resolve(args.ids), snapshots(metas)):
+    """SIGTERM every selected job at once, then one shared grace period before SIGKILL."""
+    rc, local = 0, []
+    for meta, row in zip(metas := select(args), snapshots(metas)):
         if row["status"] not in ACTIVE:
             print(f"{meta['id']} is not running ({row['status']})")
             continue
         _file(meta["id"], ".stopped").touch()
         if meta.get("kind") == "slurm" or (meta.get("slurm_id") and meta.get("host") != HOST):
             cmd = ["scancel", str(meta["slurm_id"])]
+            (HOME / "sacct-cache.json").unlink(missing_ok=True)
         elif meta.get("host") != HOST:
             target = f"-{meta['pgid']}" if meta.get("pgid") else str(meta["pid"])
             cmd = ["ssh", "-o", "BatchMode=yes", meta["host"], "kill", "-KILL" if args.force else "-TERM", "--", target]
         else:
-            kill_local(meta, args.force, args.grace)
+            local += signal_local(meta, signal.SIGKILL if args.force else signal.SIGTERM)
             print(f"stopped {meta['id']}  {meta.get('name')}")
             continue
         out = subprocess.run(cmd, capture_output=True, text=True)
@@ -641,23 +796,33 @@ def cmd_stop(args) -> int:
             print(f"{meta['id']}: {shlex.join(cmd)} failed: {out.stderr.strip()}", file=sys.stderr)
         else:
             print(f"stopped {meta['id']}  {meta.get('name')}")
+    deadline = time.time() + args.grace
+    while time.time() < deadline and any(pid_alive(t) for t in local):
+        time.sleep(0.2)
+    for target in local:
+        if pid_alive(target):
+            try:
+                os.kill(target, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
     return rc
 
 
-def remove(meta: dict) -> None:
-    for suffix in (".json", ".exit.json", ".hb", ".stopped", ".state.json"):
+def remove(meta: dict, keep_log: bool = False) -> None:
+    """Drop a job from the registry, with the log if jobrun wrote it; logs it only read are kept."""
+    for suffix in (".json", ".exit.json", ".hb", ".stopped", ".state.json", ".trim"):
         _file(meta["id"], suffix).unlink(missing_ok=True)
     log = meta.get("log")
-    if log and Path(log).parent == LOGS:
+    if log and not keep_log and (meta.get("log_owned") or Path(log).parent == LOGS):
         Path(log).unlink(missing_ok=True)
 
 
 def cmd_rm(args) -> int:
-    for meta, row in zip(metas := resolve(args.ids), snapshots(metas)):
+    for meta, row in zip(metas := select(args), snapshots(metas)):
         if row["status"] in ACTIVE and not args.force:
             print(f"{meta['id']} is {row['status']}; stop it first or pass --force", file=sys.stderr)
             continue
-        remove(meta)
+        remove(meta, args.keep_log)
         print(f"removed {meta['id']}  {meta.get('name')}")
     return 0
 
@@ -693,10 +858,13 @@ def main(argv: list[str] | None = None) -> int:
         p.add_argument("--progress-regex", help="regex with groups done/total (named or 1, 2) for the log")
         p.add_argument("--count-regex", help="progress = number of log lines matching this regex")
         p.add_argument("--total", type=int, help="total for --count-regex or a done-only --progress-regex")
+        p.add_argument("--group", help="group name; the dashboard sums progress over a group's jobs")
 
     p = sub.add_parser("run", help="run a command under supervision (detached unless --fg)")
     progress_args(p)
     p.add_argument("--progress-file", help="parse progress from this file instead of the log")
+    p.add_argument("--max-log-mb", type=float, default=MAX_LOG_MB,
+                   help=f"trim the log to its last MB beyond this size (default {MAX_LOG_MB:g}, 0: never)")
     p.add_argument("--fg", action="store_true", help="stay in the foreground and copy output to stdout")
     p.add_argument("cmd", nargs=argparse.REMAINDER, help="command (a single argument runs through the shell)")
     p.set_defaults(func=cmd_run)
@@ -724,14 +892,17 @@ def main(argv: list[str] | None = None) -> int:
     p.set_defaults(func=cmd_show)
 
     p = sub.add_parser("stop", help="stop jobs (SIGTERM, SIGKILL after --grace; scancel for Slurm)")
-    p.add_argument("ids", nargs="+")
+    p.add_argument("ids", nargs="*")
+    p.add_argument("--group", help="all jobs of this group")
     p.add_argument("--force", action="store_true", help="SIGKILL right away")
     p.add_argument("--grace", type=float, default=10)
     p.set_defaults(func=cmd_stop)
 
-    p = sub.add_parser("rm", help="remove jobs from the registry")
-    p.add_argument("ids", nargs="+")
+    p = sub.add_parser("rm", help="remove jobs from the registry, with the logs jobrun wrote")
+    p.add_argument("ids", nargs="*")
+    p.add_argument("--group", help="all jobs of this group")
     p.add_argument("--force", action="store_true", help="also remove running jobs (does not stop them)")
+    p.add_argument("--keep-log", action="store_true", help="keep logs even if jobrun wrote them")
     p.set_defaults(func=cmd_rm)
 
     p = sub.add_parser("clean", help="remove finished jobs older than --days")
@@ -750,7 +921,11 @@ def main(argv: list[str] | None = None) -> int:
     p.set_defaults(func=lambda a: supervise(a.job_id))
 
     args = parser.parse_args(argv)
-    return args.func(args) or 0
+    try:
+        return args.func(args) or 0
+    except BrokenPipeError:  # `jobrun ls | head`
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        return 0
 
 
 if __name__ == "__main__":

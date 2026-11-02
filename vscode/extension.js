@@ -63,6 +63,14 @@ function clock(epoch) {
   return `${when.toLocaleDateString([], { weekday: 'short' })} ${time}`;
 }
 
+function count(n) {
+  if (n == null) return '';
+  for (const [suffix, scale] of [['G', 1e9], ['M', 1e6], ['k', 1e3]]) {
+    if (n >= (suffix === 'k' ? 10 * scale : scale)) return `${+(n / scale).toPrecision(3)}${suffix}`;
+  }
+  return String(n);
+}
+
 function bar(fraction, width = 10) {
   const filled = Math.round(Math.max(0, Math.min(1, fraction)) * width);
   return '█'.repeat(filled) + '░'.repeat(width - filled);
@@ -70,16 +78,17 @@ function bar(fraction, width = 10) {
 
 function describe(job) {
   const parts = [];
+  if (job.jobs) parts.push(`${job.finished}/${job.jobs} jobs${job.failed ? ` (${job.failed} failed)` : ''}`);
   if (ACTIVE.has(job.status)) {
-    if (job.fraction != null) parts.push(`${bar(job.fraction)} ${Math.round(job.fraction * 100)}%`, `${job.done}/${job.total}`);
-    else if (job.done != null) parts.push(`${job.done} done`);
+    if (job.fraction != null) parts.push(`${bar(job.fraction)} ${Math.round(job.fraction * 100)}%`, `${count(job.done)}/${count(job.total)}`);
+    else if (job.done != null) parts.push(`${count(job.done)} done`);
     else parts.push(job.status);
     if (job.rate_per_s) parts.push(rate(job.rate_per_s));
     if (job.eta) parts.push(`ETA ${clock(job.eta)}`);
     parts.push(duration(job.elapsed_s));
   } else {
     parts.push(job.exit_code != null && job.status !== 'done' ? `${job.status} (${job.exit_code})` : job.status);
-    if (job.done != null) parts.push(job.total ? `${job.done}/${job.total}` : `${job.done} done`);
+    if (job.done != null) parts.push(job.total ? `${count(job.done)}/${count(job.total)}` : `${count(job.done)} done`);
     parts.push(duration(job.elapsed_s));
     if (job.ended) parts.push(`ended ${clock(job.ended)}`);
   }
@@ -108,6 +117,7 @@ class JobsProvider {
     this.emitter = new vscode.EventEmitter();
     this.onDidChangeTreeData = this.emitter.event;
     this.jobs = [];
+    this.groups = [];
     this.error = null;
     this.loaded = false;
     this.busy = false;
@@ -120,7 +130,8 @@ class JobsProvider {
     if (this.busy) return;
     this.busy = true;
     try {
-      this.jobs = JSON.parse(await jobrun(['ls', '--json', '--days', String(config().get('finishedDays'))]));
+      ({ jobs: this.jobs, groups: this.groups } = JSON.parse(
+        await jobrun(['ls', '--json', '--days', String(config().get('finishedDays'))])));
       this.error = null;
       this.notify();
     } catch (err) {
@@ -133,16 +144,23 @@ class JobsProvider {
     this.emitter.fire();
   }
 
+  // One message per finished ungrouped job, per failed group member, and per finished group.
   notify() {
     const seen = this.previous;
-    this.previous = new Map(this.jobs.map(job => [job.id, job.status]));
+    this.previous = new Map([...this.jobs.map(job => [job.id, job.status]),
+      ...this.groups.map(g => [`group:${g.name}`, g.status])]);
     if (!seen.size || !config().get('notifyOnFinish')) return;
+    const finished = (key, status) => seen.has(key) && ACTIVE.has(seen.get(key)) && !ACTIVE.has(status);
     for (const job of this.jobs) {
-      const before = seen.get(job.id);
-      if (!before || !ACTIVE.has(before) || ACTIVE.has(job.status)) continue;
-      const text = `Job "${job.name}" ${job.status} after ${duration(job.elapsed_s)}`;
+      if (!finished(job.id, job.status) || (job.group && job.status === 'done')) continue;
+      const text = `Job "${job.name}"${job.group ? ` (${job.group})` : ''} ${job.status} after ${duration(job.elapsed_s)}`;
       const show = job.status === 'done' ? vscode.window.showInformationMessage : vscode.window.showWarningMessage;
       show(text, 'Open Log').then(choice => { if (choice) openLog(job); });
+    }
+    for (const g of this.groups) {
+      if (!finished(`group:${g.name}`, g.status)) continue;
+      const text = `Group "${g.name}" finished: ${g.jobs - g.failed}/${g.jobs} jobs done after ${duration(g.elapsed_s)}`;
+      (g.failed ? vscode.window.showWarningMessage : vscode.window.showInformationMessage)(text);
     }
   }
 
@@ -167,22 +185,39 @@ class JobsProvider {
         return [item];
       }
       if (!this.loaded) return [new vscode.TreeItem('Loading…')];
-      const active = this.jobs.filter(job => ACTIVE.has(job.status)).reverse();
-      const finished = this.jobs.filter(job => !ACTIVE.has(job.status))
+      const entries = [
+        ...this.groups.map(g => ({ ...g, members: this.jobs.filter(job => job.group === g.name) })),
+        ...this.jobs.filter(job => !job.group),
+      ];
+      const active = entries.filter(e => ACTIVE.has(e.status)).sort((a, b) => b.started - a.started);
+      const finished = entries.filter(e => !ACTIVE.has(e.status))
         .sort((a, b) => (b.ended || b.started) - (a.ended || a.started));
-      return [group('Running', active, true), group('Finished', finished, false)];
+      return [section('Running', active, true), section('Finished', finished, false)];
     }
-    if (element.jobs) return element.jobs.map(jobItem);
+    if (element.entries) return element.entries.map(e => (e.members ? groupItem(e) : jobItem(e)));
+    if (element.group) return element.group.members.map(jobItem);
     if (element.job) return detailItems(element.job);
     return [];
   }
 }
 
-function group(label, jobs, expanded) {
-  const item = new vscode.TreeItem(`${label} (${jobs.length})`,
+function section(label, entries, expanded) {
+  const item = new vscode.TreeItem(`${label} (${entries.length})`,
     expanded ? vscode.TreeItemCollapsibleState.Expanded : vscode.TreeItemCollapsibleState.Collapsed);
-  item.id = `group-${label}`;
-  item.jobs = jobs;
+  item.id = `section-${label}`;
+  item.entries = entries;
+  return item;
+}
+
+function groupItem(group) {
+  const item = new vscode.TreeItem(group.name, vscode.TreeItemCollapsibleState.Collapsed);
+  item.id = `group:${group.name}`;
+  item.group = group;
+  item.description = describe(group);
+  const [, color] = ICONS[group.status] || [];
+  item.iconPath = new vscode.ThemeIcon('layers', color && new vscode.ThemeColor(color));
+  item.tooltip = `${group.name}: ${group.status}\n${describe(group)}`;
+  item.contextValue = ACTIVE.has(group.status) ? 'group-active' : 'group-finished';
   return item;
 }
 
@@ -262,6 +297,13 @@ function activate(context) {
       if (item.job.cwd) vscode.commands.executeCommand('revealInExplorer', vscode.Uri.file(item.job.cwd));
     }),
     vscode.commands.registerCommand('jobboard.copyCommand', item => vscode.env.clipboard.writeText(item.job.cmd || '')),
+    vscode.commands.registerCommand('jobboard.stopGroup', async item => {
+      const running = item.group.members.filter(job => ACTIVE.has(job.status)).length;
+      const choice = await vscode.window.showWarningMessage(
+        `Stop ${running} running job${running === 1 ? '' : 's'} of group "${item.group.name}"?`, { modal: true }, 'Stop', 'Kill now');
+      if (choice) run(['stop', '--group', item.group.name, ...(choice === 'Kill now' ? ['--force'] : [])], `Stopped ${item.group.name}`);
+    }),
+    vscode.commands.registerCommand('jobboard.removeGroup', item => run(['rm', '--group', item.group.name])),
     vscode.commands.registerCommand('jobboard.stop', async item => {
       const choice = await vscode.window.showWarningMessage(
         `Stop "${item.job.name}" (${item.job.slurm_id ? `slurm ${item.job.slurm_id}` : `pid ${item.job.pid}`})?`,
@@ -270,7 +312,7 @@ function activate(context) {
     }),
     vscode.commands.registerCommand('jobboard.remove', item => run(['rm', item.job.id])),
     vscode.commands.registerCommand('jobboard.clean', async () => {
-      const choice = await vscode.window.showWarningMessage('Remove all finished jobs from the list? Default logs under the registry are deleted; logs elsewhere are kept.',
+      const choice = await vscode.window.showWarningMessage('Remove all finished jobs from the list? Logs written by jobrun are deleted; logs it only read are kept.',
         { modal: true }, 'Remove');
       if (choice) run(['clean', '--days', '0'], 'Cleared finished jobs');
     }),
