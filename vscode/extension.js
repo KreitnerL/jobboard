@@ -256,7 +256,8 @@ function stageItems(job) {
   return (job.stages || []).map((stage, index) => {
     const item = new vscode.TreeItem(`${index + 1}. ${stage.name}`);
     item.id = `${job.id}-stage-${index}`;
-    const time = stage.started ? duration((stage.ended || now) - stage.started) : '';
+    // a finished stage without an end time was read from an old log: its duration is unknown
+    const time = stage.started && (stage.ended || stage.status === 'running') ? duration((stage.ended || now) - stage.started) : '';
     item.description = stage.status === 'pending' ? 'pending' : [progressText(stage), time].filter(Boolean).join(' · ');
     const [icon, color] = stage.status === 'pending' ? ['circle-outline', undefined] : ICONS[stage.status] || ['circle-outline'];
     item.iconPath = new vscode.ThemeIcon(icon, color && new vscode.ThemeColor(color));

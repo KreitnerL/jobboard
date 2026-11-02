@@ -394,3 +394,26 @@ def test_legacy_statuses_in_cached_rows_are_renamed(jobrun):
     state["final"]["status"] = "failed"
     state_path.write_text(json.dumps(state))
     assert rows(jobrun)["legacy"]["status"] == "error"
+
+
+def test_backfilled_stage_times_are_unknown(tmp_path):
+    log = tmp_path / "old.log"
+    log.write_text("JOBRUN_STAGE a\n[1/1] x\nJOBRUN_STAGE b\n[3/10] y\n")
+    meta, scan = {"id": "x", "log": str(log), "started": 1000.0}, {}
+    jobrun_module.scan_log(meta, scan, 5000.0)  # first scan long after the start
+    a, b = scan["stages"]
+    assert (a["started"], a["ended"], b["started"]) == (1000.0, None, None)
+    with log.open("a") as handle:
+        handle.write("JOBRUN_STAGE c\n")
+    jobrun_module.scan_log(meta, scan, 5100.0)  # live from now on
+    assert scan["stages"][-1]["started"] == 5100.0 and scan["stages"][1]["ended"] == 5100.0
+
+
+def test_stopped_while_self_waiting_is_cancelled(jobrun):
+    jobrun("run", "--name", "slow upstream", "--", "sleep 300")
+    jobrun("run", "--name", "poller", "--", "sleep 300")
+    wait_for(jobrun, "poller", "running")
+    jobrun("edit", "poller", "--after", "slow upstream")
+    jobrun("stop", "poller", "--grace", "2")
+    row = wait_for(jobrun, "poller", "cancelled")
+    assert row["reason"] == "stopped while waiting" and row["elapsed_s"] is None

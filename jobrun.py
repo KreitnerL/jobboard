@@ -495,7 +495,7 @@ def job_status(meta: dict, slurm: dict, now: float) -> tuple[str, float | None, 
         return "running", None, None, None
     log = meta.get("log")
     ended = (_mtime(Path(log)) if log else None) or now
-    return ("stopped", ended, None, None) if stopped else ("ended", ended, None, "exit code unknown (tracked process)")
+    return ("stopped" if stopped else "ended"), ended, None, None
 
 
 def _match(match: re.Match, total: int | None) -> tuple[int, int | None]:
@@ -533,13 +533,18 @@ def scan_log(meta: dict, scan: dict, now: float, final: bool = False) -> None:
     patterns = [re.compile(meta["progress_regex"])] if meta.get("progress_regex") else PROGRESS_PATTERNS
     default_total = meta.get("total")
     rules = [(name, re.compile(rule)) for name, rule in meta.get("stage_rules") or []]
+    # Catching up on a log that was written long before this first scan (`jobrun edit`, a tracked job): the times
+    # of the stage changes in it are unknown, so they are recorded as None rather than as now.
+    backfill = not scan.get("offset") and now - (meta.get("started") or now) > 60
+    when = None if backfill else now
 
     def enter(name: str, index: int | None = None, of: int | None = None) -> None:
-        stage, new = stages[-1], _new_stage(name, now, index, of)
+        stage, new = stages[-1], _new_stage(name, when, index, of)
         if stage["done"] is None and stage["name"] in (None, name):
-            stages[-1] = new  # nothing happened in the placeholder stage
+            new["started"] = stage["started"] if backfill else now  # nothing happened in the placeholder stage
+            stages[-1] = new
         else:
-            stage["ended"] = now
+            stage["ended"] = when
             stages.append(new)
 
     def handle_line(line: str) -> None:
@@ -692,7 +697,7 @@ def snapshot(meta: dict, slurm: dict) -> dict:
     done, total = current["done"], current["total"]
     rate = state.get("rate")
     if done is not None and status in ACTIVE:
-        rate = state["rate"] = update_rate(state, len(stages), done, total, now, max(started, current["started"]))
+        rate = state["rate"] = update_rate(state, len(stages), done, total, now, max(started, current["started"] or 0))
     eta = None
     if status in ACTIVE and rate and total and done is not None and done < total:
         eta = now + (total - done) / rate
@@ -749,7 +754,11 @@ def snapshots(metas: list[dict]) -> list[dict]:
             row["waiting_for"] = [d["name"] + ("" if d["status"] in ACTIVE else f" ({d['status']})")
                                   for d in deps if d["status"] != "done"] or (
                 ["Slurm queue"] if row["kind"] == "slurm" else [])
-        elif deps and all(d["status"] == "done" for d in deps) and row["status"] != "cancelled":
+        elif deps and row["status"] in ("stopped", "error", "lost") and any(
+                d["status"] in ACTIVE or (d["ended"] or now) > (row["ended"] or now) for d in deps):
+            # ended before its dependencies did: it was still waiting (inside its own script), never started
+            row.update(status="cancelled", elapsed_s=None, reason=f"{row['status']} while waiting")
+        elif deps and all(d["status"] in ("done", "ended") for d in deps) and row["status"] != "cancelled":
             start = max(d["ended"] or 0 for d in deps)  # time spent waiting is not part of the job's runtime
             if start > (row["started"] or 0):
                 row["started"], row["elapsed_s"] = start, (row["ended"] or now) - start
@@ -836,16 +845,17 @@ def fmt_eta(eta: float | None) -> str:
 def fmt_progress(row: dict) -> str:
     if row.get("status") == "waiting":
         return "waiting for " + ", ".join(row.get("waiting_for") or ["dependencies"])
-    if row.get("reason"):
-        return row["reason"]
+    if row.get("status") == "cancelled":
+        return row.get("reason") or "never started"
     stage = ""
     if row.get("stage"):
         stage = f"[{row['stage_no']}/{row['stage_of'] or '?'} {row['stage']}] "
+    reason = f" ({row['reason']})" if row.get("reason") else ""
     if row["done"] is None:
-        return stage.strip()
+        return (stage + reason).strip()
     if row["fraction"] is not None:
-        return f"{stage}{row['fraction'] * 100:3.0f}% {fmt_count(row['done'])}/{fmt_count(row['total'])}"
-    return stage + fmt_count(row["done"])
+        return f"{stage}{row['fraction'] * 100:3.0f}% {fmt_count(row['done'])}/{fmt_count(row['total'])}{reason}"
+    return stage + fmt_count(row["done"]) + reason
 
 
 def dependency_order(rows: list[dict]) -> list[dict]:
