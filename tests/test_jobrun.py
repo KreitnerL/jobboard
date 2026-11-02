@@ -236,3 +236,14 @@ def test_slurm_log_pattern_expansion():
     info = {"JobIDRaw": "42", "JobID": "42", "JobName": "train", "NodeList": "atlas", "WorkDir": "/w", "StdOut": ""}
     assert jobrun_module._slurm_log("/logs/%x-%j.err", info) == "/logs/train-42.err"
     assert jobrun_module._slurm_log("", info) == "/w/slurm-42.out"
+
+
+def test_rm_is_idempotent_and_json_is_versioned(jobrun):
+    jobrun("run", "--group", "g", "--name", "once", "--", "true")
+    job_id = wait_for(jobrun, "once", "done")["id"]
+    jobrun("rm", job_id)
+    again = jobrun("rm", job_id)  # e.g. a second click on a stale dashboard row
+    assert "already removed" in again.stderr
+    assert jobrun("rm", "--group", "g").returncode == 0
+    assert jobrun("stop", "nonexistent", check=False).returncode != 0  # stop stays strict
+    assert listing(jobrun)["schema"] == jobrun_module.JSON_SCHEMA

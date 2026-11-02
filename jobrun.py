@@ -47,6 +47,7 @@ COUNT_CHUNK_BYTES = 8 << 20  # count mode reads in chunks ...
 COUNT_BUDGET_BYTES = 256 << 20  # ... and at most this much per refresh
 SACCT_TTL_S = 30
 RATE_WINDOW_S = 15 * 60
+JSON_SCHEMA = 1  # version of `ls --json`; bump on incompatible changes (the VS Code extension checks it)
 ACTIVE = ("starting", "pending", "running", "unknown")
 # "lost" may recover (NFS hiccup, supervisor between child exit and exit file), so it is never cached.
 FINAL = ("done", "failed", "killed", "timeout", "oom", "ended")
@@ -113,13 +114,16 @@ def load_jobs() -> list[dict]:
     return sorted(metas, key=lambda m: m.get("started") or 0)
 
 
-def resolve(keys: list[str]) -> list[dict]:
-    """Jobs by exact id, exact name, or unique id substring."""
+def resolve(keys: list[str], missing_ok: bool = False) -> list[dict]:
+    """Jobs by exact id, exact name, or unique id substring; missing_ok skips keys that match nothing."""
     metas = load_jobs()
     found = []
     for key in keys:
         hits = ([m for m in metas if m["id"] == key] or [m for m in metas if m.get("name") == key]
                 or [m for m in metas if key in m["id"]])
+        if not hits and missing_ok:
+            print(f"jobrun: {key!r} not found (already removed?)", file=sys.stderr)
+            continue
         if len(hits) != 1:
             listing = "".join(f"\n  {m['id']}  {m.get('name')}" for m in hits)
             sys.exit(f"jobrun: {key!r} matches {len(hits)} jobs{listing}")
@@ -711,7 +715,7 @@ def cmd_ls(args) -> int:
     rows = visible_rows(None if args.all else args.days)
     groups = group_rows(rows)
     if args.json:
-        print(json.dumps({"jobs": rows, "groups": groups}))
+        print(json.dumps({"schema": JSON_SCHEMA, "jobs": rows, "groups": groups}))
         return 0
     if not rows:
         print("no jobs")
@@ -744,16 +748,16 @@ def cmd_show(args) -> int:
     return 0
 
 
-def select(args) -> list[dict]:
-    """Jobs named by ids and/or --group."""
-    metas = resolve(args.ids) if args.ids else []
+def select(args, missing_ok: bool = False) -> list[dict]:
+    """Jobs named by ids and/or --group; missing_ok tolerates ids and groups that are already gone."""
+    if not args.ids and not args.group:
+        sys.exit("jobrun: give job ids or --group")
+    metas = resolve(args.ids, missing_ok) if args.ids else []
     if args.group:
         members = [m for m in load_jobs() if m.get("group") == args.group]
-        if not members:
+        if not members and not missing_ok:
             sys.exit(f"jobrun: no jobs in group {args.group!r}")
         metas += [m for m in members if m["id"] not in {x["id"] for x in metas}]
-    if not metas:
-        sys.exit("jobrun: give job ids or --group")
     return metas
 
 
@@ -822,7 +826,7 @@ def remove(meta: dict, keep_log: bool = False) -> None:
 
 
 def cmd_rm(args) -> int:
-    for meta, row in zip(metas := select(args), snapshots(metas)):
+    for meta, row in zip(metas := select(args, missing_ok=True), snapshots(metas)):
         if row["status"] in ACTIVE and not args.force:
             print(f"{meta['id']} is {row['status']}; stop it first or pass --force", file=sys.stderr)
             continue

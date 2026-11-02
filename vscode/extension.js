@@ -6,6 +6,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
+const JSON_SCHEMA = 1;  // newest `jobrun ls --json` format this extension understands
 const ACTIVE = new Set(['starting', 'pending', 'running', 'unknown']);
 const ICONS = {
   starting: ['loading~spin', undefined],
@@ -130,8 +131,10 @@ class JobsProvider {
     if (this.busy) return;
     this.busy = true;
     try {
-      ({ jobs: this.jobs, groups: this.groups } = JSON.parse(
-        await jobrun(['ls', '--json', '--days', String(config().get('finishedDays'))])));
+      const data = JSON.parse(await jobrun(['ls', '--json', '--days', String(config().get('finishedDays'))]));
+      if (Array.isArray(data)) [this.jobs, this.groups] = [data, []];  // jobrun < 0.1
+      else if ((data.schema || 1) > JSON_SCHEMA) throw new Error('jobrun is newer than this extension; update the extension');
+      else [this.jobs, this.groups] = [data.jobs || [], data.groups || []];
       this.error = null;
       this.notify();
     } catch (err) {
