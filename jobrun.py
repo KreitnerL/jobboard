@@ -679,6 +679,7 @@ def snapshots(metas: list[dict]) -> list[dict]:
     rows = [snapshot(m, slurm) for m in metas]
     by_id = {r["id"]: r for r in rows}
     for row in rows:
+        row.setdefault("after", [])  # final rows cached by older versions lack it
         row["after_names"] = [(by_id.get(d) or read_json(_file(d, ".json"), {}) or {}).get("name", d) for d in row["after"]]
         if row["status"] == "waiting":
             deps = [by_id.get(d) or snapshot_or_none(d, slurm) for d in row["after"]]

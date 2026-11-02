@@ -338,3 +338,15 @@ def test_jobs_from_older_supervisors_are_scanned_by_readers(jobrun):
     (jobrun.home / "jobs" / "261101-aaaa.hb").touch()
     row = rows(jobrun)["old"]
     assert (row["status"], row["stage"], row["done"], row["total"]) == ("running", "trials", 7, 10)
+
+
+def test_rows_cached_by_older_versions_still_list(jobrun):
+    jobrun("run", "--name", "old-final", "--", "true")
+    row = wait_for(jobrun, "old-final", "done")
+    state_path = jobrun.home / "jobs" / f"{row['id']}.state.json"
+    state = json.loads(state_path.read_text())
+    for key in ("after", "after_names", "stages", "stage", "reason"):
+        state["final"].pop(key, None)
+    state_path.write_text(json.dumps(state))
+    assert rows(jobrun)["old-final"]["after_names"] == []
+    assert "old-final" in jobrun("ls").stdout
