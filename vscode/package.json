@@ -1,0 +1,82 @@
+{
+  "name": "jobboard",
+  "displayName": "Job Board",
+  "description": "Running and finished jobs from the jobrun registry: progress, rate, ETA, logs, stop.",
+  "publisher": "kreitner",
+  "version": "0.0.1",
+  "license": "MIT",
+  "engines": { "vscode": "^1.80.0" },
+  "categories": ["Other"],
+  "extensionKind": ["workspace"],
+  "main": "./extension.js",
+  "activationEvents": ["onStartupFinished"],
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [{ "id": "jobboard", "title": "Jobs", "icon": "media/jobs.svg" }]
+    },
+    "views": {
+      "jobboard": [{ "id": "jobboard.jobs", "name": "Jobs" }]
+    },
+    "commands": [
+      { "command": "jobboard.refresh", "title": "Refresh", "icon": "$(refresh)" },
+      { "command": "jobboard.clean", "title": "Clear Finished Jobs", "icon": "$(clear-all)" },
+      { "command": "jobboard.openLog", "title": "Open Log", "icon": "$(go-to-file)" },
+      { "command": "jobboard.tailLog", "title": "Follow Log in Terminal", "icon": "$(terminal)" },
+      { "command": "jobboard.stop", "title": "Stop Job", "icon": "$(debug-stop)" },
+      { "command": "jobboard.remove", "title": "Remove from List", "icon": "$(trash)" },
+      { "command": "jobboard.openFolder", "title": "Reveal Working Directory" },
+      { "command": "jobboard.copyCommand", "title": "Copy Command" }
+    ],
+    "menus": {
+      "view/title": [
+        { "command": "jobboard.refresh", "when": "view == jobboard.jobs", "group": "navigation" },
+        { "command": "jobboard.clean", "when": "view == jobboard.jobs", "group": "navigation" }
+      ],
+      "view/item/context": [
+        { "command": "jobboard.openLog", "when": "view == jobboard.jobs && viewItem =~ /^job-/", "group": "inline@1" },
+        { "command": "jobboard.stop", "when": "view == jobboard.jobs && viewItem == job-active", "group": "inline@2" },
+        { "command": "jobboard.remove", "when": "view == jobboard.jobs && viewItem == job-finished", "group": "inline@2" },
+        { "command": "jobboard.openLog", "when": "view == jobboard.jobs && viewItem =~ /^job-/", "group": "1_log@1" },
+        { "command": "jobboard.tailLog", "when": "view == jobboard.jobs && viewItem =~ /^job-/", "group": "1_log@2" },
+        { "command": "jobboard.openFolder", "when": "view == jobboard.jobs && viewItem =~ /^job-/", "group": "2_info@1" },
+        { "command": "jobboard.copyCommand", "when": "view == jobboard.jobs && viewItem =~ /^job-/", "group": "2_info@2" },
+        { "command": "jobboard.stop", "when": "view == jobboard.jobs && viewItem == job-active", "group": "3_manage@1" },
+        { "command": "jobboard.remove", "when": "view == jobboard.jobs && viewItem == job-finished", "group": "3_manage@2" }
+      ],
+      "commandPalette": [
+        { "command": "jobboard.openLog", "when": "false" },
+        { "command": "jobboard.tailLog", "when": "false" },
+        { "command": "jobboard.stop", "when": "false" },
+        { "command": "jobboard.remove", "when": "false" },
+        { "command": "jobboard.openFolder", "when": "false" },
+        { "command": "jobboard.copyCommand", "when": "false" }
+      ]
+    },
+    "configuration": {
+      "title": "Job Board",
+      "properties": {
+        "jobboard.command": {
+          "type": "string",
+          "default": "",
+          "description": "Path to the jobrun CLI. Empty: ~/.local/bin/jobrun if present, else jobrun on PATH."
+        },
+        "jobboard.registry": {
+          "type": "string",
+          "default": "",
+          "description": "Registry directory (JOBRUN_HOME). Empty: the CLI default ~/.jobs."
+        },
+        "jobboard.refreshSeconds": { "type": "number", "default": 10, "minimum": 2 },
+        "jobboard.finishedDays": {
+          "type": "number",
+          "default": 3,
+          "description": "Show finished jobs of the last N days."
+        },
+        "jobboard.notifyOnFinish": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show a notification when a job finishes while this window is open."
+        }
+      }
+    }
+  }
+}
