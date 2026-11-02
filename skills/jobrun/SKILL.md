@@ -23,7 +23,7 @@ The user watches all long jobs on a dashboard fed by `jobrun`. A job that is not
      planned stages before they start.
    - Separate commands that depend on each other: one job each, chained with `--after <id or name>`. Never write
      polling loops (`while pgrep ...`); jobrun waits (status "waiting", no elapsed time), starts the job when the
-     dependency succeeded, and marks it "skipped" if the dependency failed.
+     dependency succeeded, and marks it "cancelled" if the dependency failed.
    - If a program you will run repeatedly prints no usable progress, propose adding marker lines to its code once
      (`print(f"JOBRUN_PROGRESS {done}/{total}", flush=True)`, throttled to ~10 s in fast loops) instead of
      encoding its internals in regexes.
@@ -32,6 +32,9 @@ The user watches all long jobs on a dashboard fed by `jobrun`. A job that is not
 6. To wait for completion, run `jobrun wait ID` (or `--group G`) in the background; the job keeps running and
    stays on the dashboard even if the waiting shell dies.
 7. Do not stop or remove jobs you did not start unless the user asks.
+8. To fix a registration (name, group, `--after`, stages, progress options), use `jobrun edit ID ...`; it never
+   touches the running command. For a script that prints no stage markers and cannot be changed while it runs,
+   `--stage-at NAME=REGEX` starts stage NAME at the first log line matching REGEX.
 
 ## Commands
 
@@ -40,7 +43,7 @@ jobrun run --name NAME [--group G] [--after JOB] [--stages a,b] -- CMD ...   # d
 jobrun run --fg ...                                                # foreground, output also on stdout
 jobrun sbatch --name NAME [--group G] [--after SLURM_JOB] [--log PATTERN] -- SBATCH_ARGS... SCRIPT
 jobrun track --pid PID [--log FILE] | --slurm ID                   # adopt a running job
-jobrun ls | show ID | wait ID | log ID [-f] | stop ID | stop --group G | rm ID
+jobrun ls | show ID | wait ID | log ID [-f] | edit ID [options] | stop ID | stop --group G | rm ID
 ```
 
 Progress options (default: auto-detect tqdm bars `12/100 [`, counters `[12/100]`, `JOBRUN_PROGRESS 12/100`):

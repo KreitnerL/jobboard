@@ -111,8 +111,32 @@ jobrun run --name "tune ilp" --after "prepare n100" -- python tune.py ilp.yml
 ```
 
 The second job is **waiting** (no elapsed time) until the first one succeeds, then starts; if the first one fails,
-it is **skipped**. The dashboard lists it right after the job it waits for, on the same level. `--after` takes ids or names, repeatable or
+it is **cancelled**. The dashboard lists it right after the job it waits for, on the same level. `--after` takes ids or names, repeatable or
 comma-separated. With `jobrun sbatch --after <slurm job>`, Slurm's own `--dependency=afterok` is used.
+
+## Status
+
+| Status | Icon | Meaning |
+|---|---|---|
+| waiting | 🕒 | not started: waits for `--after` jobs or in the Slurm queue |
+| starting / running | ⟳ | |
+| done | ✓ | exit code 0 |
+| error | ✗ | non-zero exit, killed by a signal, time limit, out of memory (the reason is shown) |
+| stopped | ■ | stopped by `jobrun stop` / `scancel` while running |
+| cancelled | ⊘ | never started: a dependency failed, or stopped while waiting |
+| lost | ⚠ | the supervisor vanished without recording an exit (e.g. reboot) |
+| ended | ○ | a tracked process ended; its exit code is unknown |
+
+## Changing a running job
+
+```bash
+jobrun edit ID --name "nu15 pipeline" --group "sweep" --after "nu15 tuning"     # also --after '' to clear
+jobrun edit ID --stages tune,rollout --stage-at 'rollout=JOBRUN_PROGRESS' --count-regex 'Trial \d+ completed' --total 100
+```
+
+Only the registration changes; the command keeps running. `--stage-at NAME=REGEX` starts stage NAME at the first log
+line matching REGEX, for programs that print no stage markers. A job that waits for its dependency by itself (e.g. a
+script that polls) also shows as waiting once it has `--after`, and its runtime counts from the dependency's end.
 
 ## Slurm
 
@@ -165,9 +189,11 @@ asking you to look.
 | `show ID` · `log ID [-f]` | Details as JSON · tail the log |
 | `wait ID` / `--group G` | Block until finished |
 | `stop ID` / `--group G` | SIGTERM to the whole process tree, then SIGKILL after 10 s; `scancel` for Slurm |
+| `edit ID [options]` | Change name, group, `--after`, stages or progress settings, also while running |
 | `rm ID` · `clean [--days 7]` | Remove from the list (with the logs jobrun wrote) |
 
-Common options: `--name`, `--group`, `--after`, `--stages`, `--log`, `--count-regex`, `--progress-regex`, `--total`.
+Common options: `--name`, `--group`, `--after`, `--stages`, `--stage-at`, `--log`, `--count-regex`, `--progress-regex`,
+`--total`.
 
 ## How it works
 

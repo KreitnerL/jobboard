@@ -48,10 +48,16 @@ COUNT_CHUNK_BYTES = 8 << 20  # count mode reads in chunks ...
 COUNT_BUDGET_BYTES = 256 << 20  # ... and at most this much per refresh
 SACCT_TTL_S = 30
 RATE_WINDOW_S = 15 * 60
-JSON_SCHEMA = 1  # version of `ls --json`; bump on incompatible changes (the VS Code extension checks it)
-ACTIVE = ("starting", "waiting", "pending", "running", "unknown")
+JSON_SCHEMA = 2  # version of `ls --json`; bump on incompatible changes (the VS Code extension checks it)
+SUPERVISOR_VERSION = 2  # supervisors from 2 on reload edited settings
+ACTIVE = ("starting", "waiting", "running", "unknown")
 # "lost" may recover (NFS hiccup, supervisor between child exit and exit file), so it is never cached.
-FINAL = ("done", "failed", "killed", "timeout", "oom", "ended", "skipped")
+FINAL = ("done", "error", "stopped", "cancelled", "ended")
+# done: exit 0. error: non-zero exit, signal, time limit, out of memory (see the row's reason). stopped: by `jobrun stop`
+# (or scancel) while running. cancelled: never started (dependency failed, or stopped while waiting). ended: a
+# tracked process ended with an unknown exit code. lost: the supervisor vanished without recording an exit.
+LEGACY_STATUS = {"failed": "error", "timeout": "error", "oom": "error", "killed": "stopped", "skipped": "cancelled",
+                 "pending": "waiting"}  # names used before 0.3, e.g. in cached rows
 
 PROGRESS_PATTERNS = [
     re.compile(r"JOBRUN_PROGRESS\s+(?P<done>\d+)\s*/\s*(?P<total>\d+)"),
@@ -61,11 +67,12 @@ PROGRESS_PATTERNS = [
 STAGE_MARKER = re.compile(r"JOBRUN_STAGE\s+(?P<name>.+?)(?:\s+(?P<index>\d+)/(?P<of>\d+))?\s*$")
 ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 INTERPRETERS = {"uv", "run", "bash", "sh", "srun", "nohup", "env", "time", "exec"}
-SLURM_STATES = {
-    "PENDING": "pending", "CONFIGURING": "pending", "REQUEUED": "pending", "SUSPENDED": "pending",
-    "RUNNING": "running", "COMPLETING": "running", "COMPLETED": "done", "FAILED": "failed",
-    "NODE_FAIL": "failed", "BOOT_FAIL": "failed", "CANCELLED": "killed", "PREEMPTED": "killed",
-    "DEADLINE": "timeout", "TIMEOUT": "timeout", "OUT_OF_MEMORY": "oom",
+SLURM_STATES = {  # sacct state -> (status, reason)
+    "PENDING": ("waiting", None), "REQUEUED": ("waiting", "requeued"), "SUSPENDED": ("waiting", "suspended"),
+    "CONFIGURING": ("starting", None), "RUNNING": ("running", None), "COMPLETING": ("running", None),
+    "COMPLETED": ("done", None), "FAILED": ("error", None), "NODE_FAIL": ("error", "node failure"),
+    "BOOT_FAIL": ("error", "boot failure"), "DEADLINE": ("error", "deadline"), "TIMEOUT": ("error", "time limit"),
+    "OUT_OF_MEMORY": ("error", "out of memory"), "CANCELLED": ("stopped", None), "PREEMPTED": ("stopped", "preempted"),
 }
 
 
@@ -226,11 +233,14 @@ def query_slurm(ids: list[str]) -> dict[str, dict]:
         if len(parts) < 6:
             continue
         slurm_id, state, code, start, end, nodes = parts[:6]
-        status = SLURM_STATES.get(state.split()[0] if state else "", "unknown")
+        status, reason = SLURM_STATES.get(state.split()[0] if state else "", ("unknown", None))
+        exit_code = int(code.split(":")[0]) if code[:1].isdigit() else None
+        if status == "stopped" and _slurm_time(start) is None:
+            status = "cancelled"  # cancelled before it ever started
+        if status == "error" and reason is None and exit_code:
+            reason = f"exit code {exit_code}"
         info[slurm_id] = {
-            "status": status,
-            "exit_code": int(code.split(":")[0]) if code[:1].isdigit() else None,
-            "started": _slurm_time(start),
+            "status": status, "reason": reason, "exit_code": exit_code, "started": _slurm_time(start),
             "ended": None if status in ACTIVE else _slurm_time(end),
             "host": None if nodes in ("", "None assigned") else nodes,
         }
@@ -307,6 +317,16 @@ def trim_log(job_id: str, log: str, max_bytes: int) -> None:
         pass
 
 
+def update_meta(job_id: str, **fields) -> dict:
+    """Set fields on a fresh read of the job's metadata, so concurrent writers (supervisor, `jobrun edit`)
+    don't overwrite each other's fields; returns the updated metadata."""
+    path = _file(job_id, ".json")
+    meta = read_json(path) or {}
+    meta.update(fields)
+    write_json(path, meta)
+    return meta
+
+
 def _beat(job_id: str) -> None:
     try:  # registry trouble (NFS, a removed folder) must never kill the supervisor
         _file(job_id, ".hb").touch()
@@ -321,8 +341,9 @@ def _finish(job_id: str, info: dict) -> None:
         pass
 
 
-def wait_for_dependencies(job_id: str, meta: dict) -> str | None:
-    """Block until every job in meta["after"] is done. Returns why the job must not start, or None."""
+def wait_for_dependencies(job_id: str) -> str | None:
+    """Block until every job in the job's "after" list (re-read, so edits apply) is done. Returns why the job
+    must not start, or None."""
     stop = []
     for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
         signal.signal(signum, lambda *_: stop.append(True))
@@ -330,13 +351,13 @@ def wait_for_dependencies(job_id: str, meta: dict) -> str | None:
         _beat(job_id)
         if stop:
             return "stopped while waiting"
-        deps = [read_json(_file(dep, ".json")) for dep in meta["after"]]
+        deps = [read_json(_file(dep, ".json")) for dep in (read_json(_file(job_id, ".json")) or {}).get("after") or []]
         if not all(deps):
             return "a dependency was removed"
         rows = snapshots(deps)
         bad = next((r for r in rows if r["status"] not in ACTIVE and r["status"] != "done"), None)
         if bad:
-            return f"{bad['name']} {bad['status']}"
+            return f"dependency {bad['name']}: {bad['status']}"
         if all(r["status"] == "done" for r in rows):
             return None
         for _ in range(int(WAIT_POLL_S / 0.5)):  # sleep, but react to stop quickly
@@ -352,16 +373,14 @@ def supervise(job_id: str, tee: bool = False) -> int:
     times stay accurate while no dashboard is open.
     """
     meta_path = _file(job_id, ".json")
-    meta = read_json(meta_path)
-    meta.update(supervisor_pid=os.getpid(), supervisor_scans=True)
+    meta = update_meta(job_id, supervisor_pid=os.getpid(), supervisor_scans=True, supervisor_version=SUPERVISOR_VERSION,
+                       waiting=bool((read_json(meta_path) or {}).get("after")))
     if meta.get("after"):
-        meta["waiting"] = True
-        write_json(meta_path, meta)
-        reason = wait_for_dependencies(job_id, meta)
+        reason = wait_for_dependencies(job_id)
         if reason:
             _finish(job_id, {"exit_code": None, "skipped": reason})
             return 1
-        meta.update(waiting=False, started=time.time())
+    meta = update_meta(job_id, waiting=False, **({"started": time.time()} if meta.get("after") else {}))
     cmd = meta["cmd"]
     env = dict(os.environ, JOBRUN_ID=job_id, PYTHONUNBUFFERED="1")
     with open(meta["log"], "ab", buffering=0) as log:
@@ -374,8 +393,7 @@ def supervise(job_id: str, tee: bool = False) -> int:
             log.write(f"jobrun: cannot start {cmd}: {exc}\n".encode())
             _finish(job_id, {"exit_code": 127})
             return 127
-        meta.update(pid=proc.pid, pgid=proc.pid, proc_start=proc_start(proc.pid))
-        write_json(meta_path, meta)
+        meta = update_meta(job_id, pid=proc.pid, pgid=proc.pid, proc_start=proc_start(proc.pid))
 
         def forward(signum, _frame):
             try:
@@ -401,8 +419,11 @@ def supervise(job_id: str, tee: bool = False) -> int:
             pump.start()
 
         max_bytes = meta.get("max_log_bytes") or 0
+        meta_mtime = _mtime(meta_path)
         while True:
             _beat(job_id)
+            if _mtime(meta_path) != meta_mtime:  # `jobrun edit` changed the settings
+                meta, meta_mtime = read_json(meta_path) or meta, _mtime(meta_path)
             update_scan(meta)  # before trimming, so no stage marker is trimmed unseen
             if max_bytes:
                 trim_log(job_id, meta["log"], max_bytes)
@@ -420,25 +441,35 @@ def supervise(job_id: str, tee: bool = False) -> int:
 
 # ---------------------------------------------------------------- status and progress
 
-def job_status(meta: dict, slurm: dict, now: float) -> tuple[str, float | None, int | None]:
-    """(status, ended, exit_code) from the exit file, Slurm, or the process / heartbeat."""
+def _signal_name(number: int) -> str:
+    try:
+        return signal.Signals(number).name
+    except ValueError:
+        return f"signal {number}"
+
+
+def job_status(meta: dict, slurm: dict, now: float) -> tuple[str, float | None, int | None, str | None]:
+    """(status, ended, exit_code, reason) from the exit file, Slurm, or the process / heartbeat."""
     job_id = meta["id"]
     stopped = _file(job_id, ".stopped").exists()
     exit_info = read_json(_file(job_id, ".exit.json"))
     if exit_info:
-        code = exit_info.get("exit_code")
+        code, ended = exit_info.get("exit_code"), exit_info.get("ended")
         if exit_info.get("skipped"):
-            status = "killed" if stopped else "skipped"
-        else:
-            status = "done" if code == 0 else "killed" if stopped or (code or 0) < 0 else "failed"
-        return status, exit_info.get("ended"), code
+            return "cancelled", ended, None, exit_info["skipped"]
+        if code == 0:
+            return "done", ended, code, None
+        if stopped:
+            return "stopped", ended, code, None
+        if code is not None and code < 0:
+            return "error", ended, code, f"killed by {_signal_name(-code)}"
+        return "error", ended, code, f"exit code {code}"
     kind, pid = meta.get("kind"), meta.get("pid")
     if kind == "slurm":
         info = slurm.get(str(meta.get("slurm_id")))
         if not info:
-            return "unknown", None, None
-        status = "waiting" if info["status"] == "pending" and meta.get("after") else info["status"]
-        return status, info["ended"], info["exit_code"]
+            return "unknown", None, None, None
+        return info["status"], info["ended"], info["exit_code"], info.get("reason")
     if kind == "process":
         heartbeat = _file(job_id, ".hb")
         if meta.get("host") == HOST:
@@ -449,17 +480,22 @@ def job_status(meta: dict, slurm: dict, now: float) -> tuple[str, float | None, 
             alive = beat is not None and now - beat < STALE_S
         if pid is None:
             if meta.get("waiting") and alive:
-                return "waiting", None, None
-            return ("starting" if now - (meta.get("started") or 0) < STALE_S else "lost"), None, None
+                return "waiting", None, None, None
+            if now - (meta.get("started") or 0) < STALE_S:
+                return "starting", None, None, None
+            return "lost", None, None, "the supervisor vanished before the command started"
         if alive:
-            return "running", None, None
-        return ("killed" if stopped else "lost"), _mtime(heartbeat), None
+            return "running", None, None, None
+        if stopped:
+            return "stopped", _mtime(heartbeat), None, None
+        return "lost", _mtime(heartbeat), None, "the supervisor vanished without recording an exit code"
     if meta.get("host") != HOST:
-        return "unknown", None, None
+        return "unknown", None, None, None
     if pid_alive(pid, meta.get("proc_start")):
-        return "running", None, None
+        return "running", None, None, None
     log = meta.get("log")
-    return ("killed" if stopped else "ended"), (_mtime(Path(log)) if log else None) or now, None
+    ended = (_mtime(Path(log)) if log else None) or now
+    return ("stopped", ended, None, None) if stopped else ("ended", ended, None, "exit code unknown (tracked process)")
 
 
 def _match(match: re.Match, total: int | None) -> tuple[int, int | None]:
@@ -482,9 +518,10 @@ def scan_log(meta: dict, scan: dict, now: float, final: bool = False) -> None:
     Lines end at \\n or \\r, so tqdm updates count before the bar finishes. The unfinished last line still
     updates progress (without being consumed); with final, it is consumed like any other line.
     """
+    first = (meta.get("stages") or [None])[0]  # a planned first stage names the time before any marker
     stages = scan.setdefault("stages", [])
     if not stages:
-        stages.append(_new_stage(None, meta.get("started") or now))
+        stages.append(_new_stage(first, meta.get("started") or now))
     path = meta.get("progress_file") or meta.get("log")
     if not path:
         return
@@ -495,19 +532,31 @@ def scan_log(meta: dict, scan: dict, now: float, final: bool = False) -> None:
     count = re.compile(meta["count_regex"]) if meta.get("count_regex") else None
     patterns = [re.compile(meta["progress_regex"])] if meta.get("progress_regex") else PROGRESS_PATTERNS
     default_total = meta.get("total")
+    rules = [(name, re.compile(rule)) for name, rule in meta.get("stage_rules") or []]
+
+    def enter(name: str, index: int | None = None, of: int | None = None) -> None:
+        stage, new = stages[-1], _new_stage(name, now, index, of)
+        if stage["done"] is None and stage["name"] in (None, name):
+            stages[-1] = new  # nothing happened in the placeholder stage
+        else:
+            stage["ended"] = now
+            stages.append(new)
 
     def handle_line(line: str) -> None:
-        stage = stages[-1]
         if "JOBRUN_STAGE" in line:
             marker = STAGE_MARKER.search(ANSI.sub("", line))
             if marker:
                 index, of = marker.group("index"), marker.group("of")
-                new = _new_stage(marker.group("name"), now, int(index) if index else None, int(of) if of else None)
-                if stage["name"] is None and stage["done"] is None:
-                    stages[-1] = new  # nothing happened before the first marker
-                else:
-                    stage["ended"] = now
-                    stages.append(new)
+                enter(marker.group("name"), int(index) if index else None, int(of) if of else None)
+                return
+        for name, rule in rules:  # --stage-at: stage boundaries of programs that print no markers
+            if all(s["name"] != name for s in stages) and rule.search(line):
+                enter(name)
+        stage = stages[-1]
+        if "JOBRUN_PROGRESS" in line:  # explicit progress wins in every mode
+            explicit = PROGRESS_PATTERNS[0].search(line)
+            if explicit:
+                stage["done"], stage["total"] = int(explicit["done"]), int(explicit["total"])
                 return
         if count:
             if count.search(line):
@@ -522,7 +571,7 @@ def scan_log(meta: dict, scan: dict, now: float, final: bool = False) -> None:
         dropped = dropped_bytes(meta["id"]) if meta.get("log_owned") and path == meta.get("log") else 0
         position = max(0, scan.get("offset", 0) - dropped)
         if position > size:  # replaced by a shorter file: start over
-            position, stages[:] = 0, [_new_stage(None, meta.get("started") or now)]
+            position, stages[:] = 0, [_new_stage(first, meta.get("started") or now)]
         handle.seek(position)
         budget = COUNT_BUDGET_BYTES
         while budget > 0:
@@ -550,9 +599,15 @@ def scan_log(meta: dict, scan: dict, now: float, final: bool = False) -> None:
         stages[-1]["total"] = default_total
 
 
+def scan_path(meta: dict) -> Path:
+    """Each `jobrun edit` of the progress settings starts a fresh scan file (scan_rev)."""
+    rev = meta.get("scan_rev") or 0
+    return _file(meta["id"], f".scan.r{rev}.json" if rev else ".scan.json")
+
+
 def update_scan(meta: dict, final: bool = False) -> dict:
     """Scan new log lines and persist the result; returns the scan."""
-    path = _file(meta["id"], ".scan.json")
+    path = scan_path(meta)
     scan = read_json(path, {}) or {}
     before = json.dumps(scan, sort_keys=True)
     scan_log(meta, scan, time.time(), final)
@@ -618,14 +673,18 @@ def snapshot(meta: dict, slurm: dict) -> dict:
     state_path = _file(job_id, ".state.json")
     state = read_json(state_path, {}) or {}
     if state.get("final"):
-        return state["final"]
+        row = state["final"]
+        row["status"] = LEGACY_STATUS.get(row["status"], row["status"])
+        return row
     now = time.time()
-    status, ended, exit_code = job_status(meta, slurm, now)
+    status, ended, exit_code, reason = job_status(meta, slurm, now)
     slurm_info = (slurm.get(str(meta.get("slurm_id"))) or {}) if meta.get("kind") == "slurm" else {}
     started = slurm_info.get("started") or meta.get("started") or now
-    if meta.get("supervisor_scans"):  # the supervisor keeps the scan current
-        scan = read_json(_file(job_id, ".scan.json"), {}) or {}
-        scan.setdefault("stages", [_new_stage(None, started)])
+    # A running supervisor keeps the scan current, unless it predates `jobrun edit` and the settings were edited.
+    if (meta.get("supervisor_scans") and status in ACTIVE
+            and (not meta.get("scan_rev") or meta.get("supervisor_version", 1) >= SUPERVISOR_VERSION)):
+        scan = read_json(scan_path(meta), {}) or {}
+        scan.setdefault("stages", [_new_stage((meta.get("stages") or [None])[0], started)])
     else:
         scan = update_scan(meta)
     stages = scan["stages"]
@@ -653,7 +712,7 @@ def snapshot(meta: dict, slurm: dict) -> dict:
         stage_no=(current["index"] or (planned.index(current["name"]) + 1 if current["name"] in planned
                                        else len(stages))) if stage_list else None,
         stage_of=(current["of"] or len(planned) or None) if stage_list else None,
-        stages=stage_list, reason=(read_json(_file(job_id, ".exit.json"), {}) or {}).get("skipped"),
+        stages=stage_list, reason=reason,
     )
     row["host"] = slurm_info.get("host") or row["host"]
     if status in FINAL:
@@ -678,13 +737,22 @@ def snapshots(metas: list[dict]) -> list[dict]:
     slurm = query_slurm([str(m["slurm_id"]) for m in open_slurm])
     rows = [snapshot(m, slurm) for m in metas]
     by_id = {r["id"]: r for r in rows}
+    now = time.time()
     for row in rows:
         row.setdefault("after", [])  # final rows cached by older versions lack it
-        row["after_names"] = [(by_id.get(d) or read_json(_file(d, ".json"), {}) or {}).get("name", d) for d in row["after"]]
+        deps = [d for d in (by_id.get(dep) or snapshot_or_none(dep, slurm) for dep in row["after"]) if d]
+        row["after_names"] = [d["name"] for d in deps]
+        if row["status"] == "running" and any(d["status"] in ACTIVE for d in deps):
+            # registered with --after but started early: the command waits for its dependency by itself
+            row.update(status="waiting", elapsed_s=None, eta=None, rate_per_s=None)
         if row["status"] == "waiting":
-            deps = [by_id.get(d) or snapshot_or_none(d, slurm) for d in row["after"]]
-            row["waiting_for"] = [f"{d['name']}" + ("" if d["status"] in ACTIVE else f" ({d['status']})")
-                                  for d in deps if d and d["status"] != "done"]
+            row["waiting_for"] = [d["name"] + ("" if d["status"] in ACTIVE else f" ({d['status']})")
+                                  for d in deps if d["status"] != "done"] or (
+                ["Slurm queue"] if row["kind"] == "slurm" else [])
+        elif deps and all(d["status"] == "done" for d in deps) and row["status"] != "cancelled":
+            start = max(d["ended"] or 0 for d in deps)  # time spent waiting is not part of the job's runtime
+            if start > (row["started"] or 0):
+                row["started"], row["elapsed_s"] = start, (row["ended"] or now) - start
     return rows
 
 
@@ -704,10 +772,10 @@ def group_rows(rows: list[dict]) -> list[dict]:
         active = [r for r in jobs if r["status"] in ACTIVE]
         bad = [r for r in jobs if r["status"] not in ACTIVE and r["status"] != "done"]
         if active:
-            status = next((s for s in ("running", "waiting", "pending", "starting") if any(r["status"] == s for r in active)),
-                          active[0]["status"])
-        else:
-            status = ("killed" if all(r["status"] == "killed" for r in bad) else "failed") if bad else "done"
+            status = next(s for s in ("running", "starting", "waiting", "unknown") if any(r["status"] == s for r in active))
+        else:  # the most severe outcome
+            status = next((s for s in ("error", "lost", "stopped", "cancelled", "ended") if any(r["status"] == s for r in jobs)),
+                          "done")
         # summing only makes sense when every member counts the same kind of thing towards a known total
         total = sum(r["total"] for r in jobs) if all(r["total"] for r in jobs) else None
         done = sum(min(r["done"] or 0, r["total"]) for r in jobs) if total else None
@@ -717,6 +785,7 @@ def group_rows(rows: list[dict]) -> list[dict]:
         groups.append({
             "name": name, "status": status, "jobs": len(jobs), "finished": len(jobs) - len(active),
             "failed": len(bad), "ids": [r["id"] for r in jobs], "done": done, "total": total,
+            "counts": {st: sum(r["status"] == st for r in jobs) for st in dict.fromkeys(r["status"] for r in jobs)},
             "fraction": done / total if done is not None and total else None,
             "rate_per_s": sum(r["rate_per_s"] or 0 for r in active) or None,
             "eta": max(etas) if etas else None, "started": started, "ended": ended,
@@ -806,7 +875,20 @@ def visible(row: dict, days: float | None) -> bool:
 
 def progress_options(args) -> dict:
     return {"group": args.group, "progress_regex": args.progress_regex, "count_regex": args.count_regex,
-            "total": args.total, "stages": [s.strip() for s in args.stages.split(",")] if args.stages else None}
+            "total": args.total, "stages": [s.strip() for s in args.stages.split(",")] if args.stages else None,
+            "stage_rules": stage_rules(args.stage_at)}
+
+
+def stage_rules(values: list[str] | None) -> list[list[str]] | None:
+    """--stage-at NAME=REGEX: the stage NAME starts at the first log line matching REGEX."""
+    rules = []
+    for value in values or []:
+        name, sep, rule = value.partition("=")
+        if not sep or not name.strip():
+            sys.exit(f"jobrun: --stage-at expects NAME=REGEX, got {value!r}")
+        re.compile(rule)
+        rules.append([name.strip(), rule])
+    return rules or None
 
 
 def dependencies(args) -> list[str]:
@@ -1024,8 +1106,10 @@ def cmd_stop(args) -> int:
 
 def remove(meta: dict, keep_log: bool = False) -> None:
     """Drop a job from the registry, with the log if jobrun wrote it; logs it only read are kept."""
-    for suffix in (".json", ".exit.json", ".hb", ".stopped", ".state.json", ".scan.json", ".trim"):
+    for suffix in (".json", ".exit.json", ".hb", ".stopped", ".state.json", ".trim"):
         _file(meta["id"], suffix).unlink(missing_ok=True)
+    for scan in JOBS.glob(f"{meta['id']}.scan*.json"):
+        scan.unlink(missing_ok=True)
     log = meta.get("log")
     if log and not keep_log and (meta.get("log_owned") or Path(log).parent == LOGS):
         Path(log).unlink(missing_ok=True)
@@ -1065,6 +1149,38 @@ def cmd_wait(args) -> int:
     return 0 if rows and all(r["status"] == "done" for r in rows) else 1
 
 
+def cmd_edit(args) -> int:
+    """Change a registered job, also while it runs; the command itself is not touched."""
+    meta = resolve([args.id])[0]
+    progress = {"progress_regex": args.progress_regex, "count_regex": args.count_regex, "total": args.total,
+                "stages": [s.strip() for s in args.stages.split(",") if s.strip()] if args.stages is not None else None,
+                "stage_rules": stage_rules(args.stage_at) if args.stage_at else None,
+                "progress_file": str(Path(args.log).expanduser().resolve()) if args.log else None}
+    progress = {key: value for key, value in progress.items() if value is not None}
+    if args.log and meta.get("kind") != "process":
+        progress["log"] = progress.pop("progress_file")  # tracked and Slurm jobs are parsed from their log
+    other = {key: value for key, value in (("name", args.name), ("group", args.group)) if value is not None}
+    if args.after is not None:
+        other["after"] = dependencies(args)
+        if meta["id"] in other["after"]:
+            sys.exit("jobrun edit: a job cannot wait for itself")
+    if not progress and not other:
+        sys.exit("jobrun edit: nothing to change")
+    changes = {**other, **progress}
+    if "group" in changes and not changes["group"]:
+        changes["group"] = None
+    state_path = _file(meta["id"], ".state.json")
+    state = read_json(state_path, {}) or {}
+    state.pop("final", None)  # recompute the row
+    if progress:  # progress from scratch under the new settings
+        changes["scan_rev"] = (meta.get("scan_rev") or 0) + 1
+        state = {}
+    write_json(state_path, state)
+    meta = update_meta(meta["id"], **changes)
+    print(f"edited {meta['id']}  {meta['name']}")
+    return 0
+
+
 def cmd_log(args) -> int:
     log = resolve([args.id])[0].get("log")
     if not log:
@@ -1087,6 +1203,8 @@ def main(argv: list[str] | None = None) -> int:
         p.add_argument("--total", type=int, help="total for --count-regex or a done-only --progress-regex")
         p.add_argument("--group", help="group name; the dashboard sums progress over a group's jobs")
         p.add_argument("--stages", help="planned stage names, comma-separated (shown before they are reached)")
+        p.add_argument("--stage-at", action="append", metavar="NAME=REGEX",
+                       help="stage NAME starts at the first log line matching REGEX (for programs without markers)")
 
     p = sub.add_parser("run", help="run a command under supervision (detached unless --fg)")
     progress_args(p)
@@ -1140,6 +1258,12 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("clean", help="remove finished jobs older than --days")
     p.add_argument("--days", type=float, default=7)
     p.set_defaults(func=cmd_clean)
+
+    p = sub.add_parser("edit", help="change name, group, dependencies or progress settings of a job (also running)")
+    p.add_argument("id")
+    progress_args(p)
+    p.add_argument("--after", action="append", metavar="JOB", help="replace the dependencies ('' for none)")
+    p.set_defaults(func=cmd_edit)
 
     p = sub.add_parser("wait", help="block until jobs finish (exit 1 if any did not succeed)")
     p.add_argument("ids", nargs="*")

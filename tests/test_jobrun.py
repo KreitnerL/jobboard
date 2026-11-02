@@ -60,7 +60,7 @@ def test_detached_run_parses_tqdm_and_records_exit(jobrun):
 
 def test_shell_command_failure_and_bracket_counter(jobrun):
     jobrun("run", "--name", "fails", "--", 'echo "[2/7] case a"; exit 3')
-    row = wait_for(jobrun, "fails", "failed")
+    row = wait_for(jobrun, "fails", "error")
     assert (row["done"], row["total"], row["exit_code"]) == (2, 7, 3)
 
 
@@ -83,7 +83,7 @@ def test_foreground_copies_output_and_returns_exit_code(jobrun):
     assert out.returncode == 2
     assert "JOBRUN_PROGRESS 4/8" in out.stdout
     row = rows(jobrun)["fg"]
-    assert (row["status"], row["done"], row["total"]) == ("failed", 4, 8)
+    assert (row["status"], row["done"], row["total"]) == ("error", 4, 8)
 
 
 def test_stop_kills_process_tree(jobrun):
@@ -92,7 +92,7 @@ def test_stop_kills_process_tree(jobrun):
     time.sleep(0.3)
     children = subprocess.run(["pgrep", "-P", str(pid)], capture_output=True, text=True).stdout.split()
     jobrun("stop", "tree", "--grace", "2")
-    assert wait_for(jobrun, "tree", "killed")["status"] == "killed"
+    assert wait_for(jobrun, "tree", "stopped")["status"] == "stopped"
     time.sleep(0.3)
     assert not any(Path(f"/proc/{c}").exists() for c in children)
 
@@ -146,7 +146,7 @@ def test_group_sums_progress_and_stops_together(jobrun):
     assert "sweep (1/3 jobs)" in jobrun("ls").stdout
     jobrun("stop", "--group", "sweep", "--grace", "2")
     group = listing(jobrun)["groups"][0]
-    assert (group["status"], group["finished"]) == ("killed", 3)
+    assert (group["status"], group["finished"]) == ("stopped", 3)
 
 
 def test_rm_deletes_only_logs_jobrun_wrote(jobrun, tmp_path):
@@ -228,7 +228,7 @@ def test_wait_blocks_until_done_and_reports_failure(jobrun):
     jobrun("run", "--group", "w", "--name", "bad", "--", "sleep 0.8; exit 1")
     out = jobrun("wait", "--group", "w", "--interval", "0.2", check=False)
     assert out.returncode == 1
-    assert "done" in out.stdout and "failed" in out.stdout
+    assert "done" in out.stdout and "error" in out.stdout
     assert jobrun("wait", "ok", "--interval", "0.2").returncode == 0
 
 
@@ -304,8 +304,9 @@ def test_after_failed_dependency_skips(jobrun, monkeypatch):
     monkeypatch.setenv("JOBRUN_WAIT_POLL_S", "0.5")
     jobrun("run", "--name", "breaks", "--", "exit 3")
     jobrun("run", "--name", "follow", "--after", "breaks", "--", "touch should-not-exist")
-    row = wait_for(jobrun, "follow", "skipped")
-    assert row["reason"] == "breaks failed" and row["elapsed_s"] is None
+    row = wait_for(jobrun, "follow", "cancelled")
+    assert row["reason"] == "dependency breaks: error" and row["elapsed_s"] is None
+    assert rows(jobrun)["breaks"]["reason"] == "exit code 3"
     assert not (jobrun.home.parent / "should-not-exist").exists()
 
 
@@ -317,7 +318,7 @@ def test_stop_waiting_job(jobrun, monkeypatch):
     row = wait_for(jobrun, "queued", "waiting")
     pid = json.loads((jobrun.home / "jobs" / f"{row['id']}.json").read_text())["supervisor_pid"]
     jobrun("stop", "queued", "--grace", "2")
-    assert wait_for(jobrun, "queued", "killed")["reason"] == "stopped while waiting"
+    assert wait_for(jobrun, "queued", "cancelled")["reason"] == "stopped while waiting"
     time.sleep(0.5)
     assert not jobrun_module.pid_alive(pid) and supervisor
 
@@ -350,3 +351,46 @@ def test_rows_cached_by_older_versions_still_list(jobrun):
     state_path.write_text(json.dumps(state))
     assert rows(jobrun)["old-final"]["after_names"] == []
     assert "old-final" in jobrun("ls").stdout
+
+
+def test_error_reasons(jobrun):
+    jobrun("run", "--name", "signalled", "--", "kill -9 $$")
+    assert wait_for(jobrun, "signalled", "error")["reason"] == "killed by SIGKILL"
+
+
+def test_edit_running_job_takes_effect_without_restart(jobrun):
+    script = ("for i in 1 2 3; do echo 'JOBRUN_TRIAL Trial completed'; done; sleep 1; "
+              "echo 'JOBRUN_PROGRESS 0/6'; echo 'JOBRUN_PROGRESS 2/6'; sleep 300")
+    jobrun("run", "--name", "pipeline", "--", script)
+    row = wait_for(jobrun, "pipeline", "running")
+    jobrun("edit", "pipeline", "--name", "pipeline v2", "--stages", "tune,rollout", "--count-regex", "JOBRUN_TRIAL",
+           "--total", "3", "--stage-at", "rollout=JOBRUN_PROGRESS")
+    deadline = time.time() + 10
+    while (row := rows(jobrun).get("pipeline v2") or {}).get("stage") != "rollout" and time.time() < deadline:
+        time.sleep(0.3)
+    assert [(s["name"], s["status"], s["done"], s["total"]) for s in row["stages"]] == [
+        ("tune", "done", 3, 3), ("rollout", "running", 2, 6)]
+
+
+def test_edit_after_marks_self_waiting_command_as_waiting(jobrun):
+    jobrun("run", "--name", "upstream", "--", "sleep 2")
+    jobrun("run", "--name", "polls", "--", "sleep 1.5; echo '[1/1] x'; sleep 300")  # waits by itself
+    wait_for(jobrun, "polls", "running")  # already started: only the display can wait
+    jobrun("edit", "polls", "--after", "upstream")
+    row = rows(jobrun)["polls"]
+    assert (row["status"], row["waiting_for"], row["elapsed_s"]) == ("waiting", ["upstream"], None)
+    upstream = wait_for(jobrun, "upstream", "done")
+    row = wait_for(jobrun, "polls", "running")
+    assert row["started"] == upstream["ended"] and row["after_names"] == ["upstream"]
+    jobrun("edit", "polls", "--after", "")
+    assert rows(jobrun)["polls"]["after"] == []
+
+
+def test_legacy_statuses_in_cached_rows_are_renamed(jobrun):
+    jobrun("run", "--name", "legacy", "--", "exit 1")
+    row = wait_for(jobrun, "legacy", "error")
+    state_path = jobrun.home / "jobs" / f"{row['id']}.state.json"
+    state = json.loads(state_path.read_text())
+    state["final"]["status"] = "failed"
+    state_path.write_text(json.dumps(state))
+    assert rows(jobrun)["legacy"]["status"] == "error"

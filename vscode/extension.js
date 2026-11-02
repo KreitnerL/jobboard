@@ -6,23 +6,27 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
-const JSON_SCHEMA = 1;  // newest `jobrun ls --json` format this extension understands
-const ACTIVE = new Set(['starting', 'waiting', 'pending', 'running', 'unknown']);
+const JSON_SCHEMA = 2;  // newest `jobrun ls --json` format this extension understands
+const ACTIVE = new Set(['starting', 'waiting', 'running', 'unknown']);
+// [codicon, theme color]; active states first, then outcomes
 const ICONS = {
+  waiting: ['clock', 'charts.yellow'],              // dependency or Slurm queue: not started yet
   starting: ['loading~spin', undefined],
-  waiting: ['debug-pause', 'charts.yellow'],
-  pending: ['clock', 'charts.yellow'],
   running: ['sync~spin', 'charts.blue'],
   unknown: ['question', 'charts.yellow'],
   done: ['pass-filled', 'testing.iconPassed'],
-  failed: ['error', 'testing.iconFailed'],
-  killed: ['circle-slash', 'disabledForeground'],
-  timeout: ['watch', 'testing.iconFailed'],
-  oom: ['error', 'testing.iconFailed'],
-  ended: ['circle-large-outline', undefined],
-  lost: ['warning', 'charts.orange'],
-  skipped: ['debug-step-over', 'disabledForeground'],
+  error: ['error', 'testing.iconFailed'],           // non-zero exit, signal, time limit, out of memory
+  stopped: ['debug-stop', 'charts.orange'],         // stopped while running
+  cancelled: ['circle-slash', 'disabledForeground'],  // never started
+  lost: ['warning', 'charts.orange'],               // supervisor vanished, outcome unknown
+  ended: ['circle-large-outline', undefined],       // tracked process ended, exit code unknown
 };
+const LEGACY_STATUS = { failed: 'error', timeout: 'error', oom: 'error', killed: 'stopped', skipped: 'cancelled', pending: 'waiting' };
+
+function normalize(item) {
+  item.status = LEGACY_STATUS[item.status] || item.status;
+  return item;
+}
 
 function config() {
   return vscode.workspace.getConfiguration('jobboard');
@@ -86,9 +90,13 @@ function progressText(item) {
 
 function describe(job) {
   const parts = [];
-  if (job.jobs) parts.push(`${job.finished}/${job.jobs} jobs${job.failed ? ` (${job.failed} failed)` : ''}`);
-  if (job.status === 'waiting') return `waiting for ${(job.waiting_for || []).join(', ') || 'dependencies'}`;
-  if (job.reason) return `${job.status}: ${job.reason}`;
+  if (job.jobs) {
+    const other = Object.entries(job.counts || {}).filter(([status]) => status !== 'done' && !ACTIVE.has(status))
+      .map(([status, n]) => `${n} ${status}`);
+    parts.push(`${job.finished}/${job.jobs} jobs${other.length ? ` (${other.join(', ')})` : ''}`);
+  }
+  if (!job.jobs && job.status === 'waiting') return `waiting for ${(job.waiting_for || []).join(', ') || 'dependencies'}`;
+  if (!job.jobs && job.status === 'cancelled') return `cancelled: ${job.reason || 'never started'}`;
   if (job.stage) parts.push(`${job.stage_no}/${job.stage_of || '?'} ${job.stage}`);
   if (ACTIVE.has(job.status)) {
     if (job.fraction != null) parts.push(`${bar(job.fraction)} ${Math.round(job.fraction * 100)}%`, `${count(job.done)}/${count(job.total)}`);
@@ -101,7 +109,7 @@ function describe(job) {
     } else if (job.eta) parts.push(`ETA ${clock(job.eta)}`);
     parts.push(duration(job.elapsed_s));
   } else {
-    parts.push(job.exit_code != null && job.status !== 'done' ? `${job.status} (${job.exit_code})` : job.status);
+    parts.push(job.reason ? `${job.status}: ${job.reason}` : job.status);
     if (job.done != null) parts.push(progressText(job));
     parts.push(duration(job.elapsed_s));
     if (job.ended) parts.push(`ended ${clock(job.ended)}`);
@@ -112,7 +120,8 @@ function describe(job) {
 function tooltip(job) {
   const md = new vscode.MarkdownString();
   const where = [job.host, job.slurm_id && `slurm ${job.slurm_id}`, job.pid && `pid ${job.pid}`].filter(Boolean).join(', ');
-  md.appendMarkdown(`**${job.name}** — ${job.status}\n\n`);
+  md.appendMarkdown(`$(${(ICONS[job.status] || ['circle-outline'])[0].split('~')[0]}) **${job.name}** — ${job.status}\n\n`);
+  md.supportThemeIcons = true;
   const rows = [
     ['id', job.id], ['where', where], ['started', job.started && new Date(job.started * 1000).toLocaleString()],
     ['ended', job.ended && new Date(job.ended * 1000).toLocaleString()], ['elapsed', duration(job.elapsed_s)],
@@ -120,7 +129,7 @@ function tooltip(job) {
     ['rate', rate(job.rate_per_s)], ['ETA', job.eta && new Date(job.eta * 1000).toLocaleString()],
     ['last progress', job.progress_at && `${new Date(job.progress_at * 1000).toLocaleString()} (${duration(Date.now() / 1000 - job.progress_at)} ago)`],
     ['cwd', job.cwd], ['log', job.log],
-    ['after', (job.after_names || []).join(', ')], ['skipped', job.reason],
+    ['after', (job.after_names || []).join(', ')], ['waiting for', (job.waiting_for || []).join(', ')], ['reason', job.reason],
   ];
   for (const [key, value] of rows) if (value) md.appendMarkdown(`${key}: \`${value}\`  \n`);
   if (job.finishing) md.appendMarkdown('\n*At or past its total but still running: a final phase the progress pattern does not count, or a too small total.*\n\n');
@@ -151,6 +160,8 @@ class JobsProvider {
       if (Array.isArray(data)) [this.jobs, this.groups] = [data, []];  // jobrun < 0.1
       else if ((data.schema || 1) > JSON_SCHEMA) throw new Error('jobrun is newer than this extension; update the extension');
       else [this.jobs, this.groups] = [data.jobs || [], data.groups || []];
+      this.jobs.forEach(normalize);
+      this.groups.forEach(normalize);
       this.error = null;
       this.notify();
     } catch (err) {
@@ -172,13 +183,15 @@ class JobsProvider {
     const finished = (key, status) => seen.has(key) && ACTIVE.has(seen.get(key)) && !ACTIVE.has(status);
     for (const job of this.jobs) {
       if (!finished(job.id, job.status) || (job.group && job.status === 'done')) continue;
-      const text = `Job "${job.name}"${job.group ? ` (${job.group})` : ''} ${job.status} after ${duration(job.elapsed_s)}`;
+      const outcome = job.reason ? `${job.status}: ${job.reason}` : job.status;
+      const text = `Job "${job.name}"${job.group ? ` (${job.group})` : ''} ${outcome}${job.elapsed_s != null ? ` after ${duration(job.elapsed_s)}` : ''}`;
       const show = job.status === 'done' ? vscode.window.showInformationMessage : vscode.window.showWarningMessage;
       show(text, 'Open Log').then(choice => { if (choice) openLog(job); });
     }
     for (const g of this.groups) {
       if (!finished(`group:${g.name}`, g.status)) continue;
-      const text = `Group "${g.name}" finished: ${g.jobs - g.failed}/${g.jobs} jobs done after ${duration(g.elapsed_s)}`;
+      const counts = Object.entries(g.counts || {}).map(([status, n]) => `${n} ${status}`).join(', ');
+      const text = `Group "${g.name}" finished after ${duration(g.elapsed_s)}: ${counts}`;
       (g.failed ? vscode.window.showWarningMessage : vscode.window.showInformationMessage)(text);
     }
   }
