@@ -373,8 +373,8 @@ def supervise(job_id: str, tee: bool = False) -> int:
     times stay accurate while no dashboard is open.
     """
     meta_path = _file(job_id, ".json")
-    meta = update_meta(job_id, supervisor_pid=os.getpid(), supervisor_scans=True, supervisor_version=SUPERVISOR_VERSION,
-                       waiting=bool((read_json(meta_path) or {}).get("after")))
+    meta = update_meta(job_id, supervisor_pid=os.getpid(), supervisor_start=proc_start(os.getpid()), supervisor_scans=True,
+                       supervisor_version=SUPERVISOR_VERSION, waiting=bool((read_json(meta_path) or {}).get("after")))
     if meta.get("after"):
         reason = wait_for_dependencies(job_id)
         if reason:
@@ -473,21 +473,29 @@ def job_status(meta: dict, slurm: dict, now: float) -> tuple[str, float | None, 
     if kind == "process":
         heartbeat = _file(job_id, ".hb")
         if meta.get("host") == HOST:
-            alive = (pid_alive(pid, meta.get("proc_start")) if pid is not None
-                     else bool(meta.get("supervisor_pid")) and pid_alive(meta["supervisor_pid"]))
-        else:
+            supervisor = bool(meta.get("supervisor_pid")) and pid_alive(meta["supervisor_pid"], meta.get("supervisor_start"))
+            alive = pid_alive(pid, meta.get("proc_start")) if pid is not None else supervisor
+        else:  # the supervisor touches the heartbeat until it has written the exit file
             beat = _mtime(heartbeat)
-            alive = beat is not None and now - beat < STALE_S
+            supervisor = alive = beat is not None and now - beat < STALE_S
         if pid is None:
             if meta.get("waiting") and alive:
                 return "waiting", None, None, None
             if now - (meta.get("started") or 0) < STALE_S:
                 return "starting", None, None, None
-            return "lost", None, None, "the supervisor vanished before the command started"
-        if alive:
+        elif alive:
             return "running", None, None, None
-        if stopped:
+        elif stopped:
             return "stopped", _mtime(heartbeat), None, None
+        elif supervisor:
+            # The command has exited, but its supervisor is still alive: it scans the rest of the log and then
+            # writes the exit file. Not lost; dependents must keep waiting for that exit code.
+            return "running", None, None, None
+        if _file(job_id, ".exit.json").exists():
+            # The supervisor wrote the exit file and exited between our first look at it and the checks above.
+            return job_status(meta, slurm, now)
+        if pid is None:
+            return "lost", None, None, "the supervisor vanished before the command started"
         return "lost", _mtime(heartbeat), None, "the supervisor vanished without recording an exit code"
     if meta.get("host") != HOST:
         return "unknown", None, None, None

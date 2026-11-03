@@ -1,5 +1,6 @@
 import json
 import os
+import socket
 import subprocess
 import sys
 import time
@@ -417,3 +418,43 @@ def test_stopped_while_self_waiting_is_cancelled(jobrun):
     jobrun("stop", "poller", "--grace", "2")
     row = wait_for(jobrun, "poller", "cancelled")
     assert row["reason"] == "stopped while waiting" and row["elapsed_s"] is None
+
+
+def _job_between_child_exit_and_exit_file(home: Path, job_id: str, name: str) -> subprocess.Popen:
+    """A job whose command has exited while its supervisor is alive and has not written .exit.json yet (it is
+    still scanning the log, or about to call _finish). Returns the stand-in supervisor process."""
+    child = subprocess.Popen(["sleep", "0.2"])
+    child_start = jobrun_module.proc_start(child.pid)
+    child.wait()
+    supervisor = subprocess.Popen(["sleep", "300"])
+    (home / "jobs").mkdir(parents=True, exist_ok=True)
+    meta = {"id": job_id, "name": name, "kind": "process", "cmd": ["true"], "cwd": str(home), "host": socket.gethostname(),
+            "log": str(home / f"{job_id}.log"), "started": time.time() - 1, "pid": child.pid, "pgid": child.pid,
+            "proc_start": child_start, "supervisor_pid": supervisor.pid,
+            "supervisor_start": jobrun_module.proc_start(supervisor.pid), "supervisor_scans": True}
+    (home / "jobs" / f"{job_id}.json").write_text(json.dumps(meta))
+    return supervisor
+
+
+def test_job_whose_supervisor_is_still_finishing_is_not_lost(jobrun):
+    supervisor = _job_between_child_exit_and_exit_file(jobrun.home, "261103-aaaa", "finishing up")
+    try:
+        assert rows(jobrun)["finishing up"]["status"] == "running"
+    finally:
+        supervisor.kill()
+        supervisor.wait()
+    assert rows(jobrun)["finishing up"]["status"] == "lost"  # a real supervisor death is still lost
+
+
+def test_dependency_between_child_exit_and_exit_file_does_not_cancel(jobrun, monkeypatch):
+    monkeypatch.setenv("JOBRUN_WAIT_POLL_S", "0.3")
+    supervisor = _job_between_child_exit_and_exit_file(jobrun.home, "261103-bbbb", "short dependency")
+    try:
+        jobrun("run", "--name", "dependent", "--after", "short dependency", "--", "echo '[1/1] ok'")
+        time.sleep(1.5)  # several dependency checks inside the window
+        assert rows(jobrun)["dependent"]["status"] == "waiting"
+        (jobrun.home / "jobs" / "261103-bbbb.exit.json").write_text(json.dumps({"exit_code": 0, "ended": time.time()}))
+    finally:
+        supervisor.kill()
+        supervisor.wait()
+    assert wait_for(jobrun, "dependent", "done")["done"] == 1
