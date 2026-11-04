@@ -147,12 +147,26 @@ class JobsProvider {
     this.error = null;
     this.loaded = false;
     this.busy = false;
+    this.stale = false;
+    this.view = null;
     this.previous = new Map();
     this.statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 50);
     this.statusBar.command = 'jobboard.jobs.focus';
   }
 
-  async refresh() {
+  // Redraw only when someone can see it. Every tree event makes VS Code show the view's progress bar, and events
+  // sent while the window is minimized queue up and replay as a burst of animations when it is restored.
+  render(force = false) {
+    const seen = this.view && this.view.visible && (vscode.window.state.focused || config().get('updateWhileUnfocused'));
+    if (seen || force) {
+      this.stale = false;
+      this.emitter.fire();
+    } else {
+      this.stale = true;
+    }
+  }
+
+  async refresh(force = false) {
     if (this.busy) return;
     this.busy = true;
     try {
@@ -171,7 +185,7 @@ class JobsProvider {
     }
     this.loaded = true;
     this.updateStatusBar();
-    this.emitter.fire();
+    this.render(force);
   }
 
   // One message per finished ungrouped job, per failed group member, and per finished group.
@@ -330,6 +344,7 @@ async function openLog(job) {
 function activate(context) {
   const provider = new JobsProvider();
   const view = vscode.window.createTreeView('jobboard.jobs', { treeDataProvider: provider, showCollapseAll: true });
+  provider.view = view;
   const run = (args, message) => jobrun(args)
     .then(out => { if (message) vscode.window.setStatusBarMessage(message || out.trim(), 4000); })
     .catch(err => vscode.window.showErrorMessage(`jobrun ${args[0]}: ${err.message}`))
@@ -348,8 +363,9 @@ function activate(context) {
     vscode.workspace.onDidChangeConfiguration(event => {
       if (event.affectsConfiguration('jobboard')) { schedule(); provider.refresh(); }
     }),
-    view.onDidChangeVisibility(event => { if (event.visible) provider.refresh(); }),
-    vscode.commands.registerCommand('jobboard.refresh', () => provider.refresh()),
+    view.onDidChangeVisibility(event => { if (event.visible) provider.refresh(true); }),
+    vscode.window.onDidChangeWindowState(state => { if (state.focused && provider.stale) provider.refresh(true); }),
+    vscode.commands.registerCommand('jobboard.refresh', () => provider.refresh(true)),
     vscode.commands.registerCommand('jobboard.openLog', item => openLog(item.job)),
     vscode.commands.registerCommand('jobboard.tailLog', item => {
       if (!item.job.log) return vscode.window.showWarningMessage(`No log file for "${item.job.name}"`);

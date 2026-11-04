@@ -5,4 +5,4 @@ jobs and groups with progress, rate, ETA and elapsed time; open or follow logs; 
 
 Requires the `jobrun` CLI (`pipx install git+https://github.com/KreitnerL/jobboard`). Settings: `jobboard.command`
 (path to `jobrun`), `jobboard.registry` (`JOBRUN_HOME`), `jobboard.refreshSeconds`, `jobboard.finishedDays`,
-`jobboard.notifyOnFinish`.
+`jobboard.notifyOnFinish`, `jobboard.updateWhileUnfocused` (redraw the list while VS Code is not focused, e.g. on a second monitor; off by default).

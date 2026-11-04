@@ -3,7 +3,7 @@
   "displayName": "Job Board",
   "description": "Running and finished jobs from the jobrun registry: progress, rate, ETA, logs, stop.",
   "publisher": "kreitner",
-  "version": "0.3.1",
+  "version": "0.3.3",
   "license": "MIT",
   "engines": {
     "vscode": "^1.80.0"
@@ -228,6 +228,11 @@
           "type": "boolean",
           "default": true,
           "description": "Show a notification when a job finishes while this window is open."
+        },
+        "jobboard.updateWhileUnfocused": {
+          "type": "boolean",
+          "default": false,
+          "description": "Keep redrawing the job list while VS Code is not focused (e.g. watched on a second monitor). Off: the list is redrawn once when the window regains focus; status bar and notifications stay live."
         }
       }
     }

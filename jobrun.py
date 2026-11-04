@@ -665,8 +665,8 @@ def update_rate(state: dict, stage_key: int, done: int, total: int | None, now: 
 
 def stage_rows(meta: dict, stages: list[dict], status: str, ended: float | None) -> list[dict]:
     """Stages for display: finished, current, and planned (--stages) ones not reached yet."""
-    if len(stages) == 1 and stages[0]["name"] is None and not meta.get("stages"):
-        return []
+    if len(stages) == 1 and (stages[0]["of"] or 1) <= 1 and len(meta.get("stages") or []) <= 1:
+        return []  # a single stage with nothing announced after it carries no information ("1/?")
     rows = []
     for stage in stages:
         last = stage is stages[-1]
@@ -688,6 +688,8 @@ def snapshot(meta: dict, slurm: dict) -> dict:
     if state.get("final"):
         row = state["final"]
         row["status"] = LEGACY_STATUS.get(row["status"], row["status"])
+        if len(row.get("stages") or []) == 1 and (row.get("stage_of") or 1) <= 1:  # cached before lone stages were hidden
+            row.update(stage=None, stage_no=None, stage_of=None, stages=[])
         return row
     now = time.time()
     status, ended, exit_code, reason = job_status(meta, slurm, now)

@@ -339,7 +339,7 @@ def test_jobs_from_older_supervisors_are_scanned_by_readers(jobrun):
     (jobrun.home / "jobs" / "261101-aaaa.json").write_text(json.dumps(meta))
     (jobrun.home / "jobs" / "261101-aaaa.hb").touch()
     row = rows(jobrun)["old"]
-    assert (row["status"], row["stage"], row["done"], row["total"]) == ("running", "trials", 7, 10)
+    assert (row["status"], row["done"], row["total"]) == ("running", 7, 10)  # a lone stage is not shown
 
 
 def test_rows_cached_by_older_versions_still_list(jobrun):
@@ -458,3 +458,15 @@ def test_dependency_between_child_exit_and_exit_file_does_not_cancel(jobrun, mon
         supervisor.kill()
         supervisor.wait()
     assert wait_for(jobrun, "dependent", "done")["done"] == 1
+
+
+def test_single_stage_is_not_shown(jobrun):
+    jobrun("run", "--name", "one stage", "--", "echo 'JOBRUN_STAGE only'; echo '[2/4] x'; sleep 300")
+    jobrun("run", "--name", "announced", "--", "echo 'JOBRUN_STAGE first 1/3'; sleep 300")
+    deadline = time.time() + 10
+    while not ((row := rows(jobrun)["one stage"])["done"] and rows(jobrun)["announced"]["stage"]) and time.time() < deadline:
+        time.sleep(0.3)
+    assert (row["stage"], row["stages"], row["done"], row["total"]) == (None, [], 2, 4)
+    assert "/?" not in jobrun("ls").stdout
+    announced = rows(jobrun)["announced"]
+    assert (announced["stage"], announced["stage_no"], announced["stage_of"]) == ("first", 1, 3)
