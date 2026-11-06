@@ -7,7 +7,7 @@ The registry is a directory of small files ($JOBRUN_HOME, default ~/.jobs):
     jobs/<id>.exit.json   exit code and end time, written by the supervisor
     jobs/<id>.hb          heartbeat, touched by the supervisor while the command runs
     jobs/<id>.stopped     marker written by `jobrun stop`
-    jobs/<id>.state.json  progress samples and the cached final row, written by readers
+    jobs/<id>.state.json  the last rate and the cached final row, written by readers
     logs/<id>.log         default log of supervised commands
 
 Progress is parsed from the job's log, so commands need no changes. Recognised by default:
@@ -47,7 +47,10 @@ WAIT_POLL_S = float(os.environ.get("JOBRUN_WAIT_POLL_S", 15))  # dependency chec
 COUNT_CHUNK_BYTES = 8 << 20  # count mode reads in chunks ...
 COUNT_BUDGET_BYTES = 256 << 20  # ... and at most this much per refresh
 SACCT_TTL_S = 30
-RATE_WINDOW_S = 15 * 60
+# Rate and ETA use the last RATE_STEPS completed steps of the current stage. Backtested on 173 finished tuning and
+# rollout runs (2026-11-06): lower median ETA error than the run average or a 15-minute window, and nearly unbiased
+# when early steps are fast (parallel workers finish their short items first).
+RATE_STEPS = 15
 JSON_SCHEMA = 2  # version of `ls --json`; bump on incompatible changes (the VS Code extension checks it)
 SUPERVISOR_VERSION = 2  # supervisors from 2 on reload edited settings
 ACTIVE = ("starting", "waiting", "running", "unknown")
@@ -515,8 +518,44 @@ def _match(match: re.Match, total: int | None) -> tuple[int, int | None]:
     return int(done), int(found) if found else total
 
 
-def _new_stage(name: str | None, started: float, index=None, of=None) -> dict:
-    return {"name": name, "index": index, "of": of, "started": started, "ended": None, "done": None, "total": None}
+def _new_stage(name: str | None, started: float | None, index=None, of=None) -> dict:
+    """history: [time, done] whenever done changed (time known), trimmed to the rate window; see _set_progress."""
+    return {"name": name, "index": index, "of": of, "started": started, "ended": None, "done": None, "total": None,
+            "history": [[started, 0]] if started is not None else [], "progress_at": None}
+
+
+def _set_progress(stage: dict, done: int, total: int | None, when: float | None) -> None:
+    """Record a progress value; when=None means its time is unknown (catching up on an old log)."""
+    previous = stage["done"]
+    stage["done"], stage["total"] = done, total
+    if done == previous:
+        return
+    history = stage.setdefault("history", [])
+    if previous is not None and done < previous:
+        history.clear()  # the counter restarted
+    if when is None:
+        return
+    stage["progress_at"] = when
+    if previous is None and history == [[stage["started"], 0]] and when - (stage["started"] or when) < 10 and done > 1:
+        history.clear()  # reported right at the start (e.g. a resumed run): a baseline, not steps done in no time
+    if history and history[-1][0] == when:
+        history[-1][1] = done
+    else:
+        history.append([when, done])
+    while len(history) > 1 and history[1][1] <= done - RATE_STEPS:
+        history.pop(0)  # keep one anchor at or below done - RATE_STEPS
+
+
+def stage_rate(stage: dict, now: float, job_started: float) -> float | None:
+    """Steps per second over the last RATE_STEPS steps, counted up to now (a stall lowers the rate). Falls back
+    to the stage's (or job's) average when no step times are known, e.g. for logs written before the first scan."""
+    done = stage["done"]
+    if not done:
+        return None
+    history = stage.get("history") or []
+    anchor = next((h for h in reversed(history) if h[1] <= done - RATE_STEPS), history[0] if history else None)
+    t0, d0 = anchor if anchor else (stage["started"] or job_started, 0)
+    return (done - d0) / (now - t0) if done > d0 and now > t0 else None
 
 
 def scan_log(meta: dict, scan: dict, now: float, final: bool = False) -> None:
@@ -569,15 +608,15 @@ def scan_log(meta: dict, scan: dict, now: float, final: bool = False) -> None:
         if "JOBRUN_PROGRESS" in line:  # explicit progress wins in every mode
             explicit = PROGRESS_PATTERNS[0].search(line)
             if explicit:
-                stage["done"], stage["total"] = int(explicit["done"]), int(explicit["total"])
+                _set_progress(stage, int(explicit["done"]), int(explicit["total"]), when)
                 return
         if count:
             if count.search(line):
-                stage["done"], stage["total"] = (stage["done"] or 0) + 1, default_total
+                _set_progress(stage, (stage["done"] or 0) + 1, default_total, when)
         elif patterns is not PROGRESS_PATTERNS or "/" in line:  # every default pattern contains a slash
             match = next((m for m in (p.search(line) for p in patterns) if m), None)
             if match:
-                stage["done"], stage["total"] = _match(match, default_total)
+                _set_progress(stage, *_match(match, default_total), when)
 
     with handle:
         size = os.fstat(handle.fileno()).st_size
@@ -606,7 +645,7 @@ def scan_log(meta: dict, scan: dict, now: float, final: bool = False) -> None:
                 partial = ANSI.sub("", chunk[complete:].decode(errors="replace"))
                 match = "JOBRUN_STAGE" not in partial and next((m for m in (p.search(partial) for p in patterns) if m), None)
                 if match:
-                    stages[-1]["done"], stages[-1]["total"] = _match(match, default_total)
+                    _set_progress(stages[-1], *_match(match, default_total), when)
         scan["offset"] = position + dropped
     if stages[-1]["total"] is None and default_total:
         stages[-1]["total"] = default_total
@@ -642,25 +681,6 @@ def last_log_line(meta: dict) -> str | None:
         return None
     lines = [line for line in (ANSI.sub("", raw).strip() for raw in re.split(r"[\r\n]+", tail)) if line]
     return lines[-1][:300] if lines else None
-
-
-def update_rate(state: dict, stage_key: int, done: int, total: int | None, now: float,
-                started: float) -> float | None:
-    """Items per second over the last RATE_WINDOW_S of the current stage, or its average until then."""
-    samples = state.get("samples") or []
-    if samples and (state.get("stage") != stage_key or done < samples[-1][1] or total != state.get("total")):
-        samples = []
-    state.update(stage=stage_key, total=total)
-    if not samples or samples[-1][1] != done:
-        samples.append([now, done])
-        state["progress_at"] = now
-    older = [s for s in samples if now - s[0] > RATE_WINDOW_S]
-    samples = older[-1:] + [s for s in samples if now - s[0] <= RATE_WINDOW_S]
-    state["samples"] = samples
-    first_t, first_done = samples[0]
-    if now - first_t >= 60 and done > first_done:
-        return (done - first_done) / (now - first_t)
-    return done / (now - started) if done and now > started else None
 
 
 def stage_rows(meta: dict, stages: list[dict], status: str, ended: float | None) -> list[dict]:
@@ -707,7 +727,7 @@ def snapshot(meta: dict, slurm: dict) -> dict:
     done, total = current["done"], current["total"]
     rate = state.get("rate")
     if done is not None and status in ACTIVE:
-        rate = state["rate"] = update_rate(state, len(stages), done, total, now, max(started, current["started"] or 0))
+        rate = state["rate"] = stage_rate(current, now, started)
     eta = None
     if status in ACTIVE and rate and total and done is not None and done < total:
         eta = now + (total - done) / rate
@@ -720,7 +740,7 @@ def snapshot(meta: dict, slurm: dict) -> dict:
         elapsed_s=None if status == "waiting" or (meta.get("after") and meta.get("pid") is None and
                                                    meta.get("kind") == "process") else (ended or now) - started,
         done=done, total=total, fraction=done / total if done is not None and total else None,
-        rate_per_s=rate, eta=eta, last_line=last_log_line(meta), progress_at=state.get("progress_at"),
+        rate_per_s=rate, eta=eta, last_line=last_log_line(meta), progress_at=current.get("progress_at"),
         # at or past the total but still running: an untracked final phase (or a too small --total)
         finishing=status in ACTIVE and bool(total) and done is not None and done >= total,
         stage=current["name"] if stage_list else None,

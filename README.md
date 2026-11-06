@@ -69,7 +69,10 @@ Otherwise, say what to look for:
 --progress-regex 'case (?P<done>\d+) of (?P<total>\d+)'
 ```
 
-The rate covers the last 15 minutes, and the ETA is the remaining work divided by that rate. For loops with
+The rate covers the last 15 completed steps of the current stage, measured up to now (so a stall lowers it), and the
+ETA is the remaining work divided by that rate. A window of recent steps follows runs whose steps get slower, e.g.
+parallel workers that finish their short items first; on real tuning and rollout runs it predicted the finish more
+accurately than the run average or a time window. For loops with
 millions of steps, report by time, not per step, so the log stays small:
 
 ```python

@@ -470,3 +470,37 @@ def test_single_stage_is_not_shown(jobrun):
     assert "/?" not in jobrun("ls").stdout
     announced = rows(jobrun)["announced"]
     assert (announced["stage"], announced["stage_no"], announced["stage_of"]) == ("first", 1, 3)
+
+
+def test_rate_uses_the_last_steps_not_the_run_average():
+    stage = jobrun_module._new_stage(None, 0.0)
+    for step in range(1, 51):  # 50 fast steps (1 s each), then 20 slow ones (60 s each)
+        jobrun_module._set_progress(stage, step, 100, float(step))
+    for step in range(51, 71):
+        jobrun_module._set_progress(stage, step, 100, 50.0 + 60 * (step - 50))
+    now = 50.0 + 60 * 20
+    assert jobrun_module.stage_rate(stage, now, 0.0) == pytest.approx(1 / 60)  # the run average would be ~1/18
+    assert len(stage["history"]) <= jobrun_module.RATE_STEPS + 1
+
+
+def test_a_stall_lowers_the_rate():
+    stage = jobrun_module._new_stage(None, 0.0)
+    for step in range(1, 31):
+        jobrun_module._set_progress(stage, step, 100, float(step))
+    steps = jobrun_module.RATE_STEPS
+    assert jobrun_module.stage_rate(stage, 30.0, 0.0) == pytest.approx(steps / steps)
+    assert jobrun_module.stage_rate(stage, 330.0, 0.0) == pytest.approx(steps / (330.0 - 15.0))
+
+
+def test_progress_reported_at_the_start_is_a_baseline():
+    stage = jobrun_module._new_stage(None, 0.0)
+    jobrun_module._set_progress(stage, 120, 257, 2.0)  # a resumed run reports its earlier results at once
+    assert jobrun_module.stage_rate(stage, 10.0, 0.0) is None
+    jobrun_module._set_progress(stage, 121, 257, 62.0)
+    assert jobrun_module.stage_rate(stage, 62.0, 0.0) == pytest.approx(1 / 60)
+
+
+def test_unknown_step_times_fall_back_to_the_average():
+    stage = jobrun_module._new_stage("old", None)
+    jobrun_module._set_progress(stage, 40, 100, None)  # read from a log written before the first scan
+    assert jobrun_module.stage_rate(stage, 1000.0, 200.0) == pytest.approx(40 / 800)
