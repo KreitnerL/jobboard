@@ -32,14 +32,29 @@ function config() {
   return vscode.workspace.getConfiguration('jobboard');
 }
 
-function jobrun(args) {
+let extensionPath = '';
+
+function onPath(name) {
+  return (process.env.PATH || '').split(path.delimiter).some(dir => dir && fs.existsSync(path.join(dir, name)));
+}
+
+// The jobrun CLI: the setting, ~/.local/bin/jobrun (jobrun setup), jobrun on PATH (pipx), else the copy bundled
+// with this extension, so the Job Board works right after installing it from a .vsix or the Marketplace.
+function jobrunCommand() {
   const configured = config().get('command');
+  if (configured) return [configured, []];
   const local = path.join(os.homedir(), '.local', 'bin', 'jobrun');
-  const command = configured || (fs.existsSync(local) ? local : 'jobrun');
+  if (fs.existsSync(local)) return [local, []];
+  if (onPath('jobrun')) return ['jobrun', []];
+  return ['python3', [path.join(extensionPath, 'bundle', 'jobrun.py')]];
+}
+
+function jobrun(args) {
+  const [command, prefix] = jobrunCommand();
   const env = { ...process.env };
   if (config().get('registry')) env.JOBRUN_HOME = config().get('registry');
   return new Promise((resolve, reject) => {
-    cp.execFile(command, args, { env, timeout: 60000, maxBuffer: 64 * 1024 * 1024 }, (err, stdout, stderr) => {
+    cp.execFile(command, [...prefix, ...args], { env, timeout: 60000, maxBuffer: 64 * 1024 * 1024 }, (err, stdout, stderr) => {
       if (err) reject(new Error((stderr || err.message).trim()));
       else resolve(stdout);
     });
@@ -259,6 +274,7 @@ class JobsProvider {
         return [item];
       }
       if (!this.loaded) return [new vscode.TreeItem('Loading…')];
+      if (!this.jobs.length) return [];  // shows the welcome content (Run Demo, Set Up) from package.json
       const entries = [
         ...this.groups.map(g => ({ ...g, members: this.jobs.filter(job => job.group === g.name) })),
         ...this.jobs.filter(job => !job.group),
@@ -550,6 +566,7 @@ async function openLog(job) {
 }
 
 function activate(context) {
+  extensionPath = context.extensionPath;
   const provider = new JobsProvider();
   const view = vscode.window.createTreeView('jobboard.jobs', { treeDataProvider: provider, showCollapseAll: true });
   provider.view = view;
@@ -586,6 +603,15 @@ function activate(context) {
       if (state.focused) resources.refresh();
     }),
     vscode.commands.registerCommand('jobboard.refresh', () => provider.refresh(true)),
+    vscode.commands.registerCommand('jobboard.demo', () => run(['demo'], 'Started the demo jobs')),
+    vscode.commands.registerCommand('jobboard.setup', () => {
+      // the wizard asks questions, so it runs in a terminal; the bundled copy also installs the command itself
+      const [command, prefix] = jobrunCommand();
+      const quote = arg => `'${arg.replace(/'/g, `'\\''`)}'`;
+      const terminal = vscode.window.createTerminal({ name: 'jobrun setup' });
+      terminal.sendText([command, ...prefix, 'setup'].map(quote).join(' '));
+      terminal.show();
+    }),
     vscode.commands.registerCommand('jobboard.openLog', item => openLog(item.job)),
     vscode.commands.registerCommand('jobboard.tailLog', item => {
       if (!item.job.log) return vscode.window.showWarningMessage(`No log file for "${item.job.name}"`);

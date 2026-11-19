@@ -28,15 +28,60 @@ JOBS                                                        ⟳  ⌫
 
 ## Install
 
+One command installs everything and asks what you want:
+
 ```bash
-pipx install git+https://github.com/KreitnerL/jobboard     # or: pip install --user git+https://...
+curl -fsSL https://raw.githubusercontent.com/KreitnerL/jobboard/main/install.sh | sh
 ```
 
-Or copy the single file: `curl -o ~/.local/bin/jobrun https://raw.githubusercontent.com/KreitnerL/jobboard/main/jobrun.py && chmod +x ~/.local/bin/jobrun`.
+The setup wizard (`jobrun setup`) offers three steps, each of which you can skip:
 
-**VS Code extension:** download `jobboard.vsix` from the [releases](https://github.com/KreitnerL/jobboard/releases) and run
-`code --install-extension jobboard.vsix`. With Remote-SSH, install it on the remote, where your jobs run.
-A **Jobs** icon appears in the activity bar.
+1. **The `jobrun` command:** copied to `~/.local/share/jobboard/` and linked as `~/.local/bin/jobrun`. If that
+   folder is not on your `PATH`, it offers to add it to your shell's rc file.
+2. **The VS Code extension:** installed into `code`, `cursor`, `codium`, ... (whichever it finds). With
+   Remote-SSH, run the installer on the remote host, where your jobs run.
+3. **Your coding agents:** the jobrun [skill](skills/jobrun/SKILL.md) for Claude Code (`~/.claude/skills`), Codex
+   and other agents that read `~/.agents/skills`, and Cursor (`~/.cursor/skills`). Optionally, it also adds one
+   line to the agents' global instructions (`~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md`):
+   *"Launch every command expected to run longer than ~2 minutes through `jobrun` (see the jobrun skill)."*
+
+Setup never overwrites files it did not create: an existing skill, command or instruction that mentions jobrun is
+left alone. Run it again at any time to update or to add what you skipped.
+
+**Other ways to install:**
+
+| | |
+|---|---|
+| Without questions | `curl -fsSL …/install.sh \| sh -s -- --yes --agents claude,codex` (also `--no-vscode`, `--no-instructions`) |
+| From a clone | `git clone https://github.com/KreitnerL/jobboard && jobboard/install.sh` |
+| As a Python tool | `pipx install git+https://github.com/KreitnerL/jobboard` (or `uv tool install …`), then `jobrun setup` for the extension and the agents |
+| Only the extension | install `jobboard.vsix` from the [releases](https://github.com/KreitnerL/jobboard/releases) (`code --install-extension jobboard.vsix`). It brings its own copy of `jobrun`, so the Job Board works at once; its **Set Up Terminal and Agents** button runs the same wizard |
+| Only the file | `curl -o ~/.local/bin/jobrun https://raw.githubusercontent.com/KreitnerL/jobboard/main/jobrun.py && chmod +x ~/.local/bin/jobrun` |
+
+Requires Linux and Python 3.9 or newer; nothing else.
+
+## Try it
+
+```bash
+jobrun demo
+```
+
+starts three short example jobs (about 2 minutes) in one group: a training run with stages and a tqdm bar, a sweep
+whose progress counts `Trial N completed` lines, and a report that waits for the training run. Watch them in the
+**Jobs** view (activity bar) or with `jobrun ls`, then remove them with the trash icon or
+`jobrun rm --group "jobrun demo"`. The empty Jobs view also has a **Run Demo Jobs** button.
+
+## Uninstall
+
+```bash
+jobrun uninstall            # asks before removing; --yes for no questions
+```
+
+removes exactly what `jobrun setup` installed: the command, the PATH line, the extension, the skills and the
+instruction lines (the rest of those files stays as it was). Files you changed since are kept unless you pass
+`--force`. The job registry `~/.jobs` (your jobs and the logs jobrun wrote) is kept unless you agree or pass
+`--purge`. Running jobs keep running and finish normally. If you installed with pipx or uv, also run
+`pipx uninstall jobboard` (or `uv tool uninstall jobboard`).
 
 ## Quick start
 
@@ -221,15 +266,11 @@ A node's reserved total is Slurm's allocations (all users) plus the budgets of y
 
 ## Use with AI coding agents
 
-Copy [`skills/jobrun`](skills/jobrun/SKILL.md) into your agent's skills folder (`~/.claude/skills/`,
-`~/.agents/skills/`, …) and add one line to your `AGENTS.md` / `CLAUDE.md`:
-
-```markdown
-Launch every command expected to run longer than ~2 minutes through `jobrun` (see the jobrun skill).
-```
-
-The agent then names its jobs, groups sweeps, picks a sensible progress unit, and checks `jobrun ls` instead of
-asking you to look.
+`jobrun setup` installs the [jobrun skill](skills/jobrun/SKILL.md) for the agents you pick (see
+[Install](#install)). The agent then launches every long command through `jobrun`, names and groups its jobs, picks
+a sensible progress unit, declares the job's CPU budget, checks `jobrun res` before big jobs, and looks at
+`jobrun ls` instead of asking you. For an agent not listed, copy `skills/jobrun` into its skills folder and add the
+instruction line above to its instructions file.
 
 ## Commands
 
@@ -245,6 +286,8 @@ asking you to look.
 | `stop ID` / `--group G` | SIGTERM to the whole process tree, then SIGKILL after 10 s; `scancel` for Slurm |
 | `edit ID [options]` | Change name, group, `--after`, stages or progress settings, also while running |
 | `rm ID` · `clean [--days 7]` | Remove from the list (with the logs jobrun wrote) |
+| `demo` | Start three short example jobs |
+| `setup` · `uninstall` | Install or remove the command, the VS Code extension and the agent skill |
 
 Common options: `--name`, `--group`, `--after`, `--stages`, `--stage-at`, `--log`, `--count-regex`, `--progress-regex`,
 `--total`, and the budget `--cpus`, `--mem`, `--gpus`.
@@ -265,12 +308,20 @@ nodes show up too.
 
 Requires Linux (`/proc`) and Python ≥ 3.9. Slurm is optional.
 
+`jobrun setup` records everything it creates in `~/.local/share/jobboard/install.json`; `jobrun uninstall` works
+through that list.
+
 ## Development
 
 ```bash
+./install.sh --link       # the jobrun command points at this clone, so edits take effect at once
 python -m pytest -q tests
 cd vscode && npx @vscode/vsce package -o jobboard.vsix && code --install-extension jobboard.vsix
 ```
+
+Packaging the extension bundles `jobrun.py` and the skill into it (`vscode/scripts/bundle.js`). To release, bump
+the version in `jobrun.py`, `pyproject.toml` and `vscode/package.json` (a test checks that they agree) and push a
+tag `vX.Y.Z`: the release workflow publishes `jobboard.vsix` and `install.sh`.
 
 ## License
 

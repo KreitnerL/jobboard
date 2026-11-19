@@ -608,3 +608,73 @@ def test_budget_marker_from_the_log_newest_wins_and_flags_override(jobrun):
     found = rows(jobrun)
     assert found["declares"]["budget"] == {"cpus": 12.0, "mem": 8 * 2 ** 30}
     assert found["overridden"]["budget"] == {"cpus": 2.0, "mem": 8 * 2 ** 30}
+
+
+def test_versions_agree():
+    import re as _re
+    root = Path(__file__).resolve().parents[1]
+    pyproject = _re.search(r'^version = "([^"]+)"', (root / "pyproject.toml").read_text(), _re.M).group(1)
+    extension = json.loads((root / "vscode" / "package.json").read_text())["version"]
+    assert jobrun_module.VERSION == pyproject == extension
+
+
+def test_marker_block_round_trip(tmp_path):
+    notes = tmp_path / "CLAUDE.md"
+    notes.write_text("# mine\n\nbe nice\n")
+    assert not jobrun_module._add_block(notes, "line one", ("<!--", " -->"))
+    jobrun_module._add_block(notes, "line two", ("<!--", " -->"))  # replaces, not appends
+    text = notes.read_text()
+    assert text.count("jobrun:begin") == 1 and "line two" in text and "line one" not in text
+    assert jobrun_module._strip_block(text) == "# mine\n\nbe nice\n"
+
+
+def _sandbox(tmp_path):
+    home = tmp_path / "home"
+    (home / ".claude").mkdir(parents=True)
+    (home / ".claude" / "CLAUDE.md").write_text("# mine\n")
+    env = {"HOME": str(home), "PATH": "/usr/bin:/bin", "SHELL": "/bin/bash"}
+
+    def call(*args):
+        out = subprocess.run([sys.executable, str(JOBRUN), *args], capture_output=True, text=True, env=env,
+                             stdin=subprocess.DEVNULL)
+        assert out.returncode == 0, out.stderr
+        return out.stdout
+    return home, call
+
+
+def test_setup_then_uninstall_leaves_home_as_it_was(tmp_path):
+    home, call = _sandbox(tmp_path)
+    before = sorted(str(p.relative_to(home)) for p in home.rglob("*"))
+    call("setup", "--yes", "--no-vscode", "--agents", "claude,codex")
+    call("setup", "--yes", "--no-vscode", "--agents", "claude,codex")  # idempotent
+    assert (home / ".local" / "bin" / "jobrun").resolve() == home / ".local" / "share" / "jobboard" / "app" / "jobrun.py"
+    assert (home / ".claude" / "skills" / "jobrun" / "SKILL.md").exists()
+    assert (home / ".agents" / "skills" / "jobrun" / "SKILL.md").exists()
+    assert (home / ".claude" / "CLAUDE.md").read_text().count("through `jobrun`") == 1
+    assert "jobrun:begin" in (home / ".codex" / "AGENTS.md").read_text()
+    assert ".local/bin" in (home / ".bashrc").read_text()
+    call("uninstall", "--yes", "--purge")
+    assert sorted(str(p.relative_to(home)) for p in home.rglob("*")) == before
+    assert (home / ".claude" / "CLAUDE.md").read_text() == "# mine\n"
+
+
+def test_setup_leaves_foreign_files_alone(tmp_path):
+    home, call = _sandbox(tmp_path)
+    (home / ".claude" / "CLAUDE.md").write_text("# mine\nuse jobrun for long jobs\n")
+    skill = home / ".claude" / "skills" / "jobrun" / "SKILL.md"
+    skill.parent.mkdir(parents=True)
+    skill.write_text("my own skill\n")
+    (home / ".local" / "bin").mkdir(parents=True)
+    (home / ".local" / "bin" / "jobrun").symlink_to("/somewhere/else/jobrun.py")
+    out = call("setup", "--yes", "--no-vscode", "--agents", "claude")
+    assert out.count("left alone") == 3
+    call("uninstall", "--yes")
+    assert skill.read_text() == "my own skill\n" and (home / ".local" / "bin" / "jobrun").is_symlink()
+    assert (home / ".claude" / "CLAUDE.md").read_text() == "# mine\nuse jobrun for long jobs\n"
+
+
+def test_demo_starts_a_group(jobrun):
+    out = jobrun("demo").stdout
+    assert "jobrun demo" in out
+    group = [r for r in listing(jobrun)["jobs"] if r.get("group") == "jobrun demo"]
+    assert len(group) == len(jobrun_module.DEMO_JOBS)

@@ -1,0 +1,32 @@
+name: release
+
+# Push a tag like v0.5.0 (matching VERSION in jobrun.py) to publish a release with the VS Code extension;
+# `jobrun setup` and install.sh download jobboard.vsix from there.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Tag matches the version
+        run: |
+          version=$(python -c "import jobrun; print(jobrun.VERSION)")
+          test "v$version" = "$GITHUB_REF_NAME" || { echo "tag $GITHUB_REF_NAME != v$version"; exit 1; }
+      - run: pip install pytest && python -m pytest -q tests
+      - run: cd vscode && npx --yes @vscode/vsce package -o jobboard.vsix
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" vscode/jobboard.vsix install.sh --title "$GITHUB_REF_NAME" --generate-notes

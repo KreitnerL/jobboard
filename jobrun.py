@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import ctypes
 import getpass
+import hashlib
 import json
 import os
 import re
@@ -32,6 +33,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.request
 from datetime import datetime
 from pathlib import Path
 
@@ -61,6 +63,7 @@ STALL_MIN_S = 60
 RES_MIN_S = float(os.environ.get("JOBRUN_RES_MIN_S", 3))  # `jobrun res` within this many seconds of the last sample returns that sample (several dashboards)
 RES_FIRST_S = 0.5  # without an earlier sample, the means cover this short first interval
 JSON_SCHEMA = 2  # version of `ls --json`; bump on incompatible changes (the VS Code extension checks it)
+VERSION = "0.5.0"  # keep in sync with pyproject.toml and vscode/package.json (tested)
 SUPERVISOR_VERSION = 2  # supervisors from 2 on reload edited settings
 ACTIVE = ("starting", "waiting", "running", "unknown")
 # "lost" may recover (NFS hiccup, supervisor between child exit and exit file), so it is never cached.
@@ -1289,6 +1292,439 @@ def _tree_usage(table: dict, children: dict, root: int) -> tuple[int, int, list[
     return sum(table[p][1] for p in pids), sum(table[p][2] for p in pids), pids
 
 
+# ---------------------------------------------------------------- setup, uninstall, demo
+# `jobrun setup` installs the pieces around the CLI: the CLI itself on PATH, the VS Code extension, and the agent skill
+# (plus an optional one-line instruction) for the agents the user picks. Every file, link, text block and extension
+# it creates is recorded in DATA/install.json, so `jobrun uninstall` removes exactly those and nothing else. Front-ends
+# (install.sh, a clone, pipx, the VS Code extension) all call this one implementation.
+
+REPO = "https://github.com/KreitnerL/jobboard"
+RAW = "https://raw.githubusercontent.com/KreitnerL/jobboard"
+EXTENSION_ID = "kreitner.jobboard"
+EDITORS = ("code", "code-insiders", "cursor", "codium", "windsurf")  # CLIs that take --install-extension
+INSTRUCTION = "Launch every command expected to run longer than ~2 minutes through `jobrun` (see the jobrun skill)."
+# key -> label, skill directory, global instruction file (None: the agent has none), signs that it is installed
+AGENT_TARGETS = {
+    "claude": ("Claude Code", "~/.claude/skills", "~/.claude/CLAUDE.md", ("~/.claude",), "claude"),
+    "codex": ("Codex", "~/.agents/skills", "~/.codex/AGENTS.md", ("~/.codex",), "codex"),
+    "cursor": ("Cursor", "~/.cursor/skills", None, ("~/.cursor",), "cursor-agent"),
+    "agents": ("other agents that read ~/.agents/skills (Gemini CLI, OpenCode, ...)", "~/.agents/skills", None,
+               ("~/.agents",), None),
+}
+
+
+def data_dir() -> Path:
+    return Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share") / "jobboard"
+
+
+def bin_dir() -> Path:
+    return Path.home() / ".local" / "bin"
+
+
+def _expand(path: str) -> Path:
+    return Path(os.path.expanduser(path))
+
+
+def _sha(path: Path) -> str | None:
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+
+def say(text: str = "") -> None:
+    """print, with the home directory shown as ~."""
+    print(str(text).replace(str(Path.home()), "~"), flush=True)
+
+
+class Ask:
+    """Questions on the terminal (also under `curl | sh`, via /dev/tty); with --yes or without a terminal the
+    defaults are taken."""
+
+    def __init__(self, assume_yes: bool):
+        self.stream = None
+        if not assume_yes:
+            if sys.stdin.isatty():
+                self.stream = sys.stdin
+            else:
+                try:
+                    self.stream = open("/dev/tty")
+                except OSError:
+                    self.stream = None
+
+    @property
+    def interactive(self) -> bool:
+        return self.stream is not None
+
+    def line(self, prompt: str) -> str:
+        print(prompt.replace(str(Path.home()), "~"), end="", flush=True)
+        return (self.stream.readline() if self.stream else "\n").strip()
+
+    def yes(self, question: str, default: bool = True) -> bool:
+        if not self.stream:
+            return default
+        answer = self.line(f"{question} [{'Y/n' if default else 'y/N'}] ").lower()
+        return default if not answer else answer.startswith("y")
+
+    def pick(self, question: str, options: list[tuple[str, str, bool]]) -> list[str]:
+        """options: (key, label, default). Returns the chosen keys."""
+        if not self.stream:
+            return [key for key, _, default in options if default]
+        say(question)
+        for n, (_, label, default) in enumerate(options, 1):
+            say(f"  {n}) [{'x' if default else ' '}] {label}")
+        answer = self.line("Numbers separated by spaces, Enter for the marked ones, 0 for none: ")
+        if not answer:
+            return [key for key, _, default in options if default]
+        picked = {int(n) for n in re.findall(r"\d+", answer)}
+        return [key for n, (key, _, _) in enumerate(options, 1) if n in picked]
+
+
+class InstallRecord:
+    """What setup created: [{kind: file|link|block|extension, ...}], in creation order."""
+
+    def __init__(self):
+        self.path = data_dir() / "install.json"
+        data = read_json(self.path, {}) or {}
+        self.items: list[dict] = data.get("items", [])
+
+    def add(self, item: dict) -> None:
+        key = {k: item.get(k) for k in ("kind", "path", "editor")}
+        self.items = [i for i in self.items if {k: i.get(k) for k in key} != key] + [item]
+
+    def created(self, path: Path) -> bool:
+        """Whether setup created this file (a later setup run then still knows it may delete it)."""
+        return any(i.get("path") == str(path) and i.get("created") for i in self.items)
+
+    def owns(self, kind: str, path: Path) -> bool:
+        return any(i["kind"] == kind and i.get("path") == str(path) for i in self.items)
+
+    def mkdir(self, path: Path) -> None:
+        """mkdir -p, recording the directories it creates (uninstall removes them again when empty)."""
+        missing = []
+        for parent in [path, *path.parents]:
+            if parent.exists():
+                break
+            missing.append(parent)
+        path.mkdir(parents=True, exist_ok=True)
+        for directory in reversed(missing):
+            self.add({"kind": "dir", "path": str(directory)})
+
+    def save(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        write_json(self.path, {"version": VERSION, "items": self.items})
+
+
+BLOCK_BEGIN = "jobrun:begin (added by `jobrun setup`, removed by `jobrun uninstall`)"
+BLOCK_END = "jobrun:end"
+
+
+def _add_block(path: Path, text: str, comment: tuple[str, str]) -> bool:
+    """Append text between begin/end marker lines; an existing block is replaced. Returns whether the file is new."""
+    created = not path.exists()
+    kept = "" if created else _strip_block(path.read_text())
+    gap = "" if not kept else "\n" if kept.endswith("\n") else "\n\n"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f"{kept}{gap}{comment[0]} {BLOCK_BEGIN}{comment[1]}\n{text}\n{comment[0]} {BLOCK_END}{comment[1]}\n")
+    return created
+
+
+def _strip_block(text: str) -> str:
+    """The text without the marker block (and the blank line _add_block put before it)."""
+    if BLOCK_BEGIN not in text:
+        return text
+    kept, inside = [], False
+    for line in text.splitlines(keepends=True):
+        if BLOCK_BEGIN in line:
+            inside = True
+        elif inside and BLOCK_END in line:
+            inside = False
+        elif not inside:
+            kept.append(line)
+    rest = "".join(kept).rstrip("\n")
+    return rest + "\n" if rest else ""
+
+
+def _download(url: str, dest: Path) -> bool:
+    try:
+        with urllib.request.urlopen(url, timeout=30) as response:
+            data = response.read()
+    except (OSError, ValueError):
+        return False
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_bytes(data)
+    return True
+
+
+def _skill_source(scratch: Path) -> Path | None:
+    """The skill shipped next to this file (clone, release tarball, VS Code bundle), else downloaded for VERSION."""
+    here = Path(__file__).resolve().parent / "skills" / "jobrun" / "SKILL.md"
+    if here.exists():
+        return here
+    for ref in (f"v{VERSION}", "main"):
+        if _download(f"{RAW}/{ref}/skills/jobrun/SKILL.md", scratch / "SKILL.md"):
+            return scratch / "SKILL.md"
+    return None
+
+
+def _vsix_source(scratch: Path) -> Path | None:
+    """A built extension: next to this file, from the GitHub release of VERSION (or the latest), or built with npx."""
+    here = Path(__file__).resolve().parent
+    if (here / "vscode" / "jobboard.vsix").exists():
+        return here / "vscode" / "jobboard.vsix"
+    for url in (f"{REPO}/releases/download/v{VERSION}/jobboard.vsix", f"{REPO}/releases/latest/download/jobboard.vsix"):
+        if _download(url, scratch / "jobboard.vsix"):
+            return scratch / "jobboard.vsix"
+    if (here / "vscode" / "package.json").exists() and shutil.which("npx"):
+        print("  building the extension with npx @vscode/vsce ...")
+        out = subprocess.run(["npx", "--yes", "@vscode/vsce", "package", "-o", "jobboard.vsix"], cwd=here / "vscode",
+                             capture_output=True, text=True)
+        if out.returncode == 0:
+            return here / "vscode" / "jobboard.vsix"
+    return None
+
+
+def _running_inside_extension() -> bool:
+    package = Path(__file__).resolve().parent.parent / "package.json"
+    return (read_json(package, {}) or {}).get("name") == "jobboard"
+
+
+def cmd_setup(args) -> int:
+    ask = Ask(args.yes)
+    record = InstallRecord()
+    done: list[str] = []
+    scratch = data_dir() / "download"
+    say(f"jobrun {VERSION} setup. Each step can be skipped; `jobrun uninstall` undoes everything it does.\n")
+
+    # 1. the CLI on PATH
+    source = Path(__file__).resolve()
+    link = bin_dir() / "jobrun"
+    on_path = shutil.which("jobrun")
+    if (link.exists() or link.is_symlink()) and not record.owns("link", link):
+        say(f"1. CLI: {link} already exists{' -> ' + str(link.resolve()) if link.is_symlink() else ''} "
+              "(not made by setup); left alone.")
+    elif on_path and Path(on_path).resolve() != link.resolve():
+        say(f"1. CLI: `jobrun` is already on PATH ({on_path}, e.g. pipx); kept.")
+    elif ask.yes(f"1. Install the `jobrun` command in {bin_dir()}?"):
+        if args.link:
+            target = source
+        else:  # a stable copy, so the command survives moving the clone or updating the VS Code extension
+            app = data_dir() / "app"
+            record.mkdir(app)
+            target = app / "jobrun.py"
+            if source != target:
+                shutil.copy2(source, target)
+            target.chmod(0o755)
+            skill = source.parent / "skills" / "jobrun" / "SKILL.md"
+            if skill.exists() and skill.resolve() != (app / "skills" / "jobrun" / "SKILL.md").resolve():
+                record.mkdir(app / "skills" / "jobrun")
+                shutil.copy2(skill, app / "skills" / "jobrun" / "SKILL.md")
+        record.mkdir(link.parent)
+        if link.is_symlink():
+            link.unlink()
+        link.symlink_to(target)
+        record.add({"kind": "link", "path": str(link), "target": str(target)})
+        done.append(f"command: {link} -> {target}")
+        if str(bin_dir()) not in os.environ.get("PATH", "").split(os.pathsep):
+            shell = Path(os.environ.get("SHELL", "")).name
+            rc = Path.home() / {"bash": ".bashrc", "zsh": ".zshrc"}.get(shell, ".profile")
+            if ask.yes(f"   {bin_dir()} is not on your PATH. Add it in {rc}?"):
+                created = _add_block(rc, 'export PATH="$HOME/.local/bin:$PATH"', ("#", ""))
+                record.add({"kind": "block", "path": str(rc), "created": created or record.created(rc)})
+                done.append(f"PATH: {rc} (open a new terminal)")
+    record.save()
+
+    # 2. the VS Code extension
+    editors = [e for e in EDITORS if shutil.which(e)]
+    if args.no_vscode:
+        pass
+    elif _running_inside_extension():
+        say("2. VS Code extension: already installed (setup runs from it).")
+    elif not editors:
+        say("2. VS Code extension: no editor command found (code, cursor, ...). In VS Code run "
+              "'Shell Command: Install code command in PATH', or install jobboard.vsix from the releases page.")
+    else:
+        chosen = ask.pick("2. Install the Job Board extension into:", [(e, e, e == editors[0]) for e in editors])
+        vsix = _vsix_source(scratch) if chosen else None
+        if chosen and not vsix:
+            say(f"   no jobboard.vsix found or downloadable; see {REPO}/releases")
+        for editor in chosen if vsix else []:
+            out = subprocess.run([editor, "--install-extension", str(vsix), "--force"], capture_output=True, text=True)
+            if out.returncode == 0:
+                record.add({"kind": "extension", "editor": editor, "id": EXTENSION_ID})
+                done.append(f"extension: {editor} (reload the window; under Remote-SSH it is installed on this host)")
+            else:
+                say(f"   {editor}: {(out.stderr or out.stdout).strip()[:300]}")
+    record.save()
+
+    # 3. agents: the skill, and optionally one line in the global instructions
+    wanted = None if args.agents is None else [a.strip() for a in args.agents.split(",") if a.strip() not in ("", "none")]
+    options = []
+    for key, (label, _, _, signs, command) in AGENT_TARGETS.items():
+        present = any(_expand(s).exists() for s in signs) or bool(command and shutil.which(command))
+        options.append((key, label + ("" if present else " (not found)"), present))
+    agents = wanted if wanted is not None else ask.pick("3. Teach these coding agents to use jobrun (installs the skill):",
+                                                        options)
+    unknown = set(agents) - set(AGENT_TARGETS)
+    if unknown:
+        sys.exit(f"jobrun setup: unknown agent(s) {', '.join(sorted(unknown))}; one of {', '.join(AGENT_TARGETS)}")
+    skill = _skill_source(scratch) if agents else None
+    if agents and not skill:
+        say("   the skill could not be found or downloaded; skipped")
+    for skill_root in dict.fromkeys(AGENT_TARGETS[a][1] for a in agents) if skill else []:
+        dest = _expand(skill_root) / "jobrun" / "SKILL.md"
+        if dest.exists() and not record.owns("file", dest):
+            say(f"   {dest} exists and was not made by setup; left alone.")
+            continue
+        record.mkdir(dest.parent)
+        shutil.copy2(skill, dest)
+        record.add({"kind": "file", "path": str(dest), "sha256": _sha(dest)})
+        done.append(f"skill: {dest}")
+    files = [_expand(AGENT_TARGETS[a][2]) for a in agents if AGENT_TARGETS[a][2]]
+    fresh = [f for f in files if record.owns("block", f) or "jobrun" not in (f.read_text() if f.exists() else "")]
+    for f in sorted(set(files) - set(fresh)):
+        say(f"   {f} already mentions jobrun; left alone.")
+    if fresh and (args.instructions if args.instructions is not None else
+                  ask.yes(f"   Also add this line to {', '.join(map(str, fresh))}?\n     \"{INSTRUCTION}\"\n  ")):
+        for f in fresh:
+            record.mkdir(f.parent)
+            created = _add_block(f, INSTRUCTION, ("<!--", " -->"))
+            record.add({"kind": "block", "path": str(f), "created": created or record.created(f)})
+            done.append(f"instruction: {f}")
+    record.save()
+
+    say("\nDone." if done else "\nNothing changed.")
+    for line in done:
+        say(f"  {line}")
+    say("\nTry it: `jobrun demo` starts a few short example jobs; watch them with `jobrun ls` or in the Jobs view.")
+    return 0
+
+
+def _remove_item(item: dict, force: bool) -> str | None:
+    """Undo one recorded step; returns a note when something was kept."""
+    path = Path(item["path"]) if item.get("path") else None
+    if item["kind"] == "link":
+        if path.is_symlink() and (force or str(path.resolve()) == str(Path(item["target"]).resolve())):
+            path.unlink()
+        elif path.exists() or path.is_symlink():
+            return f"kept {path}: it no longer points to {item['target']}"
+    elif item["kind"] == "file":
+        if path.exists() and (force or _sha(path) == item.get("sha256")):
+            path.unlink()
+            try:
+                path.parent.rmdir()
+            except OSError:
+                pass
+        elif path.exists():
+            return f"kept {path}: changed since setup (--force removes it)"
+    elif item["kind"] == "block":
+        if path.exists():
+            rest = _strip_block(path.read_text())
+            if not rest.strip() and item.get("created"):
+                path.unlink()  # setup made this file for the block alone
+            else:
+                path.write_text(rest)
+    elif item["kind"] == "dir":
+        try:
+            path.rmdir()  # only when empty
+        except OSError:
+            pass
+    elif item["kind"] == "extension":
+        if shutil.which(item["editor"]):
+            subprocess.run([item["editor"], "--uninstall-extension", item["id"]], capture_output=True)
+    return None
+
+
+def cmd_uninstall(args) -> int:
+    ask = Ask(args.yes)
+    record = InstallRecord()
+    active = [r for r in snapshots(load_jobs()) if r["status"] in ACTIVE] if JOBS.exists() else []
+    say(f"jobrun {VERSION} uninstall\n")
+    if not record.items:
+        say(f"No install record ({record.path}): nothing set up by `jobrun setup` here.")
+    else:
+        say("This removes what `jobrun setup` installed:")
+        for item in record.items:
+            what = {"link": "command", "file": "skill", "block": "lines in", "extension": "extension in"}.get(item["kind"])
+            if what:
+                say(f"  {what} {item.get('path') or item.get('editor')}")
+    if active:
+        say(f"\n{len(active)} job(s) still running; they keep running and finish normally, but `jobrun` and the "
+              "Jobs view will be gone.")
+    if record.items and not ask.yes("\nContinue?"):
+        return 1
+    # the app copy and the record first, so the directories setup created are empty when their turn comes
+    shutil.rmtree(data_dir() / "app", ignore_errors=True)
+    shutil.rmtree(data_dir() / "download", ignore_errors=True)
+    if record.path.exists():
+        record.path.unlink()
+    for item in reversed(record.items):
+        note = _remove_item(item, args.force)
+        if note:
+            say(f"  {note}")
+    try:
+        data_dir().rmdir()
+    except OSError:
+        pass
+    if HOME.exists():
+        jobs = len(list(JOBS.glob("*.json"))) if JOBS.exists() else 0
+        if args.purge and active:
+            say(f"\nKept the registry {HOME}: jobs are still running. Run `jobrun uninstall --purge` again later.")
+        elif args.purge or (record.items and ask.yes(f"\nAlso delete the job registry {HOME} ({jobs} files, "
+                                                         "with the logs jobrun wrote)?", default=False)):
+            shutil.rmtree(HOME, ignore_errors=True)
+            say(f"  deleted {HOME}")
+        else:
+            say(f"\nKept the job registry {HOME} (delete it with `rm -r {HOME}`).")
+    here = Path(__file__).resolve()
+    if "site-packages" in here.parts or "dist-packages" in here.parts:
+        say("\njobrun itself was installed as a Python package; remove it with `pipx uninstall jobboard`, "
+              "`uv tool uninstall jobboard` or `pip uninstall jobboard`.")
+    say("\nUninstalled.")
+    return 0
+
+
+DEMO_JOBS = [
+    ("demo: train model", ["--stages", "prepare,train,evaluate"], """
+import sys, time
+print("JOBRUN_BUDGET cpus=1 mem=1G", flush=True)
+for (name, idx, total, pause) in (("prepare", 1, 10, 0.6), ("train", 2, 60, 0.9), ("evaluate", 3, 20, 0.5)):
+    print(f"JOBRUN_STAGE {name} {idx}/3", flush=True)
+    for i in range(1, total + 1):
+        time.sleep(pause)
+        sys.stderr.write(f"\\r{name}: {i}/{total} [00:00<00:00, 1.00it/s]"); sys.stderr.flush()
+    sys.stderr.write("\\n")
+print("done", flush=True)
+"""),
+    ("demo: tuning sweep", ["--count-regex", "Trial \\d+ completed", "--total", "40"], """
+import random, time
+print("JOBRUN_BUDGET cpus=2", flush=True)
+for trial in range(40):
+    time.sleep(random.uniform(0.5, 2.5))
+    print(f"Trial {trial} completed with value {random.random():.3f}", flush=True)
+"""),
+    ("demo: report (waits for the model)", ["--after", "demo: train model"], """
+import time
+for i in range(1, 6):
+    time.sleep(1)
+    print(f"JOBRUN_PROGRESS {i}/5", flush=True)
+"""),
+]
+
+
+def cmd_demo(args) -> int:
+    """Start a few short example jobs in one group: stages, a tqdm bar, counted lines, a dependency, budgets."""
+    group = "jobrun demo"
+    me = [sys.executable, str(Path(__file__).resolve())]
+    for name, options, script in DEMO_JOBS:
+        subprocess.run(me + ["run", "--group", group, "--name", name, *options, "--", sys.executable, "-c",
+                             script.strip()], check=True, stdout=subprocess.DEVNULL)
+    print(f"Started {len(DEMO_JOBS)} demo jobs (about 2 minutes) in the group \"{group}\".\n"
+          "Watch them: the Jobs view in VS Code, `jobrun ls`, `jobrun res`.\n"
+          f"Remove them afterwards: `jobrun rm --group \"{group}\"` (or the trash icon).")
+    return 0
+
+
 # ---------------------------------------------------------------- formatting
 
 def fmt_count(n: int | None) -> str:
@@ -1832,6 +2268,24 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("res", help="CPU, RAM, GPU and VRAM of the nodes running jobs: use, Slurm reservations, per job")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_res)
+
+    p = sub.add_parser("setup", help="install the command, the VS Code extension and the agent skill (wizard)")
+    p.add_argument("--yes", "-y", action="store_true", help="no questions: take the defaults")
+    p.add_argument("--agents", help="comma-separated: claude,codex,cursor,agents (or none); default: those found")
+    p.add_argument("--instructions", action=argparse.BooleanOptionalAction, default=None,
+                   help="add the one-line jobrun instruction to the agents' global instruction files (default: ask; yes)")
+    p.add_argument("--no-vscode", action="store_true", help="skip the VS Code extension")
+    p.add_argument("--link", action="store_true", help="link the command to this file instead of copying it (development)")
+    p.set_defaults(func=cmd_setup)
+
+    p = sub.add_parser("uninstall", help="remove what `jobrun setup` installed")
+    p.add_argument("--yes", "-y", action="store_true", help="no questions")
+    p.add_argument("--purge", action="store_true", help="also delete the job registry with its logs")
+    p.add_argument("--force", action="store_true", help="also remove installed files that were changed since")
+    p.set_defaults(func=cmd_uninstall)
+
+    p = sub.add_parser("demo", help="start a few short example jobs to see the Job Board in action")
+    p.set_defaults(func=cmd_demo)
 
     p = sub.add_parser("show", help="print one job as JSON")
     p.add_argument("id")

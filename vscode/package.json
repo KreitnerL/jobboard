@@ -3,7 +3,7 @@
   "displayName": "Job Board",
   "description": "Running and finished jobs from the jobrun registry: progress, rate, ETA, logs, stop.",
   "publisher": "kreitner",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "license": "MIT",
   "engines": {
     "vscode": "^1.80.0"
@@ -93,6 +93,15 @@
         "command": "jobboard.refreshResources",
         "title": "Refresh Resources",
         "icon": "$(refresh)"
+      },
+      {
+        "command": "jobboard.demo",
+        "title": "Job Board: Run Demo Jobs",
+        "icon": "$(play)"
+      },
+      {
+        "command": "jobboard.setup",
+        "title": "Job Board: Set Up jobrun for Terminal and Agents"
       }
     ],
     "menus": {
@@ -255,7 +264,13 @@
           "description": "Measure CPU, RAM, GPU and VRAM every N seconds while the Resources view is visible; values are means over this interval."
         }
       }
-    }
+    },
+    "viewsWelcome": [
+      {
+        "view": "jobboard.jobs",
+        "contents": "No jobs yet. Start a few short example jobs to see progress, stages and dependencies:\n[Run Demo Jobs](command:jobboard.demo)\nUse `jobrun` in your terminal and let your coding agents (Claude Code, Codex, Cursor, ...) register their jobs:\n[Set Up Terminal and Agents](command:jobboard.setup)\nThen start jobs with `jobrun run --name NAME -- COMMAND`. [Documentation](https://github.com/KreitnerL/jobboard#readme)"
+      }
+    ]
   },
   "repository": {
     "type": "git",
@@ -263,8 +278,12 @@
   },
   "files": [
     "extension.js",
+    "bundle/**",
     "media/**",
     "README.md",
     "LICENSE"
-  ]
+  ],
+  "scripts": {
+    "vscode:prepublish": "node scripts/bundle.js"
+  }
 }
