@@ -565,8 +565,29 @@ async function openLog(job) {
   editor.revealRange(new vscode.Range(end, end));
 }
 
+// What the extension cannot do itself: put `jobrun` on PATH outside VS Code and install the skill for agents other
+// than Copilot. Say once which command does that.
+function offerSetup(context) {
+  const [command, prefix] = jobrunCommand();
+  if (!prefix.length || context.globalState.get('setupNoticeShown')) return;  // a jobrun CLI is installed already
+  context.globalState.update('setupNoticeShown', true);
+  vscode.window.showInformationMessage(
+    'Job Board is ready, and `jobrun` works in VS Code terminals. To use it in other shells and to teach your coding ' +
+    `agents (Claude Code, Codex, Cursor, ...), run: ${command} ${prefix.join(' ')} setup`,
+    'Run Setup', 'Run Demo Jobs').then(choice => {
+    if (choice === 'Run Setup') vscode.commands.executeCommand('jobboard.setup');
+    if (choice === 'Run Demo Jobs') vscode.commands.executeCommand('jobboard.demo');
+  });
+}
+
 function activate(context) {
   extensionPath = context.extensionPath;
+  for (const file of [['bundle', 'bin', 'jobrun'], ['bundle', 'jobrun.py']]) {
+    try { fs.chmodSync(path.join(extensionPath, ...file), 0o755); } catch (err) { /* not bundled (development) */ }
+  }
+  // the bundled `jobrun` in VS Code's terminals; appended, so an installed jobrun takes precedence
+  context.environmentVariableCollection.description = 'Adds the jobrun command bundled with Job Board';
+  context.environmentVariableCollection.append('PATH', path.delimiter + path.join(extensionPath, 'bundle', 'bin'));
   const provider = new JobsProvider();
   const view = vscode.window.createTreeView('jobboard.jobs', { treeDataProvider: provider, showCollapseAll: true });
   provider.view = view;
@@ -589,6 +610,7 @@ function activate(context) {
   schedule();
   provider.refresh();
   resources.refresh();
+  offerSetup(context);
 
   context.subscriptions.push(
     view, resourceView, provider.statusBar, { dispose: () => { clearInterval(timer); clearInterval(resourceTimer); } },

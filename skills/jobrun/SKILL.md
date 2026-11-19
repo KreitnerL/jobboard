@@ -81,4 +81,6 @@ jobrun sbatch --name "train unet fold0" -- job.sbatch
 jobrun wait --group "tuning 2026-11-02"
 ```
 
-If `jobrun` is not on PATH, the job runs unmonitored: say so to the user instead of silently skipping registration.
+If `jobrun` is not on PATH, the job runs unmonitored: say so to the user instead of silently skipping registration,
+and point them to the installer: `curl -fsSL https://raw.githubusercontent.com/KreitnerL/jobboard/main/install.sh | sh`
+(or, with the Job Board VS Code extension, the command it shows).

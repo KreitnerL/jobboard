@@ -1303,14 +1303,19 @@ RAW = "https://raw.githubusercontent.com/KreitnerL/jobboard"
 EXTENSION_ID = "kreitner.jobboard"
 EDITORS = ("code", "code-insiders", "cursor", "codium", "windsurf")  # CLIs that take --install-extension
 INSTRUCTION = "Launch every command expected to run longer than ~2 minutes through `jobrun` (see the jobrun skill)."
-# key -> label, skill directory, global instruction file (None: the agent has none), signs that it is installed
+# Agents whose global skill folder is known, keyed by the identifiers of the Agent Skills CLI (`npx skills add -a`),
+# with the same global folders it uses: id -> label, skill folder, global instruction file (None: the agent has
+# none), signs that the agent is installed. `npx skills add KreitnerL/jobboard -g` covers the many others.
 AGENT_TARGETS = {
-    "claude": ("Claude Code", "~/.claude/skills", "~/.claude/CLAUDE.md", ("~/.claude",), "claude"),
+    "claude-code": ("Claude Code", "~/.claude/skills", "~/.claude/CLAUDE.md", ("~/.claude",), "claude"),
     "codex": ("Codex", "~/.agents/skills", "~/.codex/AGENTS.md", ("~/.codex",), "codex"),
     "cursor": ("Cursor", "~/.cursor/skills", None, ("~/.cursor",), "cursor-agent"),
-    "agents": ("other agents that read ~/.agents/skills (Gemini CLI, OpenCode, ...)", "~/.agents/skills", None,
-               ("~/.agents",), None),
+    "github-copilot": ("GitHub Copilot", "~/.copilot/skills", None, ("~/.copilot",), None),
+    "gemini-cli": ("Gemini CLI", "~/.gemini/skills", "~/.gemini/GEMINI.md", ("~/.gemini",), "gemini"),
+    "opencode": ("OpenCode", "~/.config/opencode/skills", None, ("~/.config/opencode",), "opencode"),
+    "windsurf": ("Windsurf", "~/.codeium/windsurf/skills", None, ("~/.codeium/windsurf",), "windsurf"),
 }
+AGENT_ALIASES = {"claude": "claude-code", "copilot": "github-copilot", "gemini": "gemini-cli"}
 
 
 def data_dir() -> Path:
@@ -1558,7 +1563,8 @@ def cmd_setup(args) -> int:
     record.save()
 
     # 3. agents: the skill, and optionally one line in the global instructions
-    wanted = None if args.agents is None else [a.strip() for a in args.agents.split(",") if a.strip() not in ("", "none")]
+    wanted = None if args.agents is None else [AGENT_ALIASES.get(a.strip(), a.strip()) for a in args.agents.split(",")
+                                               if a.strip() not in ("", "none")]
     options = []
     for key, (label, _, _, signs, command) in AGENT_TARGETS.items():
         present = any(_expand(s).exists() for s in signs) or bool(command and shutil.which(command))
@@ -1571,6 +1577,8 @@ def cmd_setup(args) -> int:
     skill = _skill_source(scratch) if agents else None
     if agents and not skill:
         say("   the skill could not be found or downloaded; skipped")
+    if agents:
+        say("   For other agents: `npx skills add KreitnerL/jobboard -g` (the Agent Skills installer, 70+ agents).")
     for skill_root in dict.fromkeys(AGENT_TARGETS[a][1] for a in agents) if skill else []:
         dest = _expand(skill_root) / "jobrun" / "SKILL.md"
         if dest.exists() and not record.owns("file", dest):
@@ -2271,7 +2279,7 @@ def main(argv: list[str] | None = None) -> int:
 
     p = sub.add_parser("setup", help="install the command, the VS Code extension and the agent skill (wizard)")
     p.add_argument("--yes", "-y", action="store_true", help="no questions: take the defaults")
-    p.add_argument("--agents", help="comma-separated: claude,codex,cursor,agents (or none); default: those found")
+    p.add_argument("--agents", help="comma-separated: " + ",".join(AGENT_TARGETS) + " (or none); default: those found")
     p.add_argument("--instructions", action=argparse.BooleanOptionalAction, default=None,
                    help="add the one-line jobrun instruction to the agents' global instruction files (default: ask; yes)")
     p.add_argument("--no-vscode", action="store_true", help="skip the VS Code extension")

@@ -615,7 +615,20 @@ def test_versions_agree():
     root = Path(__file__).resolve().parents[1]
     pyproject = _re.search(r'^version = "([^"]+)"', (root / "pyproject.toml").read_text(), _re.M).group(1)
     extension = json.loads((root / "vscode" / "package.json").read_text())["version"]
-    assert jobrun_module.VERSION == pyproject == extension
+    plugin = json.loads((root / ".claude-plugin" / "plugin.json").read_text())["version"]
+    assert jobrun_module.VERSION == pyproject == extension == plugin
+
+
+def test_skill_is_where_every_channel_expects_it():
+    """One SKILL.md for jobrun setup, the Claude Code plugin (repo root), `npx skills add` and the extension bundle."""
+    root = Path(__file__).resolve().parents[1]
+    skill = (root / "skills" / "jobrun" / "SKILL.md").read_text()
+    assert skill.startswith("---\nname: jobrun\n")  # the name must match the folder (Agent Skills, VS Code chatSkills)
+    marketplace = json.loads((root / ".claude-plugin" / "marketplace.json").read_text())
+    assert marketplace["plugins"][0]["source"] == "./"
+    package = json.loads((root / "vscode" / "package.json").read_text())
+    assert package["contributes"]["chatSkills"] == [{"path": "./bundle/skills/jobrun/SKILL.md"}]
+    assert "'skills', 'jobrun', 'SKILL.md'" in (root / "vscode" / "scripts" / "bundle.js").read_text()
 
 
 def test_marker_block_round_trip(tmp_path):
@@ -645,11 +658,12 @@ def _sandbox(tmp_path):
 def test_setup_then_uninstall_leaves_home_as_it_was(tmp_path):
     home, call = _sandbox(tmp_path)
     before = sorted(str(p.relative_to(home)) for p in home.rglob("*"))
-    call("setup", "--yes", "--no-vscode", "--agents", "claude,codex")
-    call("setup", "--yes", "--no-vscode", "--agents", "claude,codex")  # idempotent
+    call("setup", "--yes", "--no-vscode", "--agents", "claude,codex,copilot")
+    call("setup", "--yes", "--no-vscode", "--agents", "claude-code,codex,github-copilot")  # idempotent; aliases
     assert (home / ".local" / "bin" / "jobrun").resolve() == home / ".local" / "share" / "jobboard" / "app" / "jobrun.py"
     assert (home / ".claude" / "skills" / "jobrun" / "SKILL.md").exists()
     assert (home / ".agents" / "skills" / "jobrun" / "SKILL.md").exists()
+    assert (home / ".copilot" / "skills" / "jobrun" / "SKILL.md").exists()
     assert (home / ".claude" / "CLAUDE.md").read_text().count("through `jobrun`") == 1
     assert "jobrun:begin" in (home / ".codex" / "AGENTS.md").read_text()
     assert ".local/bin" in (home / ".bashrc").read_text()

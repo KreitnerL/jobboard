@@ -270,6 +270,11 @@
         "view": "jobboard.jobs",
         "contents": "No jobs yet. Start a few short example jobs to see progress, stages and dependencies:\n[Run Demo Jobs](command:jobboard.demo)\nUse `jobrun` in your terminal and let your coding agents (Claude Code, Codex, Cursor, ...) register their jobs:\n[Set Up Terminal and Agents](command:jobboard.setup)\nThen start jobs with `jobrun run --name NAME -- COMMAND`. [Documentation](https://github.com/KreitnerL/jobboard#readme)"
       }
+    ],
+    "chatSkills": [
+      {
+        "path": "./bundle/skills/jobrun/SKILL.md"
+      }
     ]
   },
   "repository": {

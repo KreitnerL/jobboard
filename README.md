@@ -1,10 +1,14 @@
 # jobboard
 
 **See all your long-running jobs in one place: local scripts, background processes and Slurm jobs, with
-progress, rate and ETA, right in the VS Code sidebar.**
+progress, rate, ETA and the resources they use, right in the VS Code sidebar.**
+
+jobboard is a **VS Code extension** (the Job Board) with two companions: the **`jobrun` command-line tool**,
+which starts and tracks the jobs, and a **skill for coding agents** (Claude Code, Codex, Cursor, Copilot, ...), so
+the jobs they start show up on the board too. One installer sets up all three ([Install](#install)).
 
 ```
-JOBS                                                        ⟳  ⌫
+JOBS                                                                ⟳  ⌫
 ▾ Running (2)
   ▾ ◫ wp3 2026-11-02      0/2 jobs · 1/2 prepare n100
     ▾ ⟳ prepare n100      2/2 convert · ██████░░░░ 58% · 58/100 · 2.1/min · ETA 16:40 · last step 0m20s ago (avg 0m28s) · 31m
@@ -12,23 +16,35 @@ JOBS                                                        ⟳  ⌫
         ⟳ 2. convert      58/100 · 19m10s
     ▸ ⏸ tune ilp          waiting for prepare n100
   ▸ ⟳ train unet fold0    █████████░ 91% · 91/100 · 4.2/h · ETA 17:05 · ⚠ last step 1h05m ago (avg 14m10s) · 21h40m  ⎘  ■
-▾ Finished (1)
-  ▸ ✓ eval baseline       done · 600/600 · 12m03s · ended 13:58
+▸ Finished (1)
+RESOURCES                                                           ⟳
+▾ ws01                    this machine · 2 jobs · free 40 cores, 120G RAM, 0 GPU
+  ▾ CPU     ███░░░░░░░ 21 / 64 cores · 24 reserved
+      prepare n100        ████░░ 5.8 / 8
+      train unet fold0    ██░░░░ 6.1 / 16
+      other               9.1
+  ▸ RAM     █████░░░░░ 121G / 252G · 132G reserved
+  ▾ GPU 0   ████████░░ 83% · VRAM 31G / 48G
+      train unet fold0    █████░ 83% · VRAM 30G · 1 GPU reserved
+      other               1.2G
 ```
 
 - **No code changes.** Progress is read from the job's log: tqdm bars, `[12/100]` counters, or lines you count.
 - **Anything that runs.** Local commands, processes that are already running, Slurm jobs.
 - **Survives everything.** State lives in small files, not in the editor, so jobs stay tracked when VS Code
   closes, an SSH session drops or an agent's watcher dies.
+- **Resources at a glance.** CPU, RAM, GPU and VRAM per node, and for each job what it uses next to what it
+  reserved, so you see how much room is left for the next job.
 - **Groups, stages, dependencies.** Watch a whole sweep at once, see which stage of a pipeline a job is in, and
   chain jobs so one starts when the other has finished.
 - **Tiny.** A single Python file that needs nothing beyond the standard library, plus a VS Code extension
   written in plain JavaScript.
-- **Agent-friendly.** Comes with a skill, so Claude Code, Codex or Cursor register every job they start.
+- **Agent-friendly.** Comes with a skill, so Claude Code, Codex, Cursor or Copilot register every job they start.
 
 ## Install
 
-One command installs everything and asks what you want:
+jobboard has three parts: the **`jobrun` command**, the **VS Code extension** (the Job Board) and the **skill**
+that teaches your coding agents to use `jobrun`. One command installs all three and asks about each:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/KreitnerL/jobboard/main/install.sh | sh
@@ -40,23 +56,42 @@ The setup wizard (`jobrun setup`) offers three steps, each of which you can skip
    folder is not on your `PATH`, it offers to add it to your shell's rc file.
 2. **The VS Code extension:** installed into `code`, `cursor`, `codium`, ... (whichever it finds). With
    Remote-SSH, run the installer on the remote host, where your jobs run.
-3. **Your coding agents:** the jobrun [skill](skills/jobrun/SKILL.md) for Claude Code (`~/.claude/skills`), Codex
-   and other agents that read `~/.agents/skills`, and Cursor (`~/.cursor/skills`). Optionally, it also adds one
-   line to the agents' global instructions (`~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md`):
-   *"Launch every command expected to run longer than ~2 minutes through `jobrun` (see the jobrun skill)."*
+3. **Your coding agents:** the jobrun [skill](skills/jobrun/SKILL.md), in the format of the
+   [Agent Skills](https://agentskills.io) standard, copied to the global skill folder of each agent you pick:
+
+   | Agent | Skill folder | Instruction file |
+   |---|---|---|
+   | Claude Code | `~/.claude/skills` | `~/.claude/CLAUDE.md` |
+   | Codex | `~/.agents/skills` | `~/.codex/AGENTS.md` |
+   | Cursor | `~/.cursor/skills` | |
+   | GitHub Copilot | `~/.copilot/skills` | |
+   | Gemini CLI | `~/.gemini/skills` | `~/.gemini/GEMINI.md` |
+   | OpenCode | `~/.config/opencode/skills` | |
+   | Windsurf | `~/.codeium/windsurf/skills` | |
+
+   Optionally, it also adds one line to the agent's global instruction file, so the agent uses jobrun on its own
+   initiative: *"Launch every command expected to run longer than ~2 minutes through `jobrun` (see the jobrun
+   skill)."*
 
 Setup never overwrites files it did not create: an existing skill, command or instruction that mentions jobrun is
 left alone. Run it again at any time to update or to add what you skipped.
 
-**Other ways to install:**
+### Other ways to install, and what each one covers
 
-| | |
-|---|---|
-| Without questions | `curl -fsSL …/install.sh \| sh -s -- --yes --agents claude,codex` (also `--no-vscode`, `--no-instructions`) |
-| From a clone | `git clone https://github.com/KreitnerL/jobboard && jobboard/install.sh` |
-| As a Python tool | `pipx install git+https://github.com/KreitnerL/jobboard` (or `uv tool install …`), then `jobrun setup` for the extension and the agents |
-| Only the extension | install `jobboard.vsix` from the [releases](https://github.com/KreitnerL/jobboard/releases) (`code --install-extension jobboard.vsix`). It brings its own copy of `jobrun`, so the Job Board works at once; its **Set Up Terminal and Agents** button runs the same wizard |
-| Only the file | `curl -o ~/.local/bin/jobrun https://raw.githubusercontent.com/KreitnerL/jobboard/main/jobrun.py && chmod +x ~/.local/bin/jobrun` |
+| Route | `jobrun` command | Job Board | Agents |
+|---|---|---|---|
+| `curl … \| sh`, or `./install.sh` in a clone | ✓ | ✓ | ✓ (you pick) |
+| `… \| sh -s -- --yes --agents claude-code,codex` | ✓ | ✓ | ✓ (no questions; also `--no-vscode`, `--no-instructions`) |
+| `pipx install git+https://github.com/KreitnerL/jobboard` (or `uv tool install …`) | ✓ | run `jobrun setup` | run `jobrun setup` |
+| VS Code extension only (`jobboard.vsix` from the [releases](https://github.com/KreitnerL/jobboard/releases)) | in VS Code terminals | ✓ | GitHub Copilot in VS Code; others: run the setup command it shows |
+| Claude Code plugin: `/plugin install jobrun --marketplace KreitnerL/jobboard` | install separately | install separately | Claude Code (with updates) |
+| [Agent Skills installer](https://skills.sh): `npx skills add KreitnerL/jobboard -g` | install separately | install separately | 70+ agents |
+| Only the file: `curl -o ~/.local/bin/jobrun https://raw.githubusercontent.com/KreitnerL/jobboard/main/jobrun.py && chmod +x ~/.local/bin/jobrun` | ✓ | | |
+
+The VS Code extension brings its own copy of `jobrun`: the Job Board works at once, `jobrun` works in VS Code's
+terminals, and Copilot gets the skill. It cannot install the command for other shells or the skill for other
+agents; on first start it shows the command that does (`jobrun setup`, run from the extension's copy), and its
+**Set Up Terminal and Agents** button runs it.
 
 Requires Linux and Python 3.9 or newer; nothing else.
 
@@ -81,7 +116,8 @@ removes exactly what `jobrun setup` installed: the command, the PATH line, the e
 instruction lines (the rest of those files stays as it was). Files you changed since are kept unless you pass
 `--force`. The job registry `~/.jobs` (your jobs and the logs jobrun wrote) is kept unless you agree or pass
 `--purge`. Running jobs keep running and finish normally. If you installed with pipx or uv, also run
-`pipx uninstall jobboard` (or `uv tool uninstall jobboard`).
+`pipx uninstall jobboard` (or `uv tool uninstall jobboard`). Installed another way: remove the extension in VS Code,
+the Claude Code plugin with `/plugin uninstall jobrun`, and skills from `npx skills` with `npx skills remove jobrun -g`.
 
 ## Quick start
 
@@ -267,10 +303,10 @@ A node's reserved total is Slurm's allocations (all users) plus the budgets of y
 ## Use with AI coding agents
 
 `jobrun setup` installs the [jobrun skill](skills/jobrun/SKILL.md) for the agents you pick (see
-[Install](#install)). The agent then launches every long command through `jobrun`, names and groups its jobs, picks
+[Install](#install); also available as a Claude Code plugin and through `npx skills add`). The agent then launches every long command through `jobrun`, names and groups its jobs, picks
 a sensible progress unit, declares the job's CPU budget, checks `jobrun res` before big jobs, and looks at
-`jobrun ls` instead of asking you. For an agent not listed, copy `skills/jobrun` into its skills folder and add the
-instruction line above to its instructions file.
+`jobrun ls` instead of asking you. For another agent, use `npx skills add KreitnerL/jobboard -g -a <agent>` or copy
+`skills/jobrun` into its skills folder, and add the instruction line above to its instructions file.
 
 ## Commands
 

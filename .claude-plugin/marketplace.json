@@ -1,0 +1,12 @@
+{
+  "name": "jobboard",
+  "description": "jobrun and the Job Board: follow long-running jobs (local, background, Slurm) with progress, rate and ETA",
+  "owner": { "name": "Linus Kreitner" },
+  "plugins": [
+    {
+      "name": "jobrun",
+      "source": "./",
+      "description": "The jobrun skill: Claude registers every long job it starts on your Job Board"
+    }
+  ]
+}
