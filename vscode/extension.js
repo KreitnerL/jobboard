@@ -88,6 +88,13 @@ function progressText(item) {
   return item.total ? `${count(item.done)}/${count(item.total)}` : `${count(item.done)} done`;
 }
 
+// Time since the last step next to the average step time, so a hanging job stands out; ⚠ once it is a
+// few average steps overdue (`stalled`, decided by jobrun).
+function lastStep(job) {
+  const average = job.step_s ? ` (avg ${duration(job.step_s)})` : '';
+  return `${job.stalled ? '⚠ ' : ''}last step ${duration(job.idle_s)} ago${average}`;
+}
+
 function describe(job) {
   const parts = [];
   if (job.jobs) {
@@ -103,10 +110,9 @@ function describe(job) {
     else if (job.done != null) parts.push(`${count(job.done)} done`);
     else parts.push(job.status);
     if (job.rate_per_s && !job.finishing) parts.push(rate(job.rate_per_s));
-    if (job.finishing) {
-      const idle = job.progress_at ? ` · last step ${duration(Date.now() / 1000 - job.progress_at)} ago` : '';
-      parts.push(`finishing${idle}`);
-    } else if (job.eta) parts.push(`ETA ${clock(job.eta)}`);
+    if (job.finishing) parts.push('finishing');
+    else if (job.eta) parts.push(`ETA ${clock(job.eta)}`);
+    if (job.idle_s != null) parts.push(lastStep(job));
     parts.push(duration(job.elapsed_s));
   } else {
     parts.push(job.reason ? `${job.status}: ${job.reason}` : job.status);
@@ -128,10 +134,12 @@ function tooltip(job) {
     ['progress', job.done != null ? `${job.done}${job.total ? ` / ${job.total}` : ''}` : ''],
     ['rate', rate(job.rate_per_s)], ['ETA', job.eta && new Date(job.eta * 1000).toLocaleString()],
     ['last progress', job.progress_at && `${new Date(job.progress_at * 1000).toLocaleString()} (${duration(Date.now() / 1000 - job.progress_at)} ago)`],
+    ['average step', job.step_s && duration(job.step_s)],
     ['cwd', job.cwd], ['log', job.log],
     ['after', (job.after_names || []).join(', ')], ['waiting for', (job.waiting_for || []).join(', ')], ['reason', job.reason],
   ];
   for (const [key, value] of rows) if (value) md.appendMarkdown(`${key}: \`${value}\`  \n`);
+  if (job.stalled) md.appendMarkdown(`\n*No step for ${duration(job.idle_s)}, several times the average step (${duration(job.step_s)}): the job may hang.*\n\n`);
   if (job.finishing) md.appendMarkdown('\n*At or past its total but still running: a final phase the progress pattern does not count, or a too small total.*\n\n');
   if (job.cmd) md.appendCodeblock(job.cmd, 'shell');
   if (job.last_line) md.appendCodeblock(job.last_line, 'text');
@@ -305,7 +313,7 @@ function jobItem(job) {
   item.job = job;
   item.description = describe(job);
   item.tooltip = tooltip(job);
-  const [icon, color] = ICONS[job.status] || ['circle-outline', undefined];
+  const [icon, color] = job.stalled ? ['sync~spin', 'charts.orange'] : ICONS[job.status] || ['circle-outline', undefined];
   item.iconPath = new vscode.ThemeIcon(icon, color && new vscode.ThemeColor(color));
   item.contextValue = ACTIVE.has(job.status) ? 'job-active' : 'job-finished';
   return item;

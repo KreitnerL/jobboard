@@ -51,6 +51,10 @@ SACCT_TTL_S = 30
 # rollout runs (2026-11-06): lower median ETA error than the run average or a 15-minute window, and nearly unbiased
 # when early steps are fast (parallel workers finish their short items first).
 RATE_STEPS = 15
+# A running job is "stalled" when its last step is this many average steps ago (and at least STALL_MIN_S): a hint
+# that it may hang, shown next to the time since the last step.
+STALL_FACTOR = 3
+STALL_MIN_S = 60
 JSON_SCHEMA = 2  # version of `ls --json`; bump on incompatible changes (the VS Code extension checks it)
 SUPERVISOR_VERSION = 2  # supervisors from 2 on reload edited settings
 ACTIVE = ("starting", "waiting", "running", "unknown")
@@ -558,6 +562,16 @@ def stage_rate(stage: dict, now: float, job_started: float) -> float | None:
     return (done - d0) / (now - t0) if done > d0 and now > t0 else None
 
 
+def step_seconds(stage: dict) -> float | None:
+    """Average seconds per completed step over the last RATE_STEPS steps (only steps with known times); unlike
+    stage_rate it ends at the last step, so it is the yardstick for how long the current step is taking."""
+    history = stage.get("history") or []
+    if len(history) < 2:
+        return None
+    (t0, d0), (t1, d1) = history[0], history[-1]
+    return (t1 - t0) / (d1 - d0) if d1 > d0 and t1 > t0 else None
+
+
 def scan_log(meta: dict, scan: dict, now: float, final: bool = False) -> None:
     """Advance over the log's new lines: stage markers, count-mode matches and progress lines (newest wins).
 
@@ -731,6 +745,10 @@ def snapshot(meta: dict, slurm: dict) -> dict:
     eta = None
     if status in ACTIVE and rate and total and done is not None and done < total:
         eta = now + (total - done) / rate
+    step_s = step_seconds(current) if status in ACTIVE else None
+    # time since the last step, or since the stage began when it has no step yet
+    since = current.get("progress_at") or (current.get("started") if done is None and len(stages) > 1 else None)
+    idle_s = now - since if status == "running" and since else None
     planned = meta.get("stages") or []
     stage_list = stage_rows(meta, stages, status, ended)
     row = {key: meta.get(key) for key in ("id", "name", "group", "kind", "host", "slurm_id", "pid", "cwd", "log")}
@@ -741,6 +759,8 @@ def snapshot(meta: dict, slurm: dict) -> dict:
                                                    meta.get("kind") == "process") else (ended or now) - started,
         done=done, total=total, fraction=done / total if done is not None and total else None,
         rate_per_s=rate, eta=eta, last_line=last_log_line(meta), progress_at=current.get("progress_at"),
+        step_s=step_s, idle_s=idle_s,
+        stalled=bool(idle_s and step_s and idle_s > max(STALL_FACTOR * step_s, STALL_MIN_S)),
         # at or past the total but still running: an untracked final phase (or a too small --total)
         finishing=status in ACTIVE and bool(total) and done is not None and done >= total,
         stage=current["name"] if stage_list else None,
@@ -829,6 +849,7 @@ def group_rows(rows: list[dict]) -> list[dict]:
             "rate_per_s": sum(r["rate_per_s"] or 0 for r in active) or None,
             "eta": max(etas) if etas else None, "started": started, "ended": ended,
             "finishing": bool(active) and all(r.get("finishing") for r in active),
+            "stalled": any(r.get("stalled") for r in active),
             "elapsed_s": (ended or time.time()) - started,
         })
     return groups
@@ -870,6 +891,14 @@ def fmt_eta(eta: float | None) -> str:
         return ""
     when = datetime.fromtimestamp(eta)
     return f"{when:%H:%M}" if when.date() == datetime.now().date() else f"{when:%a %H:%M}"
+
+
+def fmt_idle(row: dict) -> str:
+    """Time since the last step, with the average step time when known; "!" marks a likely stall."""
+    if row.get("idle_s") is None:
+        return ""
+    average = f" (avg {fmt_duration(row['step_s'])})" if row.get("step_s") else ""
+    return f"{fmt_duration(row['idle_s'])} ago{average}{' !' if row.get('stalled') else ''}"
 
 
 def fmt_progress(row: dict) -> str:
@@ -1043,11 +1072,12 @@ def cmd_ls(args) -> int:
     if not rows:
         print("no jobs")
         return 0
-    table = [("ID", "STATUS", "NAME", "PROGRESS", "RATE", "ETA", "ELAPSED", "WHERE")]
+    table = [("ID", "STATUS", "NAME", "PROGRESS", "RATE", "ETA", "LAST STEP", "ELAPSED", "WHERE")]
 
     def line(r, job_id, name, where=""):
         table.append((job_id, r["status"], name, fmt_progress(r), fmt_rate(r["rate_per_s"]),
-                      "finishing" if r.get("finishing") else fmt_eta(r["eta"]), fmt_duration(r["elapsed_s"]), where))
+                      "finishing" if r.get("finishing") else fmt_eta(r["eta"]), fmt_idle(r), fmt_duration(r["elapsed_s"]),
+                      where))
 
     by_name = {g["name"]: g for g in groups}
     for r in dependency_order(rows):

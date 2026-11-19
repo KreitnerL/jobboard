@@ -500,6 +500,36 @@ def test_progress_reported_at_the_start_is_a_baseline():
     assert jobrun_module.stage_rate(stage, 62.0, 0.0) == pytest.approx(1 / 60)
 
 
+def test_step_seconds_is_the_average_of_the_last_steps():
+    stage = jobrun_module._new_stage(None, 0.0)
+    assert jobrun_module.step_seconds(stage) is None  # no step yet
+    for step in range(1, 51):  # 50 fast steps (1 s each), then 20 slow ones (60 s each)
+        jobrun_module._set_progress(stage, step, 100, float(step))
+    for step in range(51, 71):
+        jobrun_module._set_progress(stage, step, 100, 50.0 + 60 * (step - 50))
+    assert jobrun_module.step_seconds(stage) == pytest.approx(60)  # ends at the last step: a stall does not count
+
+
+def test_a_long_silence_is_flagged_as_stalled(jobrun):
+    jobrun("run", "--name", "quiet", "--count-regex", "completed", "--total", "10", "--",
+           "echo 'Trial 0 completed'; sleep 0.3; echo 'Trial 1 completed'; sleep 300")
+    wait_for(jobrun, "quiet", "running")
+    deadline = time.time() + 10
+    while rows(jobrun)["quiet"]["done"] != 2 and time.time() < deadline:
+        time.sleep(0.2)
+    row = rows(jobrun)["quiet"]
+    assert row["idle_s"] is not None and row["step_s"] and not row["stalled"]
+    scan_file = next(Path(os.environ["JOBRUN_HOME"]).glob(f"jobs/{row['id']}.scan*.json"))
+    scan = json.loads(scan_file.read_text())  # pretend the last step was long ago
+    stage = scan["stages"][-1]
+    stage["history"] = [[t - 600, d] for t, d in stage["history"]]
+    stage["progress_at"] -= 600
+    scan_file.write_text(json.dumps(scan))
+    row = rows(jobrun)["quiet"]
+    assert row["stalled"] and row["idle_s"] >= 600
+    assert "ago" in jobrun("ls").stdout and " !" in jobrun("ls").stdout
+
+
 def test_unknown_step_times_fall_back_to_the_average():
     stage = jobrun_module._new_stage("old", None)
     jobrun_module._set_progress(stage, 40, 100, None)  # read from a log written before the first scan

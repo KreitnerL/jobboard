@@ -7,11 +7,11 @@ progress, rate and ETA, right in the VS Code sidebar.**
 JOBS                                                        ⟳  ⌫
 ▾ Running (2)
   ▾ ◫ wp3 2026-11-02      0/2 jobs · 1/2 prepare n100
-    ▾ ⟳ prepare n100      2/2 convert · ██████░░░░ 58% · 58/100 · 2.1/min · ETA 16:40 · 31m
+    ▾ ⟳ prepare n100      2/2 convert · ██████░░░░ 58% · 58/100 · 2.1/min · ETA 16:40 · last step 0m20s ago (avg 0m28s) · 31m
         ✓ 1. download     100/100 · 12m03s
         ⟳ 2. convert      58/100 · 19m10s
     ▸ ⏸ tune ilp          waiting for prepare n100
-  ▸ ⟳ train unet fold0    █████████░ 91% · 91/100 · 4.2/h · ETA 17:05 · 21h40m        ⎘  ■
+  ▸ ⟳ train unet fold0    █████████░ 91% · 91/100 · 4.2/h · ETA 17:05 · ⚠ last step 1h05m ago (avg 14m10s) · 21h40m  ⎘  ■
 ▾ Finished (1)
   ▸ ✓ eval baseline       done · 600/600 · 12m03s · ended 13:58
 ```
@@ -48,8 +48,8 @@ jobrun stop "eval baseline"
 ```
 
 ```
-ID           STATUS   NAME            PROGRESS      RATE    ETA    ELAPSED  WHERE
-261102-a28f  running  eval baseline    41% 246/600  1.6/s   14:34  2m31s    ws01
+ID           STATUS   NAME            PROGRESS      RATE    ETA    LAST STEP            ELAPSED  WHERE
+261102-a28f  running  eval baseline    41% 246/600  1.6/s   14:34  0m01s ago (avg 0m00s)  2m31s    ws01
 ```
 
 ## Progress
@@ -72,7 +72,12 @@ Otherwise, say what to look for:
 The rate covers the last 15 completed steps of the current stage, measured up to now (so a stall lowers it), and the
 ETA is the remaining work divided by that rate. A window of recent steps follows runs whose steps get slower, e.g.
 parallel workers that finish their short items first; on real tuning and rollout runs it predicted the finish more
-accurately than the run average or a time window. For loops with
+accurately than the run average or a time window.
+
+**Is it hanging?** Each running job also shows the time since its last step next to the average step time
+(`last step 1h05m ago (avg 14m10s)`; `LAST STEP` in `jobrun ls`). Once that gap exceeds 3 average steps (and at
+least a minute), the job is flagged as stalled: `⚠` and an orange icon in the sidebar, `!` in `jobrun ls`,
+`"stalled": true` in `ls --json`. The average covers the same last 15 steps as the rate, up to the last step. For loops with
 millions of steps, report by time, not per step, so the log stays small:
 
 ```python
