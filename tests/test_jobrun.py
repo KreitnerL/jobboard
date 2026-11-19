@@ -544,7 +544,7 @@ def test_slurm_value_parsers():
     assert jobrun_module._slurm_seconds("1-02:03:04") == 86400 + 2 * 3600 + 3 * 60 + 4
     assert jobrun_module._slurm_seconds("03:04.500") == pytest.approx(184.5)
     assert jobrun_module.expand_hosts("node[01-03,07],gpu1") == ["node01", "node02", "node03", "node07", "gpu1"]
-    assert jobrun_module.expand_hosts("wskreitner") == ["wskreitner"]
+    assert jobrun_module.expand_hosts("workstation") == ["workstation"]
     assert jobrun_module._gpu_count("gpu:rtx_8000:1(S:0),gpu:rtx_a6000:1(S:0),gpumem:rtx_8000:no_consume:48G") == 2
     assert jobrun_module._gpu_count("gpu:a100:4(IDX:0,4,6-7),gpumem:a100:0") == 4
     tres = jobrun_module._tres("cpu=8,mem=48G,node=1,gres/gpu=1,gres/gpu:a100=1")

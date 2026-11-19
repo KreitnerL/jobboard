@@ -255,7 +255,7 @@ see each job's share as **used / reserved**. The node row shows what is still **
 the larger of what is used and what is reserved.
 
 ```
-▾ wskreitner   this machine · 4 jobs · free 40 cores, 0 RAM, 0 GPU
+▾ workstation  this machine · 4 jobs · free 40 cores, 0 RAM, 0 GPU
   ▾ CPU     ████░░░░░░ 24 / 64 cores · 2 reserved
       tuning s4103         7.8 · no budget
       train unet           ██░░░░ 0.7 / 2
