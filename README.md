@@ -57,17 +57,18 @@ The setup wizard (`jobrun setup`) offers three steps, each of which you can skip
 2. **The VS Code extension:** installed into `code`, `cursor`, `codium`, ... (whichever it finds). With
    Remote-SSH, run the installer on the remote host, where your jobs run.
 3. **Your coding agents:** the jobrun [skill](skills/jobrun/SKILL.md), in the format of the
-   [Agent Skills](https://agentskills.io) standard, copied to the global skill folder of each agent you pick:
+   [Agent Skills](https://agentskills.io) standard, copied to the global skill folder of each agent you pick.
+   The wizard lists the agents it finds on the machine, none selected; `--agents ID,...` names them directly:
 
-   | Agent | Skill folder | Instruction file |
-   |---|---|---|
-   | Claude Code | `~/.claude/skills` | `~/.claude/CLAUDE.md` |
-   | Codex | `~/.agents/skills` | `~/.codex/AGENTS.md` |
-   | Cursor | `~/.cursor/skills` | |
-   | GitHub Copilot | `~/.copilot/skills` | |
-   | Gemini CLI | `~/.gemini/skills` | `~/.gemini/GEMINI.md` |
-   | OpenCode | `~/.config/opencode/skills` | |
-   | Windsurf | `~/.codeium/windsurf/skills` | |
+   | Agent | ID | Skill folder | Instruction file |
+   |---|---|---|---|
+   | Claude Code | `claude-code` | `~/.claude/skills` | `~/.claude/CLAUDE.md` |
+   | Codex | `codex` | `~/.agents/skills` | `~/.codex/AGENTS.md` |
+   | Cursor | `cursor` | `~/.cursor/skills` | |
+   | GitHub Copilot | `github-copilot` | `~/.copilot/skills` | |
+   | Gemini CLI | `gemini-cli` | `~/.gemini/skills` | `~/.gemini/GEMINI.md` |
+   | OpenCode | `opencode` | `~/.config/opencode/skills` | |
+   | Windsurf | `windsurf` | `~/.codeium/windsurf/skills` | |
 
    Optionally, it also adds one line to the agent's global instruction file, so the agent uses jobrun on its own
    initiative: *"Launch every command expected to run longer than ~2 minutes through `jobrun` (see the jobrun
@@ -81,7 +82,7 @@ left alone. Run it again at any time to update or to add what you skipped.
 | Route | `jobrun` command | Job Board | Agents |
 |---|---|---|---|
 | `curl … \| sh`, or `./install.sh` in a clone | ✓ | ✓ | ✓ (you pick) |
-| `… \| sh -s -- --yes --agents claude-code,codex` | ✓ | ✓ | ✓ (no questions; also `--no-vscode`, `--no-instructions`) |
+| `… \| sh -s -- --yes --agents claude-code,codex` | ✓ | ✓ | ✓ (no questions; without `--agents` no skill; also `--no-vscode`, `--no-instructions`) |
 | `pipx install git+https://github.com/KreitnerL/jobboard` (or `uv tool install …`) | ✓ | run `jobrun setup` | run `jobrun setup` |
 | VS Code extension only (`jobboard.vsix` from the [releases](https://github.com/KreitnerL/jobboard/releases)) | in VS Code terminals | ✓ | GitHub Copilot in VS Code; others: run the setup command it shows |
 | Claude Code plugin: `/plugin install jobrun --marketplace KreitnerL/jobboard` | install separately | install separately | Claude Code (with updates) |

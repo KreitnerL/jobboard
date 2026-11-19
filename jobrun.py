@@ -1301,7 +1301,8 @@ def _tree_usage(table: dict, children: dict, root: int) -> tuple[int, int, list[
 REPO = "https://github.com/KreitnerL/jobboard"
 RAW = "https://raw.githubusercontent.com/KreitnerL/jobboard"
 EXTENSION_ID = "kreitner.jobboard"
-EDITORS = ("code", "code-insiders", "cursor", "codium", "windsurf")  # CLIs that take --install-extension
+EDITORS = {"code": "VS Code", "code-insiders": "VS Code Insiders", "cursor": "Cursor", "codium": "VSCodium",
+           "windsurf": "Windsurf"}  # CLIs that take --install-extension -> editor name
 INSTRUCTION = "Launch every command expected to run longer than ~2 minutes through `jobrun` (see the jobrun skill)."
 # Agents whose global skill folder is known, keyed by the identifiers of the Agent Skills CLI (`npx skills add -a`),
 # with the same global folders it uses: id -> label, skill folder, global instruction file (None: the agent has
@@ -1378,7 +1379,9 @@ class Ask:
         say(question)
         for n, (_, label, default) in enumerate(options, 1):
             say(f"  {n}) [{'x' if default else ' '}] {label}")
-        answer = self.line("Numbers separated by spaces, Enter for the marked ones, 0 for none: ")
+        marked = any(default for _, _, default in options)
+        answer = self.line("Numbers separated by spaces" + (", Enter for the marked ones, 0 for none: " if marked
+                                                            else ", Enter for none: "))
         if not answer:
             return [key for key, _, default in options if default]
         picked = {int(n) for n in re.findall(r"\d+", answer)}
@@ -1498,6 +1501,7 @@ def cmd_setup(args) -> int:
     ask = Ask(args.yes)
     record = InstallRecord()
     done: list[str] = []
+    missed: list[str] = []  # wanted but not done, repeated in the summary so it is not lost in the output
     scratch = data_dir() / "download"
     say(f"jobrun {VERSION} setup. Each step can be skipped; `jobrun uninstall` undoes everything it does.\n")
 
@@ -1541,6 +1545,7 @@ def cmd_setup(args) -> int:
 
     # 2. the VS Code extension
     editors = [e for e in EDITORS if shutil.which(e)]
+    label = {e: f"{EDITORS[e]} (`{e}`)" for e in editors}
     if args.no_vscode:
         pass
     elif _running_inside_extension():
@@ -1549,10 +1554,15 @@ def cmd_setup(args) -> int:
         say("2. VS Code extension: no editor command found (code, cursor, ...). In VS Code run "
               "'Shell Command: Install code command in PATH', or install jobboard.vsix from the releases page.")
     else:
-        chosen = ask.pick("2. Install the Job Board extension into:", [(e, e, e == editors[0]) for e in editors])
+        if len(editors) == 1:
+            chosen = editors if ask.yes(f"2. Install the Job Board extension into {label[editors[0]]}?") else []
+        else:
+            chosen = ask.pick("2. Install the Job Board extension into these editors:",
+                              [(e, label[e], e == editors[0]) for e in editors])
         vsix = _vsix_source(scratch) if chosen else None
         if chosen and not vsix:
             say(f"   no jobboard.vsix found or downloadable; see {REPO}/releases")
+            missed.append(f"extension: no jobboard.vsix found or downloadable; install it from {REPO}/releases")
         for editor in chosen if vsix else []:
             out = subprocess.run([editor, "--install-extension", str(vsix), "--force"], capture_output=True, text=True)
             if out.returncode == 0:
@@ -1560,25 +1570,32 @@ def cmd_setup(args) -> int:
                 done.append(f"extension: {editor} (reload the window; under Remote-SSH it is installed on this host)")
             else:
                 say(f"   {editor}: {(out.stderr or out.stdout).strip()[:300]}")
+                missed.append(f"extension: `{editor} --install-extension` failed (see above)")
     record.save()
 
     # 3. agents: the skill, and optionally one line in the global instructions
     wanted = None if args.agents is None else [AGENT_ALIASES.get(a.strip(), a.strip()) for a in args.agents.split(",")
                                                if a.strip() not in ("", "none")]
-    options = []
-    for key, (label, _, _, signs, command) in AGENT_TARGETS.items():
-        present = any(_expand(s).exists() for s in signs) or bool(command and shutil.which(command))
-        options.append((key, label + ("" if present else " (not found)"), present))
-    agents = wanted if wanted is not None else ask.pick("3. Teach these coding agents to use jobrun (installs the skill):",
-                                                        options)
+    found = [key for key, (_, _, _, signs, command) in AGENT_TARGETS.items()
+             if any(_expand(s).exists() for s in signs) or (command and shutil.which(command))]
+    if wanted is not None:
+        agents = wanted
+    elif not found:
+        say("3. Coding agents: none found (looked for " + ", ".join(t[0] for t in AGENT_TARGETS.values()) + ").")
+        agents = []
+    else:
+        agents = ask.pick("3. Teach these coding agents to use jobrun (installs the skill); found on this machine:",
+                          [(key, AGENT_TARGETS[key][0], False) for key in found])
+    if wanted is None:
+        say(f"   An agent not listed here, or later: `jobrun setup --agents ID,...` (IDs: {', '.join(AGENT_TARGETS)}),\n"
+            "   or for any other agent `npx skills add KreitnerL/jobboard -g` (the Agent Skills installer, 70+ agents).")
     unknown = set(agents) - set(AGENT_TARGETS)
     if unknown:
         sys.exit(f"jobrun setup: unknown agent(s) {', '.join(sorted(unknown))}; one of {', '.join(AGENT_TARGETS)}")
     skill = _skill_source(scratch) if agents else None
     if agents and not skill:
         say("   the skill could not be found or downloaded; skipped")
-    if agents:
-        say("   For other agents: `npx skills add KreitnerL/jobboard -g` (the Agent Skills installer, 70+ agents).")
+        missed.append("skill: could not be found or downloaded")
     for skill_root in dict.fromkeys(AGENT_TARGETS[a][1] for a in agents) if skill else []:
         dest = _expand(skill_root) / "jobrun" / "SKILL.md"
         if dest.exists() and not record.owns("file", dest):
@@ -1604,6 +1621,10 @@ def cmd_setup(args) -> int:
     say("\nDone." if done else "\nNothing changed.")
     for line in done:
         say(f"  {line}")
+    if missed:
+        say("\nNot done:")
+        for line in missed:
+            say(f"  {line}")
     say("\nTry it: `jobrun demo` starts a few short example jobs; watch them with `jobrun ls` or in the Jobs view.")
     return 0
 
@@ -2279,7 +2300,7 @@ def main(argv: list[str] | None = None) -> int:
 
     p = sub.add_parser("setup", help="install the command, the VS Code extension and the agent skill (wizard)")
     p.add_argument("--yes", "-y", action="store_true", help="no questions: take the defaults")
-    p.add_argument("--agents", help="comma-separated: " + ",".join(AGENT_TARGETS) + " (or none); default: those found")
+    p.add_argument("--agents", help="comma-separated: " + ",".join(AGENT_TARGETS) + " (or none); default: ask, none selected")
     p.add_argument("--instructions", action=argparse.BooleanOptionalAction, default=None,
                    help="add the one-line jobrun instruction to the agents' global instruction files (default: ask; yes)")
     p.add_argument("--no-vscode", action="store_true", help="skip the VS Code extension")
