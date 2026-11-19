@@ -8,6 +8,7 @@ The registry is a directory of small files ($JOBRUN_HOME, default ~/.jobs):
     jobs/<id>.hb          heartbeat, touched by the supervisor while the command runs
     jobs/<id>.stopped     marker written by `jobrun stop`
     jobs/<id>.state.json  the last rate and the cached final row, written by readers
+    hosts/<host>.json     the last resource sample of that host (`jobrun res`), the baseline for the next mean
     logs/<id>.log         default log of supervised commands
 
 Progress is parsed from the job's log, so commands need no changes. Recognised by default:
@@ -17,6 +18,8 @@ tqdm bars ("412/1000 [01:23<..."), bracketed counters ("[412/1000] ...") and exp
 from __future__ import annotations
 
 import argparse
+import ctypes
+import getpass
 import json
 import os
 import re
@@ -55,6 +58,8 @@ RATE_STEPS = 15
 # that it may hang, shown next to the time since the last step.
 STALL_FACTOR = 3
 STALL_MIN_S = 60
+RES_MIN_S = float(os.environ.get("JOBRUN_RES_MIN_S", 3))  # `jobrun res` within this many seconds of the last sample returns that sample (several dashboards)
+RES_FIRST_S = 0.5  # without an earlier sample, the means cover this short first interval
 JSON_SCHEMA = 2  # version of `ls --json`; bump on incompatible changes (the VS Code extension checks it)
 SUPERVISOR_VERSION = 2  # supervisors from 2 on reload edited settings
 ACTIVE = ("starting", "waiting", "running", "unknown")
@@ -72,6 +77,8 @@ PROGRESS_PATTERNS = [
     re.compile(r"\[(?:[^\[\]]*\s)?(?P<done>\d+)/(?P<total>\d+)\]"),  # "[412/1000] ..." or "[cfg 412/1000] ..."
 ]
 STAGE_MARKER = re.compile(r"JOBRUN_STAGE\s+(?P<name>.+?)(?:\s+(?P<index>\d+)/(?P<of>\d+))?\s*$")
+# "JOBRUN_BUDGET cpus=12 mem=96G gpus=1": what the job has been given from now on (any subset of the keys)
+BUDGET_MARKER = re.compile(r"JOBRUN_BUDGET((?:\s+(?:cpus|mem|gpus)=[\w.]+)+)")
 ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 INTERPRETERS = {"uv", "run", "bash", "sh", "srun", "nohup", "env", "time", "exec"}
 SLURM_STATES = {  # sacct state -> (status, reason)
@@ -609,6 +616,11 @@ def scan_log(meta: dict, scan: dict, now: float, final: bool = False) -> None:
             stages.append(new)
 
     def handle_line(line: str) -> None:
+        if "JOBRUN_BUDGET" in line:
+            marker = BUDGET_MARKER.search(ANSI.sub("", line))
+            if marker:
+                scan["budget"] = parse_budget(marker.group(1))  # replaces the previous one: e.g. per stage
+                return
         if "JOBRUN_STAGE" in line:
             marker = STAGE_MARKER.search(ANSI.sub("", line))
             if marker:
@@ -752,6 +764,8 @@ def snapshot(meta: dict, slurm: dict) -> dict:
     planned = meta.get("stages") or []
     stage_list = stage_rows(meta, stages, status, ended)
     row = {key: meta.get(key) for key in ("id", "name", "group", "kind", "host", "slurm_id", "pid", "cwd", "log")}
+    # declared budget: the newest JOBRUN_BUDGET line, with --cpus/--mem/--gpus (run, edit) taking precedence per key
+    row["budget"] = {**(scan.get("budget") or {}), **(meta.get("budget") or {})} or None
     row.update(
         log_owned=bool(meta.get("log_owned")), after=meta.get("after") or [],
         cmd=shlex.join(meta.get("cmd") or []), status=status, exit_code=exit_code, started=started, ended=ended,
@@ -855,6 +869,426 @@ def group_rows(rows: list[dict]) -> list[dict]:
     return groups
 
 
+# ---------------------------------------------------------------- resources
+# `jobrun res`: CPU, RAM, GPU and VRAM of every node that runs an active job (and this one), what Slurm has reserved
+# there, and which job uses what. Nothing samples in the background: each call measures the means since the previous
+# call from cumulative counters (/proc CPU ticks, NVML's utilization samples since a timestamp, Slurm's CPU time),
+# so the cost is one pass over /proc, one NVML query and two short Slurm calls per refresh. RAM and VRAM are current
+# values. Nodes other than this one are seen through Slurm only: reservations, a coarse load and free memory as
+# reported by slurmd, and the usage of your own Slurm jobs (sstat); their GPU utilization is not available.
+
+def _size(value: str | None, unit: str = "") -> float | None:
+    """Bytes from Slurm sizes like 85356K, 48G, 249856 (with unit as the default suffix)."""
+    match = re.fullmatch(r"([\d.]+)([KMGTP]?)", (value or "").strip())
+    if not match:
+        return None
+    return float(match.group(1)) * 1024 ** "_KMGTP".index(match.group(2) or unit or "_")
+
+
+def _slurm_seconds(value: str) -> float:
+    """CPU time like 1-02:03:04, 02:03:04, 03:04.123 -> seconds."""
+    days, _, rest = value.rpartition("-")
+    seconds = 0.0
+    for part in rest.split(":"):
+        seconds = seconds * 60 + float(part or 0)
+    return seconds + (int(days) * 86400 if days else 0)
+
+
+def _tres(text: str) -> dict[str, str]:
+    return dict(item.split("=", 1) for item in text.split(",") if "=" in item)
+
+
+def expand_hosts(nodelist: str | None) -> list[str]:
+    """Slurm hostlists like "node[01-03,07],gpu1" -> names."""
+    hosts = []
+    for prefix, ranges in re.findall(r"([^,\[]+)(?:\[([^\]]*)\])?", nodelist or ""):
+        if not ranges:
+            hosts.append(prefix)
+            continue
+        for part in ranges.split(","):
+            start, _, end = part.partition("-")
+            for n in range(int(start), int(end or start) + 1):
+                hosts.append(f"{prefix}{n:0{len(start)}d}")
+    return hosts
+
+
+def _gpu_count(gres: str) -> int:
+    return sum(int(n) for n in re.findall(r"(?:^|,)gpu(?::[^:,(]+)?:(\d+)", gres or ""))
+
+
+class Nvml:
+    """The few NVML calls needed, through ctypes (no pynvml). Raises OSError when there is no NVIDIA driver."""
+
+    class _Memory(ctypes.Structure):
+        _fields_ = [("total", ctypes.c_ulonglong), ("free", ctypes.c_ulonglong), ("used", ctypes.c_ulonglong)]
+
+    class _Sample(ctypes.Structure):  # nvmlSample_t; the value union is 8 bytes, GPU utilization is an unsigned int
+        _fields_ = [("time", ctypes.c_ulonglong), ("value", ctypes.c_ulonglong)]
+
+    class _Process(ctypes.Structure):  # nvmlProcessInfo_t (v2/v3)
+        _fields_ = [("pid", ctypes.c_uint), ("memory", ctypes.c_ulonglong), ("gi", ctypes.c_uint), ("ci", ctypes.c_uint)]
+
+    class _ProcessUtil(ctypes.Structure):  # nvmlProcessUtilizationSample_t
+        _fields_ = [("pid", ctypes.c_uint), ("time", ctypes.c_ulonglong), ("sm", ctypes.c_uint), ("mem", ctypes.c_uint),
+                    ("enc", ctypes.c_uint), ("dec", ctypes.c_uint)]
+
+    def __init__(self):
+        self.lib = ctypes.CDLL("libnvidia-ml.so.1")
+        if self.lib.nvmlInit_v2():
+            raise OSError("nvmlInit failed")
+
+    def close(self):
+        self.lib.nvmlShutdown()
+
+    def devices(self, since_us: int) -> list[dict]:
+        """Per GPU: mean utilization of the samples after since_us (epoch µs), memory, and per process the used
+        memory and mean SM utilization."""
+        lib, count = self.lib, ctypes.c_uint()
+        lib.nvmlDeviceGetCount_v2(ctypes.byref(count))
+        gpus = []
+        for index in range(count.value):
+            handle, name, memory = ctypes.c_void_p(), ctypes.create_string_buffer(96), self._Memory()
+            if lib.nvmlDeviceGetHandleByIndex_v2(index, ctypes.byref(handle)):
+                continue
+            lib.nvmlDeviceGetName(handle, name, 96)
+            lib.nvmlDeviceGetMemoryInfo(handle, ctypes.byref(memory))
+            last = since_us
+            kind, n = ctypes.c_int(), ctypes.c_uint(0)
+            samples = []
+            if lib.nvmlDeviceGetSamples(handle, 1, ctypes.c_ulonglong(last), ctypes.byref(kind), ctypes.byref(n), None) == 0 and n.value:
+                buffer = (self._Sample * n.value)()
+                if lib.nvmlDeviceGetSamples(handle, 1, ctypes.c_ulonglong(last), ctypes.byref(kind), ctypes.byref(n), buffer) == 0:
+                    samples = [b.value & 0xFFFFFFFF for b in buffer[:n.value] if b.time > last]
+            processes = {}
+            n = ctypes.c_uint(0)
+            if lib.nvmlDeviceGetComputeRunningProcesses_v3(handle, ctypes.byref(n), None) in (0, 7) and n.value:
+                buffer = (self._Process * (n.value + 4))()
+                n = ctypes.c_uint(n.value + 4)
+                if lib.nvmlDeviceGetComputeRunningProcesses_v3(handle, ctypes.byref(n), buffer) == 0:
+                    for proc in buffer[:n.value]:
+                        processes[proc.pid] = {"vram": proc.memory if proc.memory < 1 << 62 else None, "util": None}
+            n = ctypes.c_uint(0)
+            if lib.nvmlDeviceGetProcessUtilization(handle, None, ctypes.byref(n), ctypes.c_ulonglong(last)) in (0, 7) and n.value:
+                buffer = (self._ProcessUtil * n.value)()
+                if lib.nvmlDeviceGetProcessUtilization(handle, buffer, ctypes.byref(n), ctypes.c_ulonglong(last)) == 0:
+                    per_pid: dict[int, list[int]] = {}
+                    for sample in buffer[:n.value]:
+                        if sample.pid and sample.time > last:
+                            per_pid.setdefault(sample.pid, []).append(sample.sm)
+                    for pid, values in per_pid.items():
+                        processes.setdefault(pid, {"vram": None})["util"] = sum(values) / len(values)
+            gpus.append({"index": index, "name": name.value.decode(errors="replace"),
+                         "util": sum(samples) / len(samples) if samples else 0.0,
+                         "vram": memory.used, "vram_total": memory.total, "processes": processes})
+        return gpus
+
+
+def _proc_table() -> dict[int, tuple[int, int, int]]:
+    """pid -> (ppid, cumulative CPU ticks incl. reaped children, RSS bytes), from one pass over /proc."""
+    page = os.sysconf("SC_PAGE_SIZE")
+    table = {}
+    for entry in os.scandir("/proc"):
+        if entry.name.isdigit():
+            fields = _proc_stat(entry.name)
+            if fields and len(fields) > 21:
+                ticks = sum(int(v) for v in fields[11:15])  # utime stime cutime cstime
+                table[int(entry.name)] = (int(fields[1]), ticks, int(fields[21]) * page)
+    return table
+
+
+def cgroup_limits(pid: int) -> dict:
+    """RAM and CPU limits of the job's own cgroup (e.g. `systemd-run --scope -p MemoryMax=96G`, or a Slurm job), found
+    by walking up from the process's cgroup v2 path until a limit or a shared cgroup (a slice, a service, Slurm's
+    scope of all jobs) is reached, so a user-wide limit is never taken for the job's."""
+    try:
+        path = Path(f"/proc/{pid}/cgroup").read_text().split("::", 1)[1].strip()
+    except (OSError, IndexError):
+        return {}
+    limits: dict[str, float] = {}
+    while path not in ("", "/"):
+        name = path.rsplit("/", 1)[-1]
+        if name.endswith((".slice", ".service")) or name == "slurmstepd.scope":
+            break
+        base = Path("/sys/fs/cgroup" + path)
+        try:
+            memory = (base / "memory.max").read_text().strip()
+            if "mem" not in limits and memory != "max":
+                limits["mem"] = float(memory)
+        except (OSError, ValueError):
+            pass
+        try:
+            quota, period = (base / "cpu.max").read_text().split()
+            if "cpus" not in limits and quota != "max":
+                limits["cpus"] = float(quota) / float(period)
+        except (OSError, ValueError):
+            pass
+        path = path.rsplit("/", 1)[0]
+    return limits
+
+
+def holds_gpu(pids: list[int]) -> bool:
+    """Whether any of the processes has an NVIDIA device open (every CUDA process does). Lets `res` skip NVML, which
+    wakes an idle GPU's driver (~2 s) when nothing uses it."""
+    for pid in pids:
+        try:
+            fds = os.scandir(f"/proc/{pid}/fd")
+        except OSError:
+            continue
+        with fds:
+            for fd in fds:
+                try:
+                    if os.readlink(fd.path).startswith("/dev/nvidia"):
+                        return True
+                except OSError:
+                    pass
+    return False
+
+
+def _local_gpu_count() -> int:
+    try:
+        return len(os.listdir("/proc/driver/nvidia/gpus"))
+    except OSError:
+        return 0
+
+
+def _cpu_ticks() -> tuple[int, int]:
+    """(busy, total) jiffies of the whole machine."""
+    with open("/proc/stat") as f:
+        values = [int(v) for v in f.readline().split()[1:9]]
+    return sum(values) - values[3] - values[4], sum(values)
+
+
+def _meminfo() -> dict[str, int]:
+    info = {}
+    with open("/proc/meminfo") as f:
+        for line in f:
+            key, _, rest = line.partition(":")
+            if key in ("MemTotal", "MemAvailable"):
+                info[key] = int(rest.split()[0]) * 1024
+    return info
+
+
+def _slurm_nodes(hosts: list[str]) -> dict[str, dict]:
+    """Totals, Slurm's coarse load / free memory, and the reservations of all running jobs, per node."""
+    if not hosts or not shutil.which("sinfo"):
+        return {}
+    try:
+        out = subprocess.run(["sinfo", "-N", "-h", "-n", ",".join(hosts), "-O",
+                              "NodeList:200,CPUsState:30,CPUsLoad:12,Memory:16,FreeMem:16,Gres:300,StateLong:30"],
+                             capture_output=True, text=True, timeout=15).stdout
+        jobs = subprocess.run(["squeue", "-h", "-t", "R", "-w", ",".join(hosts), "-O",
+                               "JobID:30,UserName:40,NodeList:300,tres-alloc:400"],
+                              capture_output=True, text=True, timeout=15).stdout
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    nodes = {}
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) < 7 or parts[0] in nodes:  # a node in several partitions is listed once per partition
+            continue
+        name, cpus, load, memory, free, gres, state = parts[:7]
+        total_cpus = int(cpus.split("/")[-1]) if cpus.count("/") == 3 else None
+        nodes[name] = {"cpus": total_cpus, "load": float(load) if load[:1].isdigit() else None,
+                       "mem": _size(memory, "M"), "mem_free": _size(free, "M"), "gpus": _gpu_count(gres),
+                       "state": state, "reserved": {"cpus": 0, "mem": 0.0, "gpus": 0}, "slurm_jobs": []}
+    user = getpass.getuser()
+    for line in jobs.splitlines():
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        job_id, owner, nodelist, tres = parts[:4]
+        names = expand_hosts(nodelist)
+        alloc = _tres(tres)
+        share = {"cpus": int(alloc.get("cpu", 0)) / len(names), "mem": (_size(alloc.get("mem"), "M") or 0) / len(names),
+                 "gpus": int(alloc.get("gres/gpu", 0)) / len(names)}
+        for name in names:
+            if name in nodes:
+                for key, value in share.items():
+                    nodes[name]["reserved"][key] += value
+                nodes[name]["slurm_jobs"].append({"slurm_id": job_id, "user": owner, "mine": owner == user, **share})
+    return nodes
+
+
+def _sstat(ids: list[str]) -> dict[str, dict]:
+    """Cumulative CPU seconds and current RAM / VRAM / GPU utilization of running Slurm jobs, summed over steps."""
+    if not ids or not shutil.which("sstat"):
+        return {}
+    try:
+        out = subprocess.run(["sstat", "-a", "-n", "-P", "-j", ",".join(ids), "-o", "JobID,TRESUsageInTot"],
+                             capture_output=True, text=True, timeout=15).stdout
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    usage: dict[str, dict] = {}
+    for line in out.splitlines():
+        step, _, tres = line.partition("|")
+        values = _tres(tres.rstrip("|"))
+        if not values:
+            continue
+        job = usage.setdefault(step.split(".")[0], {"cpu_s": 0.0, "mem": 0.0, "vram": 0.0, "gpu_util": None})
+        job["cpu_s"] += _slurm_seconds(values["cpu"]) if values.get("cpu") else 0.0
+        job["mem"] += _size(values.get("mem")) or 0.0
+        job["vram"] += _size(values.get("gres/gpumem")) or 0.0
+        if values.get("gres/gpuutil"):
+            job["gpu_util"] = max(job["gpu_util"] or 0.0, float(values["gres/gpuutil"]))
+    return usage
+
+
+def resources(rows: list[dict]) -> dict:
+    """See the section comment. rows: job rows from snapshots(); only running ones are measured."""
+    path = HOME / "hosts" / f"{HOST}.json"
+    previous = read_json(path, {}) or {}
+    now = time.time()
+    if now - previous.get("time", 0) < RES_MIN_S and previous.get("result"):
+        return previous["result"]
+    running = [r for r in rows if r["status"] == "running"]
+    local = [r for r in running if r.get("kind") in ("process", "pid") and r.get("host") == HOST and r.get("pid")]
+    slurm_rows = [r for r in running if r.get("kind") == "slurm" and r.get("slurm_id")]
+    if not previous.get("time"):  # no baseline yet: measure a short first interval
+        previous = {"time": now, "cpu": _cpu_ticks(), "jobs": {}}
+        table = _proc_table()
+        children = _children(table)
+        previous["jobs"] = {r["id"]: _tree_usage(table, children, r["pid"])[0] for r in local}
+        time.sleep(RES_FIRST_S)
+        now = time.time()
+    interval = now - previous["time"]
+    hz = os.sysconf("SC_CLK_TCK")
+
+    # this machine, from /proc and NVML
+    busy, total = _cpu_ticks()
+    prev_busy, prev_total = previous.get("cpu") or (busy, total)
+    memory = _meminfo()
+    table = _proc_table()
+    children = _children(table)
+    cpus = os.cpu_count() or 1
+    jobs_usage, job_ticks, owner, limits = {}, {}, {}, {}
+    for r in local:
+        ticks, rss, pids = _tree_usage(table, children, r["pid"])
+        job_ticks[r["id"]] = ticks
+        before = (previous.get("jobs") or {}).get(r["id"])
+        cpu = (ticks - before) / hz / interval if before is not None and ticks >= before else None
+        jobs_usage[r["id"]] = {"cpu": cpu, "mem": rss, "gpu_util": None, "vram": None}
+        owner.update({pid: r["id"] for pid in pids})
+        limits[r["id"]] = cgroup_limits(r["pid"])
+    # NVML only while one of our jobs holds the GPU: querying an idle GPU wakes its driver
+    gpu_queried = holds_gpu(list(owner))
+    gpus = []
+    if gpu_queried:
+        try:
+            nvml = Nvml()
+        except OSError:
+            nvml = None
+        if nvml:
+            try:
+                gpus = nvml.devices(int(previous["time"] * 1e6))
+            finally:
+                nvml.close()
+    for gpu in gpus:
+        for pid, proc in gpu.pop("processes").items():
+            job = owner.get(pid)
+            if job:
+                usage = jobs_usage[job]
+                usage["vram"] = (usage["vram"] or 0) + (proc.get("vram") or 0)
+                if proc.get("util") is not None:
+                    usage["gpu_util"] = (usage["gpu_util"] or 0) + proc["util"]
+                usage.setdefault("gpus", []).append(gpu["index"])
+    here = {"host": HOST, "local": True, "cpus": cpus,
+            "cpu": (busy - prev_busy) / max(total - prev_total, 1) * cpus,
+            "mem": memory.get("MemTotal", 0) - memory.get("MemAvailable", 0), "mem_total": memory.get("MemTotal"),
+            "gpus": gpus, "gpu_count": len(gpus) or _local_gpu_count(), "gpu_queried": bool(gpus)}
+
+    # Slurm: reservations on every node involved, usage of our running Slurm jobs
+    hosts = [HOST] + sorted({h for r in running if r.get("host") for h in expand_hosts(r["host"])} - {HOST})
+    slurm_nodes = _slurm_nodes(hosts) if shutil.which("sinfo") else {}
+    stats = _sstat([str(r["slurm_id"]) for r in slurm_rows])
+    slurm_cpu = {}
+    for r in slurm_rows:
+        stat = stats.get(str(r["slurm_id"]))
+        if not stat:
+            continue
+        slurm_cpu[r["id"]] = stat["cpu_s"]
+        before = (previous.get("slurm_cpu") or {}).get(r["id"])
+        if before is not None and stat["cpu_s"] >= before:
+            cpu = (stat["cpu_s"] - before) / interval
+        else:  # first sight: the mean over the job's runtime so far
+            cpu = stat["cpu_s"] / r["elapsed_s"] if r.get("elapsed_s") else None
+        jobs_usage[r["id"]] = {"cpu": cpu, "mem": stat["mem"], "vram": stat["vram"] or None,
+                               "gpu_util": stat["gpu_util"]}
+
+    nodes = []
+    for host in hosts:
+        node = dict(here) if host == HOST else {"host": host, "local": False, "gpus": []}
+        info = slurm_nodes.get(host)
+        if info:
+            node["slurm"] = {"state": info["state"], "reserved": info["reserved"], "jobs": info["slurm_jobs"]}
+            if host != HOST:
+                node.update(cpus=info["cpus"], cpu=info["load"], mem_total=info["mem"], gpu_count=info["gpus"],
+                            mem=info["mem"] - info["mem_free"] if info["mem"] and info["mem_free"] is not None else None,
+                            coarse=True)  # slurmd's load average and free memory, updated every few minutes
+        reservations = {j["slurm_id"]: j for j in (info or {}).get("slurm_jobs", [])}
+        members = []
+        for r in running:
+            on = expand_hosts(r.get("host")) if r.get("kind") == "slurm" else [r.get("host")]
+            if host not in on:
+                continue
+            usage = dict(jobs_usage.get(r["id"]) or {})
+            if len(on) > 1:  # Slurm reports a multi-node job as a whole
+                usage = {k: (v / len(on) if isinstance(v, float) and k != "gpu_util" else v) for k, v in usage.items()}
+            members.append({"id": r["id"], "name": r["name"], "group": r.get("group"), "kind": r.get("kind"),
+                            "measured": r["id"] in jobs_usage, **usage,
+                            "reserved": job_reservation(r, reservations.get(str(r.get("slurm_id"))), limits.get(r["id"]))})
+        node["jobs"] = members
+        # reserved on the node: Slurm's allocations (all users) plus the budgets of our jobs Slurm does not manage
+        slurm_reserved = (node.get("slurm") or {}).get("reserved") or {"cpus": 0, "mem": 0, "gpus": 0}
+        own = [m["reserved"] for m in members if m["reserved"] and m["reserved"]["source"] != "slurm"]
+        node["reserved"] = {k: slurm_reserved[k] + sum(o.get(k) or 0 for o in own) for k in ("cpus", "mem", "gpus")}
+        if node.get("local"):  # everything not started through jobrun (other users, Slurm jobs of others, the OS)
+            node["other"] = {"cpu": max(0.0, node["cpu"] - sum(m.get("cpu") or 0 for m in members)),
+                             "mem": max(0, node["mem"] - sum(m.get("mem") or 0 for m in members)),
+                             "vram": max(0, sum(g["vram"] for g in gpus) - sum(m.get("vram") or 0 for m in members))
+                             if gpus else None}
+        nodes.append(node)
+
+    result = {"time": now, "interval_s": interval, "nodes": nodes}
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        write_json(path, {"time": now, "cpu": [busy, total], "jobs": job_ticks, "slurm_cpu": slurm_cpu,
+                          "result": result})
+    except OSError:
+        pass
+    return result
+
+
+def job_reservation(row: dict, slurm: dict | None, limits: dict | None) -> dict | None:
+    """What the job was given: its Slurm allocation, else the --cpus/--mem/--gpus budget, else its cgroup's limits
+    (per resource, so `--cpus 10` and a MemoryMax scope combine)."""
+    if slurm:
+        return {"cpus": slurm["cpus"], "mem": slurm["mem"], "gpus": slurm["gpus"], "source": "slurm"}
+    declared, limits = row.get("budget") or {}, limits or {}
+    reserved = {k: declared.get(k) if declared.get(k) is not None else limits.get(k) for k in ("cpus", "mem", "gpus")}
+    if all(v is None for v in reserved.values()):
+        return None
+    sources = {"budget" if declared.get(k) is not None else "cgroup" for k, v in reserved.items() if v is not None}
+    return {**reserved, "source": "+".join(sorted(sources))}
+
+
+def _children(table: dict) -> dict[int, list[int]]:
+    children: dict[int, list[int]] = {}
+    for pid, (ppid, _, _) in table.items():
+        children.setdefault(ppid, []).append(pid)
+    return children
+
+
+def _tree_usage(table: dict, children: dict, root: int) -> tuple[int, int, list[int]]:
+    """CPU ticks (live processes plus reaped children, so nothing is lost when a worker exits), RSS (shared pages
+    count once per process) and pids of a process and its descendants."""
+    pids, todo = [], [root] if root in table else []
+    while todo:
+        pid = todo.pop()
+        pids.append(pid)
+        todo.extend(children.get(pid, []))
+    return sum(table[p][1] for p in pids), sum(table[p][2] for p in pids), pids
+
+
 # ---------------------------------------------------------------- formatting
 
 def fmt_count(n: int | None) -> str:
@@ -942,8 +1376,29 @@ def visible(row: dict, days: float | None) -> bool:
 
 # ---------------------------------------------------------------- commands
 
+def budget(args, current: dict | None = None) -> dict | None:
+    """--cpus / --mem / --gpus as stored in the metadata (bytes for RAM); None when none is given."""
+    given = {"cpus": args.cpus, "mem": _size(args.mem.upper().rstrip("B"), "G") if args.mem else None, "gpus": args.gpus}
+    if args.mem and given["mem"] is None:
+        sys.exit(f"jobrun: --mem expects a size like 20G, got {args.mem!r}")
+    if all(v is None for v in given.values()):
+        return None
+    return {**(current or {}), **{k: v for k, v in given.items() if v is not None}}
+
+
+def parse_budget(text: str) -> dict:
+    """{"cpus": 12.0, "mem": bytes, "gpus": 1.0} from "cpus=12 mem=96G gpus=1"; malformed values are skipped."""
+    found = {}
+    for key, value in re.findall(r"(cpus|mem|gpus)=([\w.]+)", text):
+        try:
+            found[key] = _size(value.upper().rstrip("B"), "G") if key == "mem" else float(value)
+        except ValueError:
+            continue
+    return {k: v for k, v in found.items() if v is not None}
+
+
 def progress_options(args) -> dict:
-    return {"group": args.group, "progress_regex": args.progress_regex, "count_regex": args.count_regex,
+    return {"budget": budget(args), "group": args.group, "progress_regex": args.progress_regex, "count_regex": args.count_regex,
             "total": args.total, "stages": [s.strip() for s in args.stages.split(",")] if args.stages else None,
             "stage_rules": stage_rules(args.stage_at)}
 
@@ -1099,6 +1554,68 @@ def cmd_ls(args) -> int:
     return 0
 
 
+def fmt_bytes(n: float | None) -> str:
+    if n is None:
+        return "?"
+    for unit, scale in (("T", 1 << 40), ("G", 1 << 30), ("M", 1 << 20)):
+        if n >= scale:
+            return f"{n / scale:.3g}{unit}"
+    return f"{n / 1024:.0f}K" if n else "0"
+
+
+def fmt_usage(u: dict) -> str:
+    """CPU cores, RAM, GPU utilization and VRAM of a job or of "other"."""
+    parts = [f"cpu {u['cpu']:.1f}" if u.get("cpu") is not None else "cpu ?", f"ram {fmt_bytes(u.get('mem'))}"]
+    if u.get("gpu_util") is not None:
+        parts.append(f"gpu {u['gpu_util']:.0f}%")
+    if u.get("vram"):
+        parts.append(f"vram {fmt_bytes(u['vram'])}")
+    return "  ".join(parts)
+
+
+def cmd_res(args) -> int:
+    rows = [r for r in snapshots(load_jobs()) if r["status"] in ACTIVE]
+    result = resources(rows)
+    if args.json:
+        print(json.dumps({"schema": JSON_SCHEMA, **result}))
+        return 0
+    print(f"means over the last {fmt_duration(result['interval_s'])}; RAM and VRAM now. used / reserved per job")
+    for node in result["nodes"]:
+        reserved = node["reserved"]
+        coarse = " (CPU, RAM: Slurm's load average and free memory, minutes old)" if node.get("coarse") else ""
+        print(f"\n{node['host']}{' (this machine)' if node.get('local') else ''}{coarse}")
+        cpu = f"{node['cpu']:.1f}" if node.get("cpu") is not None else "?"
+        print(f"  CPU    {cpu:>6} / {node.get('cpus') or '?'} cores   reserved {reserved['cpus']:g}")
+        print(f"  RAM    {fmt_bytes(node.get('mem')):>6} / {fmt_bytes(node.get('mem_total'))}   reserved {fmt_bytes(reserved['mem'])}")
+        for gpu in node.get("gpus") or []:
+            print(f"  GPU{gpu['index']}   {gpu['util']:5.0f}%   vram {fmt_bytes(gpu['vram'])} / {fmt_bytes(gpu['vram_total'])}"
+                  f"   {gpu['name']}")
+        if node.get("gpu_count"):
+            why = "" if node.get("gpus") else (" (not measured: no job holds a GPU)" if node.get("local")
+                                                else " (utilization not available)")
+            print(f"  GPUs   reserved {reserved['gpus']:g} / {node['gpu_count']}{why}")
+        for job in node["jobs"]:
+            r = job["reserved"] or {}
+            pair = (lambda used, rsv, fmt: f"{fmt(used) if used is not None else '?'}"
+                    f"{'/' + fmt(rsv) if rsv is not None else ''}")
+            parts = [f"cpu {pair(job.get('cpu'), r.get('cpus'), lambda v: f'{v:.1f}')}",
+                     f"ram {pair(job.get('mem'), r.get('mem'), fmt_bytes)}"]
+            if job.get("gpu_util") is not None or r.get("gpus"):
+                util = "?" if job.get("gpu_util") is None else f"{job['gpu_util']:.0f}%"
+                parts.append(f"gpu {util}" + (f" of {r['gpus']:g}" if r.get("gpus") else ""))
+            if job.get("vram"):
+                parts.append(f"vram {fmt_bytes(job['vram'])}")
+            source = f"  [{r['source']}]" if r else "  [no budget]"
+            usage = "  ".join(parts) if job["measured"] else "no usage data"
+            print(f"    {job['id']}  {(job['name'] or '')[:36]:<36}  {usage}{source}")
+        if node.get("other"):
+            print(f"    {'other':<11}  {'(not started through jobrun)':<36}  {fmt_usage(node['other'])}")
+        others = [j for j in (node.get("slurm") or {}).get("jobs", []) if not j["mine"]]
+        if others:
+            print(f"    Slurm jobs of others: {len(others)} ({', '.join(sorted({j['user'] for j in others}))})")
+    return 0
+
+
 def cmd_show(args) -> int:
     print(json.dumps(snapshots(resolve([args.id]))[0], indent=1))
     return 0
@@ -1230,6 +1747,8 @@ def cmd_edit(args) -> int:
     if args.log and meta.get("kind") != "process":
         progress["log"] = progress.pop("progress_file")  # tracked and Slurm jobs are parsed from their log
     other = {key: value for key, value in (("name", args.name), ("group", args.group)) if value is not None}
+    if budget(args):
+        other["budget"] = budget(args, meta.get("budget"))
     if args.after is not None:
         other["after"] = dependencies(args)
         if meta["id"] in other["after"]:
@@ -1275,6 +1794,9 @@ def main(argv: list[str] | None = None) -> int:
         p.add_argument("--stages", help="planned stage names, comma-separated (shown before they are reached)")
         p.add_argument("--stage-at", action="append", metavar="NAME=REGEX",
                        help="stage NAME starts at the first log line matching REGEX (for programs without markers)")
+        p.add_argument("--cpus", type=float, help="CPU cores budgeted for the job (shown as reserved; not enforced)")
+        p.add_argument("--mem", help="RAM budgeted for the job, e.g. 20G (shown as reserved; not enforced)")
+        p.add_argument("--gpus", type=float, help="GPUs budgeted for the job (shown as reserved; not enforced)")
 
     p = sub.add_parser("run", help="run a command under supervision (detached unless --fg)")
     progress_args(p)
@@ -1306,6 +1828,10 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--all", action="store_true", help="include all finished jobs")
     p.add_argument("--days", type=float, default=3, help="show finished jobs of the last N days (default 3)")
     p.set_defaults(func=cmd_ls)
+
+    p = sub.add_parser("res", help="CPU, RAM, GPU and VRAM of the nodes running jobs: use, Slurm reservations, per job")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_res)
 
     p = sub.add_parser("show", help="print one job as JSON")
     p.add_argument("id")

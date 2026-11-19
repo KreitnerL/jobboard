@@ -3,7 +3,7 @@
   "displayName": "Job Board",
   "description": "Running and finished jobs from the jobrun registry: progress, rate, ETA, logs, stop.",
   "publisher": "kreitner",
-  "version": "0.3.4",
+  "version": "0.4.0",
   "license": "MIT",
   "engines": {
     "vscode": "^1.80.0"
@@ -33,6 +33,10 @@
         {
           "id": "jobboard.jobs",
           "name": "Jobs"
+        },
+        {
+          "id": "jobboard.resources",
+          "name": "Resources"
         }
       ]
     },
@@ -84,6 +88,11 @@
         "command": "jobboard.removeGroup",
         "title": "Remove Group from List",
         "icon": "$(trash)"
+      },
+      {
+        "command": "jobboard.refreshResources",
+        "title": "Refresh Resources",
+        "icon": "$(refresh)"
       }
     ],
     "menus": {
@@ -96,6 +105,11 @@
         {
           "command": "jobboard.clean",
           "when": "view == jobboard.jobs",
+          "group": "navigation"
+        },
+        {
+          "command": "jobboard.refreshResources",
+          "when": "view == jobboard.resources",
           "group": "navigation"
         }
       ],
@@ -233,6 +247,12 @@
           "type": "boolean",
           "default": false,
           "description": "Keep redrawing the job list while VS Code is not focused (e.g. watched on a second monitor). Off: the list is redrawn once when the window regains focus; status bar and notifications stay live."
+        },
+        "jobboard.resourceSeconds": {
+          "type": "number",
+          "default": 15,
+          "minimum": 5,
+          "description": "Measure CPU, RAM, GPU and VRAM every N seconds while the Resources view is visible; values are means over this interval."
         }
       }
     }

@@ -166,6 +166,51 @@ jobrun wait ID            # or --group G; exits 0 only if everything finished su
 This is useful in scripts and for agents. Waiting is separate from running: if the waiting shell dies, the job
 keeps running and stays tracked.
 
+## Resources
+
+The **Resources** panel below the job list (and `jobrun res`) shows this machine and every node that runs an active
+job. Each resource (CPU, RAM, each GPU) is a row with what is used, the total, and what is reserved; expand it to
+see each job's share as **used / reserved**. The node row shows what is still **free** for new jobs: the total minus
+the larger of what is used and what is reserved.
+
+```
+▾ wskreitner   this machine · 4 jobs · free 40 cores, 0 RAM, 0 GPU
+  ▾ CPU     ████░░░░░░ 24 / 64 cores · 2 reserved
+      tuning s4103         7.8 · no budget
+      train unet           ██░░░░ 0.7 / 2
+      other                0.4
+  ▾ RAM     ███░░░░░░░ 83.7G / 252G · 296G reserved
+      tuning s4103         █░░░░░ 21.2G / 96G
+      train unet           ░░░░░░ 672M / 8G
+      other                21.3G
+  ▾ GPU 0   ███████░░░ 69% · VRAM 2.97G / 48G
+      train unet           ████░░ 69% · VRAM 2.38G · 1 GPU reserved
+      other                605M
+```
+
+**What a job has reserved**, per resource, from the first of:
+
+1. its **Slurm allocation** (`squeue`), for Slurm jobs;
+2. a declared **budget** (bookkeeping only, not enforced), preferably from the program itself, which knows its
+   worker count: a log line `JOBRUN_BUDGET cpus=12 mem=96G gpus=1` (any subset of the keys; the newest line replaces
+   the previous one, so a program can declare a budget per stage). Or given from outside:
+   `jobrun run --cpus 8 --mem 20G --gpus 1 -- …`, `jobrun edit ID --cpus 12`; these take precedence per key;
+3. the limits of the job's own **cgroup**, e.g. `systemd-run --user --scope -p MemoryMax=96G …` or `CPUQuota=`.
+   Only the job's own scope counts, never a user-wide slice.
+
+A node's reserved total is Slurm's allocations (all users) plus the budgets of your jobs that Slurm does not manage.
+
+**How it is measured** (`jobboard.resourceSeconds`, default 15 s, only while the panel is visible):
+
+- CPU and GPU utilization are **means since the last refresh**, from cumulative counters: `/proc` CPU ticks (exited
+  workers included) and the driver's utilization samples since a timestamp (NVML). RAM and VRAM are current values;
+  a job's RAM is the resident memory of its processes, so pages shared between forked workers count once per process.
+- Nothing samples in the background. A refresh costs about 0.1 s of CPU: one pass over `/proc`, two short Slurm
+  calls, and NVML only **while one of your jobs has the GPU open**. Querying an idle GPU would wake its driver (~2 s),
+  so without a GPU job the GPU row shows only reservations.
+- **Other nodes** are seen through Slurm only: reservations of all users, slurmd's load average and free memory (which
+  lag by minutes), and the usage of your own Slurm jobs (`sstat`). Their GPU utilization is not available.
+
 ## Logs
 
 - `jobrun run` writes the command's output to `~/.jobs/logs/<id>.log`, or to `--log FILE`.
@@ -194,6 +239,7 @@ asking you to look.
 | `sbatch -- ARGS` | Submit with `sbatch` and track |
 | `track --pid PID` / `--slurm ID` | Adopt a running process or Slurm job; a process's log is detected from its stdout |
 | `ls [--all] [--json]` | List jobs (finished ones from the last 3 days unless `--all`) |
+| `res [--json]` | CPU, RAM, GPU, VRAM per node: used and reserved, per job |
 | `show ID` · `log ID [-f]` | Details as JSON · tail the log |
 | `wait ID` / `--group G` | Block until finished |
 | `stop ID` / `--group G` | SIGTERM to the whole process tree, then SIGKILL after 10 s; `scancel` for Slurm |
@@ -201,7 +247,7 @@ asking you to look.
 | `rm ID` · `clean [--days 7]` | Remove from the list (with the logs jobrun wrote) |
 
 Common options: `--name`, `--group`, `--after`, `--stages`, `--stage-at`, `--log`, `--count-regex`, `--progress-regex`,
-`--total`.
+`--total`, and the budget `--cpus`, `--mem`, `--gpus`.
 
 ## How it works
 

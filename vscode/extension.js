@@ -174,8 +174,14 @@ class JobsProvider {
     }
   }
 
+  // A refresh asked for while one is running (e.g. right after `jobrun clean`) runs again when that one ends;
+  // dropping it would show the pre-clean list until the next interval.
   async refresh(force = false) {
-    if (this.busy) return;
+    if (this.busy) {
+      this.again = this.again || { force: false };
+      this.again.force = this.again.force || force;
+      return;
+    }
     this.busy = true;
     try {
       const data = JSON.parse(await jobrun(['ls', '--json', '--days', String(config().get('finishedDays'))]));
@@ -194,6 +200,20 @@ class JobsProvider {
     this.loaded = true;
     this.updateStatusBar();
     this.render(force);
+    if (this.again) {
+      const again = this.again;
+      this.again = null;
+      return this.refresh(again.force);
+    }
+  }
+
+  // Show the effect of rm / clean at once, before jobrun has finished and the list is read again.
+  drop(predicate) {
+    const gone = new Set(this.jobs.filter(predicate).map(job => job.id));
+    if (!gone.size) return;
+    this.jobs = this.jobs.filter(job => !gone.has(job.id));
+    this.groups = this.groups.filter(g => this.jobs.some(job => job.group === g.name));
+    this.render(true);
   }
 
   // One message per finished ungrouped job, per failed group member, and per finished group.
@@ -337,6 +357,186 @@ function detailItems(job) {
   });
 }
 
+// ---------------------------------------------------------------- resources view
+// `jobrun res --json`: per node CPU, RAM, GPU, VRAM (means over the time since the last call), Slurm reservations
+// and per-job usage. Polled only while the view is visible, every jobboard.resourceSeconds.
+
+function bytes(n) {
+  if (n == null) return '?';
+  for (const [unit, scale] of [['T', 2 ** 40], ['G', 2 ** 30], ['M', 2 ** 20]]) if (n >= scale) return `${+(n / scale).toPrecision(3)}${unit}`;
+  return n > 0 ? `${Math.round(n / 1024)}K` : '0';
+}
+
+function cores(n) {
+  return n == null ? '?' : `${+n.toFixed(n >= 10 ? 0 : 1)}`;
+}
+
+// what is left for new jobs: the total minus whichever is larger, what is used or what Slurm has reserved
+function free(total, used, reserved) {
+  if (total == null) return null;
+  return Math.max(0, total - Math.max(used || 0, reserved || 0));
+}
+
+const SOURCES = { slurm: 'Slurm allocation', budget: 'declared (JOBRUN_BUDGET line or --cpus/--mem/--gpus)', cgroup: 'cgroup limit (e.g. systemd-run MemoryMax)' };
+
+function resourceItem(id, label, fraction, text, tooltip, icon, children) {
+  const item = new vscode.TreeItem(label, children && children.length
+    ? vscode.TreeItemCollapsibleState.Collapsed : vscode.TreeItemCollapsibleState.None);
+  item.id = id;
+  item.description = fraction != null ? `${bar(fraction)} ${text}` : text;
+  item.tooltip = tooltip || text;
+  item.iconPath = new vscode.ThemeIcon(icon);
+  item.children = children || [];
+  return item;
+}
+
+// One job's share of a resource: used / reserved, with a bar of used against reserved when it has a reservation.
+function shareItem(id, job, used, reserved, fmt, extra) {
+  const item = new vscode.TreeItem(job.name);
+  item.id = id;
+  const r = job.reserved;
+  const usedText = !job.measured ? 'no data' : used == null ? '?' : fmt(used);
+  const fraction = job.measured && used != null && reserved ? used / reserved : null;
+  item.description = [fraction != null ? bar(fraction, 6) : '', reserved != null ? `${usedText} / ${fmt(reserved)}` : `${usedText} · no budget`,
+    extra].filter(Boolean).join(' ');
+  item.tooltip = `${job.name} (${job.id})${job.group ? `\ngroup: ${job.group}` : ''}\n` +
+    (r ? `reserved: ${cores(r.cpus)} CPUs · ${bytes(r.mem)} RAM · ${cores(r.gpus)} GPU\nfrom: ${r.source.split('+').map(k => SOURCES[k] || k).join(', ')}`
+      : 'No budget: not a Slurm job, no JOBRUN_BUDGET line or --cpus/--mem/--gpus, no cgroup limit.') +
+    (job.kind === 'slurm' ? '\nUsage from sstat.' : '\nRAM is the resident memory of its processes (shared pages count once per process).');
+  item.iconPath = new vscode.ThemeIcon(fraction != null && fraction > 0.9 ? 'warning' : 'sync~spin',
+    new vscode.ThemeColor(fraction != null && fraction > 0.9 ? 'charts.orange' : 'charts.blue'));
+  return item;
+}
+
+function plainItem(id, label, description, tooltip, icon) {
+  const item = new vscode.TreeItem(label);
+  item.id = id;
+  item.description = description;
+  item.tooltip = tooltip;
+  item.iconPath = new vscode.ThemeIcon(icon);
+  return item;
+}
+
+class ResourcesProvider {
+  constructor() {
+    this.emitter = new vscode.EventEmitter();
+    this.onDidChangeTreeData = this.emitter.event;
+    this.data = null;
+    this.error = null;
+    this.busy = false;
+    this.view = null;
+  }
+
+  visible() {
+    return this.view && this.view.visible && (vscode.window.state.focused || config().get('updateWhileUnfocused'));
+  }
+
+  async refresh(force = false) {
+    if (this.busy || !(force || this.visible())) return;
+    this.busy = true;
+    try {
+      this.data = JSON.parse(await jobrun(['res', '--json']));
+      this.error = null;
+    } catch (err) {
+      this.error = err.message;
+    } finally {
+      this.busy = false;
+    }
+    this.emitter.fire();
+  }
+
+  getTreeItem(element) {
+    return element;
+  }
+
+  getChildren(element) {
+    if (!element) {
+      if (this.error) {
+        const item = new vscode.TreeItem(`jobrun res failed: ${this.error}`);
+        item.iconPath = new vscode.ThemeIcon('error');
+        item.tooltip = this.error;
+        return [item];
+      }
+      if (!this.data) return [new vscode.TreeItem('Measuring…')];
+      return (this.data.nodes || []).map(node => this.nodeItem(node));
+    }
+    if (element.node) return this.nodeChildren(element.node);
+    return element.children || [];
+  }
+
+  nodeItem(node) {
+    const item = new vscode.TreeItem(node.host, vscode.TreeItemCollapsibleState.Expanded);
+    item.id = `node:${node.host}`;
+    item.node = node;
+    const reserved = node.reserved || {};
+    const left = [
+      free(node.cpus, node.cpu, reserved.cpus) != null && `${cores(free(node.cpus, node.cpu, reserved.cpus))} cores`,
+      free(node.mem_total, node.mem, reserved.mem) != null && `${bytes(free(node.mem_total, node.mem, reserved.mem))} RAM`,
+      node.gpu_count ? `${free(node.gpu_count, null, reserved.gpus)} GPU` : '',
+    ].filter(Boolean);
+    const where = node.local ? 'this machine' : 'via Slurm';
+    item.description = `${where} · ${node.jobs.length} job${node.jobs.length === 1 ? '' : 's'} · free ${left.join(', ')}`;
+    item.tooltip = `${node.host} (${where})\nFree = total minus the larger of what is used and what is reserved ` +
+      `(Slurm allocations plus the budgets of your other jobs).\nExpand CPU, RAM or GPU to see each job's share: used / reserved.\n` +
+      `Means over the last ${duration(this.data.interval_s)}; RAM and VRAM are current.` +
+      (node.coarse ? '\nCPU and RAM use come from slurmd (load average, free memory) and lag by minutes.' : '');
+    item.iconPath = new vscode.ThemeIcon(node.local ? 'vm' : 'server');
+    return item;
+  }
+
+  nodeChildren(node) {
+    const id = `node:${node.host}`;
+    const reserved = node.reserved || { cpus: 0, mem: 0, gpus: 0 };
+    const others = ((node.slurm || {}).jobs || []).filter(job => !job.mine);
+    const othersReserved = key => others.reduce((total, job) => total + job[key], 0);
+    // per resource: the jobs that use it, then everything else
+    const rest = (key, used, fmt) => {
+      const items = [];
+      if (node.other && used != null) items.push(plainItem(`${id}:${key}:other`, 'other', fmt(used),
+        'Everything not started through jobrun: other users, Slurm jobs of others, the system.', 'person'));
+      if (others.length && othersReserved(key === 'vram' ? 'gpus' : key)) {
+        items.push(plainItem(`${id}:${key}:slurm-others`, `Slurm jobs of others (${others.length})`,
+          `${fmt(othersReserved(key === 'vram' ? 'gpus' : key))} reserved`, [...new Set(others.map(job => job.user))].join(', '), 'organization'));
+      }
+      return items;
+    };
+    const jobs = node.jobs;
+    const cpuItems = [...jobs.map(job => shareItem(`${id}:cpu:${job.id}`, job, job.cpu, job.reserved && job.reserved.cpus, cores)),
+      ...rest('cpus', node.other && node.other.cpu, cores)];
+    const ramItems = [...jobs.map(job => shareItem(`${id}:ram:${job.id}`, job, job.mem, job.reserved && job.reserved.mem, bytes)),
+      ...rest('mem', node.other && node.other.mem, bytes)];
+    const gpuJobs = jobs.filter(job => job.gpu_util != null || job.vram || (job.reserved && job.reserved.gpus));
+    const gpuShare = job => {
+      const item = shareItem(`${id}:gpu:${job.id}`, job, null, null, cores);
+      const r = job.reserved && job.reserved.gpus;
+      item.description = [job.gpu_util != null ? `${bar(job.gpu_util / 100, 6)} ${Math.round(job.gpu_util)}%` : job.measured ? '' : 'no data',
+        job.vram ? `VRAM ${bytes(job.vram)}` : '', r ? `${cores(r)} GPU reserved` : 'no GPU reserved'].filter(Boolean).join(' · ');
+      return item;
+    };
+    const items = [
+      resourceItem(`${id}:cpu`, 'CPU', node.cpus && node.cpu != null ? node.cpu / node.cpus : null,
+        `${cores(node.cpu)} / ${node.cpus || '?'} cores${node.coarse ? ' (load)' : ''} · ${cores(reserved.cpus)} reserved`,
+        null, 'pulse', cpuItems),
+      resourceItem(`${id}:ram`, 'RAM', node.mem_total && node.mem != null ? node.mem / node.mem_total : null,
+        `${bytes(node.mem)} / ${bytes(node.mem_total)} · ${bytes(reserved.mem)} reserved`, null, 'database', ramItems),
+    ];
+    for (const gpu of node.gpus || []) {
+      items.push(resourceItem(`${id}:gpu${gpu.index}`, `GPU ${gpu.index}`, gpu.util / 100,
+        `${Math.round(gpu.util)}% · VRAM ${bytes(gpu.vram)} / ${bytes(gpu.vram_total)}`, gpu.name, 'circuit-board',
+        [...gpuJobs.filter(job => !job.gpus || job.gpus.includes(gpu.index)).map(gpuShare),
+          ...rest('vram', node.other && node.other.vram, bytes)]));
+    }
+    if (node.gpu_count) {
+      const why = (node.gpus || []).length ? '' : node.local ? ' · not measured: no job holds a GPU' : ' · utilization not available';
+      items.push(resourceItem(`${id}:gpus`, 'GPUs', reserved.gpus / node.gpu_count,
+        `${cores(reserved.gpus)} / ${node.gpu_count} reserved${why}`,
+        node.local && !(node.gpus || []).length ? 'The GPU is queried only while one of your jobs has it open, so an idle GPU is never woken up.' : null,
+        'circuit-board', (node.gpus || []).length ? [] : [...gpuJobs.map(gpuShare), ...rest('gpus', null, cores)]));
+    }
+    return items;
+  }
+}
+
 async function openLog(job) {
   if (!job.log || !fs.existsSync(job.log)) {
     vscode.window.showWarningMessage(`No log file for "${job.name}"${job.log ? `: ${job.log}` : ''}`);
@@ -356,23 +556,35 @@ function activate(context) {
   const run = (args, message) => jobrun(args)
     .then(out => { if (message) vscode.window.setStatusBarMessage(message || out.trim(), 4000); })
     .catch(err => vscode.window.showErrorMessage(`jobrun ${args[0]}: ${err.message}`))
-    .finally(() => provider.refresh());
+    .finally(() => provider.refresh(true));
 
-  let timer;
+  const resources = new ResourcesProvider();
+  const resourceView = vscode.window.createTreeView('jobboard.resources', { treeDataProvider: resources });
+  resources.view = resourceView;
+
+  let timer, resourceTimer;
   const schedule = () => {
     clearInterval(timer);
+    clearInterval(resourceTimer);
     timer = setInterval(() => provider.refresh(), Math.max(2, config().get('refreshSeconds')) * 1000);
+    resourceTimer = setInterval(() => resources.refresh(), Math.max(5, config().get('resourceSeconds')) * 1000);
   };
   schedule();
   provider.refresh();
+  resources.refresh();
 
   context.subscriptions.push(
-    view, provider.statusBar, { dispose: () => clearInterval(timer) },
+    view, resourceView, provider.statusBar, { dispose: () => { clearInterval(timer); clearInterval(resourceTimer); } },
+    resourceView.onDidChangeVisibility(event => { if (event.visible) resources.refresh(true); }),
+    vscode.commands.registerCommand('jobboard.refreshResources', () => resources.refresh(true)),
     vscode.workspace.onDidChangeConfiguration(event => {
-      if (event.affectsConfiguration('jobboard')) { schedule(); provider.refresh(); }
+      if (event.affectsConfiguration('jobboard')) { schedule(); provider.refresh(); resources.refresh(); }
     }),
     view.onDidChangeVisibility(event => { if (event.visible) provider.refresh(true); }),
-    vscode.window.onDidChangeWindowState(state => { if (state.focused && provider.stale) provider.refresh(true); }),
+    vscode.window.onDidChangeWindowState(state => {
+      if (state.focused && provider.stale) provider.refresh(true);
+      if (state.focused) resources.refresh();
+    }),
     vscode.commands.registerCommand('jobboard.refresh', () => provider.refresh(true)),
     vscode.commands.registerCommand('jobboard.openLog', item => openLog(item.job)),
     vscode.commands.registerCommand('jobboard.tailLog', item => {
@@ -391,18 +603,26 @@ function activate(context) {
         `Stop ${running} running job${running === 1 ? '' : 's'} of group "${item.group.name}"?`, { modal: true }, 'Stop', 'Kill now');
       if (choice) run(['stop', '--group', item.group.name, ...(choice === 'Kill now' ? ['--force'] : [])], `Stopped ${item.group.name}`);
     }),
-    vscode.commands.registerCommand('jobboard.removeGroup', item => run(['rm', '--group', item.group.name])),
+    vscode.commands.registerCommand('jobboard.removeGroup', item => {
+      provider.drop(job => job.group === item.group.name && !ACTIVE.has(job.status));
+      return run(['rm', '--group', item.group.name]);
+    }),
     vscode.commands.registerCommand('jobboard.stop', async item => {
       const choice = await vscode.window.showWarningMessage(
         `Stop "${item.job.name}" (${item.job.slurm_id ? `slurm ${item.job.slurm_id}` : `pid ${item.job.pid}`})?`,
         { modal: true }, 'Stop', 'Kill now');
       if (choice) run(['stop', item.job.id, ...(choice === 'Kill now' ? ['--force'] : [])], `Stopped ${item.job.name}`);
     }),
-    vscode.commands.registerCommand('jobboard.remove', item => run(['rm', item.job.id])),
+    vscode.commands.registerCommand('jobboard.remove', item => {
+      provider.drop(job => job.id === item.job.id);
+      return run(['rm', item.job.id]);
+    }),
     vscode.commands.registerCommand('jobboard.clean', async () => {
       const choice = await vscode.window.showWarningMessage('Remove all finished jobs from the list? Logs written by jobrun are deleted; logs it only read are kept.',
         { modal: true }, 'Remove');
-      if (choice) run(['clean', '--days', '0'], 'Cleared finished jobs');
+      if (!choice) return;
+      provider.drop(job => !ACTIVE.has(job.status));
+      run(['clean', '--days', '0'], 'Cleared finished jobs');
     }),
   );
 }

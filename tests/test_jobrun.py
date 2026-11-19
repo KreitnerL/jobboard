@@ -534,3 +534,77 @@ def test_unknown_step_times_fall_back_to_the_average():
     stage = jobrun_module._new_stage("old", None)
     jobrun_module._set_progress(stage, 40, 100, None)  # read from a log written before the first scan
     assert jobrun_module.stage_rate(stage, 1000.0, 200.0) == pytest.approx(40 / 800)
+
+
+def test_slurm_value_parsers():
+    assert jobrun_module._size("85356K") == 85356 * 1024
+    assert jobrun_module._size("48G") == 48 * 2 ** 30
+    assert jobrun_module._size("249856", "M") == 249856 * 2 ** 20
+    assert jobrun_module._size("N/A") is None
+    assert jobrun_module._slurm_seconds("1-02:03:04") == 86400 + 2 * 3600 + 3 * 60 + 4
+    assert jobrun_module._slurm_seconds("03:04.500") == pytest.approx(184.5)
+    assert jobrun_module.expand_hosts("node[01-03,07],gpu1") == ["node01", "node02", "node03", "node07", "gpu1"]
+    assert jobrun_module.expand_hosts("wskreitner") == ["wskreitner"]
+    assert jobrun_module._gpu_count("gpu:rtx_8000:1(S:0),gpu:rtx_a6000:1(S:0),gpumem:rtx_8000:no_consume:48G") == 2
+    assert jobrun_module._gpu_count("gpu:a100:4(IDX:0,4,6-7),gpumem:a100:0") == 4
+    tres = jobrun_module._tres("cpu=8,mem=48G,node=1,gres/gpu=1,gres/gpu:a100=1")
+    assert (tres["cpu"], tres["mem"], tres["gres/gpu"]) == ("8", "48G", "1")
+
+
+def test_res_attributes_cpu_and_memory_to_the_job(jobrun, monkeypatch):
+    monkeypatch.setenv("JOBRUN_RES_MIN_S", "0")
+    spin = f"{sys.executable} -c 'while True: pass'"
+    jobrun("run", "--name", "busy", "--", f"{spin} & {spin} & wait")  # two busy processes below the job's shell
+    wait_for(jobrun, "busy", "running")
+    time.sleep(0.5)
+    json.loads(jobrun("res", "--json").stdout)  # baseline
+    time.sleep(1.5)
+    result = json.loads(jobrun("res", "--json").stdout)
+    node = next(n for n in result["nodes"] if n["local"])
+    job = next(j for j in node["jobs"] if j["name"] == "busy")
+    assert result["interval_s"] >= 1.5 and job["measured"]
+    assert 1.5 < job["cpu"] < 2.5 and job["mem"] > 0
+    assert node["cpu"] >= job["cpu"] - 0.3 and node["other"]["cpu"] >= 0
+    assert "busy" in jobrun("res").stdout
+
+
+def test_reservation_prefers_slurm_then_budget_then_cgroup():
+    reserve = jobrun_module.job_reservation
+    slurm = {"cpus": 8, "mem": 48 * 2 ** 30, "gpus": 1}
+    assert reserve({"budget": {"cpus": 2}}, slurm, {"mem": 1.0})["source"] == "slurm"
+    mixed = reserve({"budget": {"cpus": 10}}, None, {"mem": 96 * 2 ** 30})
+    assert (mixed["cpus"], mixed["mem"], mixed["gpus"], mixed["source"]) == (10, 96 * 2 ** 30, None, "budget+cgroup")
+    assert reserve({}, None, {}) is None
+
+
+def test_budget_flags_are_stored_and_editable(jobrun):
+    jobrun("run", "--name", "budgeted", "--cpus", "4", "--mem", "20G", "--", "sleep 300")
+    row = wait_for(jobrun, "budgeted", "running")
+    assert row["budget"] == {"cpus": 4.0, "mem": 20 * 2 ** 30}
+    jobrun("edit", row["id"], "--gpus", "1")
+    assert rows(jobrun)["budgeted"]["budget"]["gpus"] == 1 and rows(jobrun)["budgeted"]["budget"]["cpus"] == 4.0
+    node = next(n for n in json.loads(jobrun("res", "--json").stdout)["nodes"] if n["local"])
+    job = next(j for j in node["jobs"] if j["name"] == "budgeted")
+    assert job["reserved"]["mem"] == 20 * 2 ** 30 and job["reserved"]["source"].startswith("budget")
+    assert node["reserved"]["cpus"] >= 4
+
+
+def test_gpu_is_not_queried_without_a_job_holding_it(jobrun):
+    assert not jobrun_module.holds_gpu([os.getpid()])
+    jobrun("run", "--name", "cpu only", "--", "sleep 300")
+    wait_for(jobrun, "cpu only", "running")
+    node = next(n for n in json.loads(jobrun("res", "--json").stdout)["nodes"] if n["local"])
+    assert node["gpus"] == [] and not node["gpu_queried"]
+
+
+def test_budget_marker_from_the_log_newest_wins_and_flags_override(jobrun):
+    assert jobrun_module.parse_budget(" cpus=12 mem=96G gpus=1") == {"cpus": 12.0, "mem": 96 * 2 ** 30, "gpus": 1.0}
+    script = "echo 'JOBRUN_BUDGET cpus=4'; echo 'JOBRUN_BUDGET cpus=12 mem=8G'; sleep 300"
+    jobrun("run", "--name", "declares", "--", script)
+    jobrun("run", "--name", "overridden", "--cpus", "2", "--", script)
+    wait_for(jobrun, "declares", "running")
+    wait_for(jobrun, "overridden", "running")
+    time.sleep(0.5)
+    found = rows(jobrun)
+    assert found["declares"]["budget"] == {"cpus": 12.0, "mem": 8 * 2 ** 30}
+    assert found["overridden"]["budget"] == {"cpus": 2.0, "mem": 8 * 2 ** 30}
