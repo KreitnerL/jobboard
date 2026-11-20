@@ -1,33 +1,16 @@
 # jobboard
 
-**See all your long-running jobs in one place: local scripts, background processes and Slurm jobs, with
-progress, rate, ETA and the resources they use, right in the VS Code sidebar.**
+**Coding agents are great at running experiments on their own, but it is easy to lose track of what they
+started. jobboard keeps you in control: a lightweight live board in VS Code shows every CPU and GPU job, from any
+agent and on any node of your cluster, with progress, ETA and resource use.**
 
 jobboard is a **VS Code extension** (the Job Board) with two companions: the **`jobrun` command-line tool**,
 which starts and tracks the jobs, and a **skill for coding agents** (Claude Code, Codex, Cursor, Copilot, ...), so
 the jobs they start show up on the board too. One installer sets up all three ([Install](#install)).
 
-```
-JOBS                                                                ⟳  ⌫
-▾ Running (2)
-  ▾ ◫ wp3 2026-11-02      0/2 jobs · 1/2 prepare n100
-    ▾ ⟳ prepare n100      2/2 convert · ██████░░░░ 58% · 58/100 · 2.1/min · ETA 16:40 · last step 0m20s ago (avg 0m28s) · 31m
-        ✓ 1. download     100/100 · 12m03s
-        ⟳ 2. convert      58/100 · 19m10s
-    ▸ ⏸ tune ilp          waiting for prepare n100
-  ▸ ⟳ train unet fold0    █████████░ 91% · 91/100 · 4.2/h · ETA 17:05 · ⚠ last step 1h05m ago (avg 14m10s) · 21h40m  ⎘  ■
-▸ Finished (1)
-RESOURCES                                                           ⟳
-▾ ws01                    this machine · 2 jobs · free 40 cores, 120G RAM, 0 GPU
-  ▾ CPU     ███░░░░░░░ 21 / 64 cores · 24 reserved
-      prepare n100        ████░░ 5.8 / 8
-      train unet fold0    ██░░░░ 6.1 / 16
-      other               9.1
-  ▸ RAM     █████░░░░░ 121G / 252G · 132G reserved
-  ▾ GPU 0   ████████░░ 83% · VRAM 31G / 48G
-      train unet fold0    █████░ 83% · VRAM 30G · 1 GPU reserved
-      other               1.2G
-```
+<p align="center">
+  <img src="docs/jobboard.png" width="800" alt="The Job Board in VS Code: a sweep with a running and a waiting job, a stalled training job on a Slurm GPU node, finished jobs, and CPU, RAM and GPU use per node and per job">
+</p>
 
 - **No code changes.** Progress is read from the job's log: tqdm bars, `[12/100]` counters, or lines you count.
 - **Anything that runs.** Local commands, processes that are already running, Slurm jobs.
