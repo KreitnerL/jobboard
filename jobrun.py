@@ -45,8 +45,6 @@ HOST = socket.gethostname()
 HEARTBEAT_S = float(os.environ.get("JOBRUN_HEARTBEAT_S", 30))
 STALE_S = 5 * HEARTBEAT_S
 CHECK_S = min(HEARTBEAT_S, 2)  # supervisor wake-up: log scan (stages, progress), heartbeat, log size check
-MAX_LOG_MB = float(os.environ.get("JOBRUN_MAX_LOG_MB", 512))  # cap for logs jobrun writes; 0 disables
-TRIM_KEEP_BYTES = 1 << 20  # tail kept when a log is trimmed
 LAST_LINE_BYTES = 16 * 1024  # tail read for the last log line
 WAIT_POLL_S = float(os.environ.get("JOBRUN_WAIT_POLL_S", 15))  # dependency checks of a waiting job
 COUNT_CHUNK_BYTES = 8 << 20  # count mode reads in chunks ...
@@ -56,10 +54,19 @@ SACCT_TTL_S = 30
 # rollout runs (2026-11-06): lower median ETA error than the run average or a 15-minute window, and nearly unbiased
 # when early steps are fast (parallel workers finish their short items first).
 RATE_STEPS = 15
-# A running job is "stalled" when its last step is this many average steps ago (and at least STALL_MIN_S): a hint
-# that it may hang, shown next to the time since the last step.
-STALL_FACTOR = 3
-STALL_MIN_S = 60
+# User settings, in $JOBRUN_HOME/config.json (`jobrun config`, or the Job Board's VS Code settings, which write it):
+# one file for every machine that shares the registry. Environment variables JOBRUN_<KEY> take precedence.
+SETTINGS = {
+    # a running job is "stalled" when its last step is stall_factor average steps ago, and at least stall_min_s:
+    # a hint that it may hang, shown next to the time since the last step
+    "stall_factor": (3.0, "a job is stalled after this many average step times without progress"),
+    "stall_min_s": (60.0, "... and at least this many seconds"),
+    # logs jobrun writes: beyond max_log_mb, the middle is cut; the first log_keep_head_mb and the newest
+    # max_log_mb / 2 are kept
+    "max_log_mb": (512.0, "cap for the logs jobrun writes (0: no cap); beyond it the middle of the log is cut"),
+    "log_keep_head_mb": (16.0, "start of a capped log that is always kept (at most a quarter of max_log_mb)"),
+    "auto_clean_days": (0.0, "delete finished jobs older than this many days, with the logs jobrun wrote (0: never)"),
+}
 RES_MIN_S = float(os.environ.get("JOBRUN_RES_MIN_S", 3))  # `jobrun res` within this many seconds of the last sample returns that sample (several dashboards)
 RES_FIRST_S = 0.5  # without an earlier sample, the means cover this short first interval
 JSON_SCHEMA = 2  # version of `ls --json`; bump on incompatible changes (the VS Code extension checks it)
@@ -97,6 +104,32 @@ SLURM_STATES = {  # sacct state -> (status, reason)
 
 def _file(job_id: str, suffix: str) -> Path:
     return JOBS / f"{job_id}{suffix}"
+
+
+CONFIG_PATH = HOME / "config.json"
+_config_cache: tuple = (None, {})
+
+
+def config_file() -> dict:
+    """The registry's config.json, re-read when it changes (a supervisor runs for days)."""
+    global _config_cache
+    mtime = _mtime(CONFIG_PATH)
+    if mtime != _config_cache[0]:
+        data = read_json(CONFIG_PATH, {}) or {}
+        _config_cache = (mtime, data if isinstance(data, dict) else {})
+    return _config_cache[1]
+
+
+def setting(key: str) -> float:
+    """JOBRUN_<KEY> from the environment, else config.json, else the default."""
+    default = SETTINGS[key][0]
+    for source in (os.environ.get(f"JOBRUN_{key.upper()}"), config_file().get(key)):
+        try:
+            if source is not None and source != "":
+                return float(source)
+        except (TypeError, ValueError):
+            pass
+    return default
 
 
 def read_json(path: Path, default=None):
@@ -311,27 +344,62 @@ def dropped_bytes(job_id: str) -> int:
         return 0
 
 
-def trim_log(job_id: str, log: str, max_bytes: int) -> None:
-    """Keep only the last TRIM_KEEP_BYTES of whole lines once the log exceeds max_bytes.
+TRIM_CHUNK_BYTES = 8 << 20  # the kept tail moves down in chunks of this size
 
-    The command writes with O_APPEND, so it keeps appending at the new end; output written between
-    reading the tail and truncating is lost, which is acceptable for a log that big.
+
+def _line_start(handle, position: int, limit: int) -> int:
+    """The first line start at or after position, looking at most limit bytes ahead (else position itself)."""
+    handle.seek(max(0, position - 1))
+    window = handle.read(min(limit, LAST_LINE_BYTES) + 1)
+    newline = window.find(b"\n")
+    return max(0, position - 1) + newline + 1 if newline >= 0 else position
+
+
+def trim_log(job_id: str, log: str, max_bytes: int, head_bytes: int, scanned: int | None = None) -> int:
+    """Cut the middle out of a log beyond max_bytes: keep the first head_bytes (at most a quarter of the cap) and
+    the newest max_bytes / 2, with a line saying what was dropped in between. Returns the bytes dropped.
+
+    The job writes with O_APPEND, so it keeps appending at the end; the tail is moved down in place, chunk by
+    chunk, and the file is shortened once the copy has caught up with the end. Output appended between that last
+    check and the truncation is lost: a few lines at most, and only once the log has reached the cap.
+    scanned: how far (physical bytes) the progress scan has read; nothing it has not read yet is cut.
     """
     try:
         size = os.path.getsize(log)
-        if size <= max_bytes:
-            return
+        if not max_bytes or size <= max_bytes:
+            return 0
+        head = min(head_bytes, max_bytes // 4)
         with open(log, "r+b") as handle:
-            handle.seek(max(0, size - TRIM_KEEP_BYTES))
-            tail = handle.read(TRIM_KEEP_BYTES)
-            tail = tail[tail.find(b"\n") + 1:]
-            marker = f"jobrun: log exceeded {max_bytes >> 20} MB, dropped the oldest {size - len(tail)} bytes\n".encode()
-            handle.truncate(0)
-        with open(log, "ab") as handle:
-            handle.write(marker + tail)
-        _file(job_id, ".trim").write_text(str(dropped_bytes(job_id) + size - len(tail) - len(marker)))
+            cut = _line_start(handle, head, max_bytes // 8) if head else 0
+            source = _line_start(handle, size - max_bytes // 2, max_bytes // 8)
+            if scanned is not None and scanned < source:
+                return 0  # the scan is behind: trim once it has caught up
+            dropped = source - cut
+            marker = (f"\njobrun: ... {dropped / (1 << 20):.0f} MB dropped here: the log exceeded {max_bytes / (1 << 20):g} MB; "
+                      f"jobrun keeps its start and its newest part ...\n\n").encode()
+            if dropped <= len(marker):
+                return 0
+            handle.seek(cut)
+            handle.write(marker)
+            target = cut + len(marker)
+            while True:
+                handle.seek(source)
+                chunk = handle.read(TRIM_CHUNK_BYTES)
+                if not chunk:
+                    if source >= os.fstat(handle.fileno()).st_size:
+                        handle.truncate(target)
+                        break
+                    continue
+                handle.seek(target)
+                handle.write(chunk)
+                source += len(chunk)
+                target += len(chunk)
+            handle.flush()
+        removed = source - target  # logical offset = physical + everything removed so far
+        _file(job_id, ".trim").write_text(str(dropped_bytes(job_id) + removed))
+        return removed
     except OSError:
-        pass
+        return 0
 
 
 def update_meta(job_id: str, **fields) -> dict:
@@ -435,15 +503,18 @@ def supervise(job_id: str, tee: bool = False) -> int:
             pump = threading.Thread(target=copy, daemon=True)
             pump.start()
 
-        max_bytes = meta.get("max_log_bytes") or 0
         meta_mtime = _mtime(meta_path)
         while True:
             _beat(job_id)
             if _mtime(meta_path) != meta_mtime:  # `jobrun edit` changed the settings
                 meta, meta_mtime = read_json(meta_path) or meta, _mtime(meta_path)
-            update_scan(meta)  # before trimming, so no stage marker is trimmed unseen
-            if max_bytes:
-                trim_log(job_id, meta["log"], max_bytes)
+            scan = update_scan(meta)  # before trimming, so no stage marker is trimmed unseen
+            # a cap given to `jobrun run --max-log-mb` is the job's own; otherwise the current setting applies
+            cap_mb = meta["max_log_mb"] if meta.get("max_log_mb") is not None else setting("max_log_mb")
+            if cap_mb:
+                scanned = None if meta.get("progress_file") else scan.get("offset", 0) - dropped_bytes(job_id)
+                trim_log(job_id, meta["log"], int(cap_mb * (1 << 20)), int(setting("log_keep_head_mb") * (1 << 20)),
+                         scanned)
             try:
                 code = proc.wait(timeout=CHECK_S)
                 break
@@ -777,7 +848,7 @@ def snapshot(meta: dict, slurm: dict) -> dict:
         done=done, total=total, fraction=done / total if done is not None and total else None,
         rate_per_s=rate, eta=eta, last_line=last_log_line(meta), progress_at=current.get("progress_at"),
         step_s=step_s, idle_s=idle_s,
-        stalled=bool(idle_s and step_s and idle_s > max(STALL_FACTOR * step_s, STALL_MIN_S)),
+        stalled=bool(idle_s and step_s and idle_s > max(setting("stall_factor") * step_s, setting("stall_min_s"))),
         # at or past the total but still running: an untracked final phase (or a too small --total)
         finishing=status in ACTIVE and bool(total) and done is not None and done >= total,
         stage=current["name"] if stage_list else None,
@@ -787,6 +858,11 @@ def snapshot(meta: dict, slurm: dict) -> dict:
         stages=stage_list, reason=reason,
     )
     row["host"] = slurm_info.get("host") or row["host"]
+    try:  # the log's size, and what jobrun cut out of a log it writes (see trim_log)
+        row["log_bytes"] = os.path.getsize(meta["log"]) if meta.get("log") else None
+    except OSError:
+        row["log_bytes"] = None
+    row["log_dropped"] = dropped_bytes(job_id) if meta.get("log_owned") else 0
     if status in FINAL:
         state["final"] = row
     try:
@@ -1890,13 +1966,14 @@ def cmd_run(args) -> int:
     cmd = args.cmd[1:] if args.cmd[:1] == ["--"] else args.cmd
     if not cmd:
         sys.exit("jobrun run: no command given")
+    auto_clean()
     job_id = allocate_id()
     log = Path(args.log).expanduser().resolve() if args.log else LOGS / f"{job_id}.log"
     log.parent.mkdir(parents=True, exist_ok=True)
     meta = {"id": job_id, "name": args.name or default_name(cmd), "kind": "process", "cmd": cmd,
             "cwd": os.getcwd(), "host": HOST, "log": str(log), "started": time.time(),
             "slurm_id": os.environ.get("SLURM_JOB_ID"), "log_owned": True,
-            "max_log_bytes": int(args.max_log_mb * (1 << 20)),
+            "max_log_mb": args.max_log_mb,
             "progress_file": str(Path(args.progress_file).expanduser().resolve()) if args.progress_file else None,
             "after": dependencies(args), **progress_options(args)}
     write_json(_file(job_id, ".json"), meta)
@@ -1984,10 +2061,12 @@ def visible_rows(days: float | None) -> list[dict]:
 
 
 def cmd_ls(args) -> int:
+    auto_clean()
     rows = visible_rows(None if args.all else args.days)
     groups = group_rows(rows)
     if args.json:
-        print(json.dumps({"schema": JSON_SCHEMA, "jobs": rows, "groups": groups}))
+        print(json.dumps({"schema": JSON_SCHEMA, "jobs": rows, "groups": groups,
+                          "settings": {key: setting(key) for key in SETTINGS}}))
         return 0
     if not rows:
         print("no jobs")
@@ -2177,14 +2256,72 @@ def cmd_rm(args) -> int:
     return 0
 
 
-def cmd_clean(args) -> int:
+def clean(days: float) -> int:
+    """Remove finished jobs that ended more than days ago, with the logs jobrun wrote; returns how many."""
     metas = load_jobs()
     removed = 0
     for meta, row in zip(metas, snapshots(metas)):
-        if row["status"] not in ACTIVE and not visible(row, args.days):
+        if row["status"] not in ACTIVE and not visible(row, days):
             remove(meta)
             removed += 1
-    print(f"removed {removed} finished jobs")
+    return removed
+
+
+AUTO_CLEAN_EVERY_S = 3600
+
+
+def auto_clean() -> None:
+    """The auto_clean_days setting: at most once an hour, from `ls` (every open Job Board) and `run`."""
+    days = setting("auto_clean_days")
+    stamp = HOME / "auto-clean"
+    if days <= 0 or time.time() - (_mtime(stamp) or 0) < AUTO_CLEAN_EVERY_S:
+        return
+    try:
+        stamp.touch()  # first, so that dashboards refreshing at the same time do not all clean
+        clean(days)
+    except OSError:
+        pass
+
+
+def cmd_clean(args) -> int:
+    print(f"removed {clean(args.days)} finished jobs")
+    return 0
+
+
+def cmd_config(args) -> int:
+    """Show or change the settings in the registry's config.json."""
+    data = dict(config_file())
+    changed = False
+    for item in args.items:
+        key, sep, value = item.partition("=")
+        if key not in SETTINGS:
+            sys.exit(f"jobrun config: unknown setting {key}; one of {', '.join(SETTINGS)}")
+        if sep:
+            try:
+                number = float(value)
+            except ValueError:
+                sys.exit(f"jobrun config: {key} needs a number, not {value!r}")
+            changed = changed or data.get(key) != number  # every VS Code window syncs on start: write only changes
+            data[key] = number
+    for key in args.unset or []:
+        if key not in SETTINGS:
+            sys.exit(f"jobrun config: unknown setting {key}; one of {', '.join(SETTINGS)}")
+        changed = data.pop(key, None) is not None or changed
+    if changed:
+        HOME.mkdir(parents=True, exist_ok=True)
+        write_json(CONFIG_PATH, data)
+    keys = [item for item in args.items if "=" not in item]
+    if args.json:
+        print(json.dumps({key: setting(key) for key in SETTINGS}))
+    elif keys:
+        for key in keys:
+            print(f"{setting(key):g}")
+    elif not args.items and not args.unset:
+        for key, (default, text) in SETTINGS.items():
+            source = ("env" if os.environ.get(f"JOBRUN_{key.upper()}") else
+                      "config" if key in config_file() else "default")
+            print(f"{key:<18} {setting(key):<8g} ({source})  {text}")
+        print(f"\nfile: {CONFIG_PATH}")
     return 0
 
 
@@ -2268,8 +2405,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--after", action="append", metavar="JOB",
                    help="start only after these jobs (ids or names, comma-separated) finished successfully")
     p.add_argument("--progress-file", help="parse progress from this file instead of the log")
-    p.add_argument("--max-log-mb", type=float, default=MAX_LOG_MB,
-                   help=f"trim the log to its last MB beyond this size (default {MAX_LOG_MB:g}, 0: never)")
+    p.add_argument("--max-log-mb", type=float,
+                   help="cap the log at this size by cutting its middle (default: the max_log_mb setting; 0: never)")
     p.add_argument("--fg", action="store_true", help="stay in the foreground and copy output to stdout")
     p.add_argument("cmd", nargs=argparse.REMAINDER, help="command (a single argument runs through the shell)")
     p.set_defaults(func=cmd_run)
@@ -2337,6 +2474,14 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("clean", help="remove finished jobs older than --days")
     p.add_argument("--days", type=float, default=7)
     p.set_defaults(func=cmd_clean)
+
+    p = sub.add_parser("config", help="show or change settings (stall detection, log cap, auto-clean)",
+                       description="Settings in $JOBRUN_HOME/config.json, shared by every machine that uses the "
+                                   "registry. JOBRUN_<KEY> environment variables take precedence.")
+    p.add_argument("items", nargs="*", metavar="KEY[=VALUE]", help="show KEY, or set it to VALUE")
+    p.add_argument("--unset", action="append", metavar="KEY", help="back to the default")
+    p.add_argument("--json", action="store_true", help="all current values as JSON")
+    p.set_defaults(func=cmd_config)
 
     p = sub.add_parser("edit", help="change name, group, dependencies or progress settings of a job (also running)")
     p.add_argument("id")

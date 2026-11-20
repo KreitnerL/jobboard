@@ -165,16 +165,72 @@ def test_rm_deletes_only_logs_jobrun_wrote(jobrun, tmp_path):
 
 
 def test_log_is_trimmed_and_count_survives_trimming(jobrun):
-    script = ("import time\nfor i in range(30):\n print('completed ' + 'x' * 100000, flush=True); time.sleep(0.05)\n"
+    script = ("import time\nprint('config: lr=0.1', flush=True)\n"
+              "for i in range(30):\n print(f'completed {i} ' + 'x' * 100000, flush=True); time.sleep(0.05)\n"
               "time.sleep(1.5)")
     jobrun("run", "--name", "big", "--max-log-mb", "1", "--count-regex", "^completed", "--total", "30",
            "--", sys.executable, "-c", script)
-    time.sleep(0.8)
-    rows(jobrun)  # count part of the log before it is trimmed
     row = wait_for(jobrun, "big", "done")
-    assert os.path.getsize(row["log"]) < 2 << 20
-    assert "jobrun: log exceeded" in Path(row["log"]).read_text()
-    assert 20 <= row["done"] <= 30  # lines written between two refreshes may be trimmed unseen
+    text = Path(row["log"]).read_text()
+    assert os.path.getsize(row["log"]) <= 1 << 20
+    assert text.startswith("config: lr=0.1\n")  # the start of the log is kept ...
+    assert "MB dropped here" in text and "completed 29 " in text  # ... the middle is cut, the newest part kept
+    assert row["done"] == 30  # the scan reads every line before it is cut
+    assert row["log_dropped"] > 1 << 20
+
+
+def test_trim_log_keeps_head_and_tail_and_offsets_stay_valid(tmp_path, monkeypatch):
+    monkeypatch.setattr(jobrun_module, "JOBS", tmp_path)
+    monkeypatch.setattr(jobrun_module, "TRIM_CHUNK_BYTES", 1000)  # move the tail in many chunks
+    log = tmp_path / "x.log"
+    lines = [f"line {i:05d} ".ljust(99, "x") + "\n" for i in range(1000)]  # 100 kB, 100-byte lines
+    log.write_text("".join(lines))
+    removed = jobrun_module.trim_log("x", str(log), 40_000, 5_000)
+    text = log.read_text()
+    assert text.startswith("".join(lines[:50]))  # the first 5 kB, whole lines
+    assert text.endswith("".join(lines[800:]))  # the newest 20 kB
+    assert "MB dropped here" in text and "line 00500" not in text
+    assert removed == 100_000 - len(text.encode()) == jobrun_module.dropped_bytes("x")
+    # a position read before the trim, past the cut, maps to the same line after it (logical = physical + removed)
+    with open(log, "rb") as handle:
+        handle.seek(900 * 100 - removed)
+        assert handle.readline().decode() == lines[900]
+    assert jobrun_module.trim_log("x", str(log), 40_000, 5_000) == 0  # under the cap now
+
+
+def test_trim_waits_for_the_scan(tmp_path, monkeypatch):
+    monkeypatch.setattr(jobrun_module, "JOBS", tmp_path)
+    log = tmp_path / "y.log"
+    log.write_text("z" * 99 + "\n" * 1 + ("a" * 99 + "\n") * 999)
+    assert jobrun_module.trim_log("y", str(log), 40_000, 5_000, scanned=1000) == 0
+    assert os.path.getsize(log) == 100_000
+
+
+def test_settings_come_from_env_then_config_file_then_default(jobrun, monkeypatch):
+    assert json.loads(jobrun("config", "--json").stdout)["stall_factor"] == 3
+    jobrun("config", "stall_factor=5", "auto_clean_days=30")
+    assert json.loads((jobrun.home / "config.json").read_text()) == {"stall_factor": 5, "auto_clean_days": 30}
+    assert jobrun("config", "stall_factor").stdout.strip() == "5"
+    assert listing(jobrun)["settings"]["stall_factor"] == 5
+    monkeypatch.setenv("JOBRUN_STALL_FACTOR", "7")
+    assert jobrun("config", "stall_factor").stdout.strip() == "7"
+    monkeypatch.delenv("JOBRUN_STALL_FACTOR")
+    jobrun("config", "--unset", "stall_factor")
+    assert json.loads(jobrun("config", "--json").stdout)["stall_factor"] == 3
+    assert jobrun("config", "nope=1", check=False).returncode
+
+
+def test_auto_clean_removes_old_finished_jobs(jobrun):
+    jobrun("run", "--name", "old", "--", "true")
+    wait_for(jobrun, "old", "done")
+    jobrun("config", "auto_clean_days=0.00001")  # about a second
+    time.sleep(1.2)
+    assert rows(jobrun) == {}  # `ls` cleaned
+    assert (jobrun.home / "auto-clean").exists()
+    jobrun("run", "--name", "new", "--", "true")
+    wait_for(jobrun, "new", "done")
+    time.sleep(1.2)
+    assert "new" in rows(jobrun)  # not again within the hour
 
 
 def test_count_mode_reads_large_logs_in_bounded_chunks(tmp_path, monkeypatch):

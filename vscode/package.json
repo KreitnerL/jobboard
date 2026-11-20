@@ -227,41 +227,203 @@
     "configuration": {
       "title": "Job Board",
       "properties": {
+        "jobboard.finishedDays": {
+          "type": "number",
+          "default": 30,
+          "minimum": 0,
+          "order": 1,
+          "markdownDescription": "Show finished jobs of the last N days. Nothing is deleted; see `#jobboard.autoCleanDays#` for that."
+        },
+        "jobboard.notifyOn": {
+          "type": "array",
+          "order": 2,
+          "uniqueItems": true,
+          "default": [
+            "error",
+            "stalled"
+          ],
+          "items": {
+            "type": "string",
+            "enum": [
+              "done",
+              "error",
+              "stopped",
+              "cancelled",
+              "stalled",
+              "logTrimmed"
+            ],
+            "enumDescriptions": [
+              "A job or group finished successfully.",
+              "A job failed (non-zero exit, signal, time limit, out of memory) or its supervisor vanished (lost).",
+              "A job was stopped while running.",
+              "A waiting job was cancelled, e.g. because a dependency failed.",
+              "A running job has made no progress for several average step times (see Stall Factor).",
+              "jobrun cut the middle out of a job's log (see Max Log MB), or a log it does not write grew past that size."
+            ]
+          },
+          "markdownDescription": "Show a notification for these events while a VS Code window is open."
+        },
+        "jobboard.etaFormat": {
+          "type": "string",
+          "enum": [
+            "clock",
+            "remaining",
+            "both"
+          ],
+          "default": "clock",
+          "order": 3,
+          "enumDescriptions": [
+            "ETA 16:40",
+            "ETA in 2h10m",
+            "ETA 16:40 (in 2h10m)"
+          ],
+          "description": "How the expected end time is shown."
+        },
+        "jobboard.rowDetails": {
+          "type": "array",
+          "uniqueItems": true,
+          "order": 4,
+          "default": [
+            "rate",
+            "eta",
+            "lastStep",
+            "elapsed"
+          ],
+          "items": {
+            "type": "string",
+            "enum": [
+              "rate",
+              "eta",
+              "lastStep",
+              "elapsed"
+            ],
+            "enumDescriptions": [
+              "Steps per second, minute or hour.",
+              "Expected end time.",
+              "Time since the last step, next to the average step time (⚠ when stalled).",
+              "Running time."
+            ]
+          },
+          "description": "What a running job's row shows after its progress. Hidden parts stay in the tooltip; a stalled job always shows its last step."
+        },
+        "jobboard.groupBy": {
+          "type": "string",
+          "enum": [
+            "status",
+            "host",
+            "none"
+          ],
+          "default": "status",
+          "order": 5,
+          "enumDescriptions": [
+            "Running and Finished sections.",
+            "One section per machine or Slurm node, running jobs first.",
+            "One list, running jobs first."
+          ],
+          "description": "How the job list is organized."
+        },
+        "jobboard.statusBar": {
+          "type": "string",
+          "enum": [
+            "running",
+            "active",
+            "hidden"
+          ],
+          "default": "running",
+          "order": 6,
+          "enumDescriptions": [
+            "Count running jobs.",
+            "Count running, starting and waiting jobs.",
+            "No status bar item."
+          ],
+          "description": "The job count in the status bar."
+        },
+        "jobboard.diskWarnGB": {
+          "type": "number",
+          "default": 5,
+          "minimum": 0,
+          "order": 7,
+          "description": "Warn at the top of the job list when the disk with the registry or a running job's log has less than this many GB free (0: never)."
+        },
+        "jobboard.stallFactor": {
+          "type": "number",
+          "default": 3,
+          "minimum": 1,
+          "order": 10,
+          "scope": "machine",
+          "markdownDescription": "A running job counts as stalled (⚠) after this many average step times without progress, and at least `#jobboard.stallMinSeconds#`. Stored in the registry's config.json (`jobrun config`), so it applies on every machine that uses the registry, also without VS Code; a JOBRUN_* environment variable takes precedence."
+        },
+        "jobboard.stallMinSeconds": {
+          "type": "number",
+          "default": 60,
+          "minimum": 0,
+          "order": 11,
+          "scope": "machine",
+          "description": "A job counts as stalled only after at least this many seconds without progress. Stored in the registry's config.json (`jobrun config`), so it applies on every machine that uses the registry, also without VS Code; a JOBRUN_* environment variable takes precedence."
+        },
+        "jobboard.maxLogMB": {
+          "type": "number",
+          "default": 512,
+          "minimum": 0,
+          "order": 12,
+          "scope": "machine",
+          "markdownDescription": "Cap for the logs jobrun writes (`jobrun run`). Beyond it jobrun cuts the middle of the log, keeping its start (`#jobboard.logKeepHeadMB#`) and its newest half of this size; the job is not affected. 0: no cap. Logs of Slurm and adopted jobs are only reported. Stored in the registry's config.json (`jobrun config`), so it applies on every machine that uses the registry, also without VS Code; a JOBRUN_* environment variable takes precedence."
+        },
+        "jobboard.logKeepHeadMB": {
+          "type": "number",
+          "default": 16,
+          "minimum": 0,
+          "order": 13,
+          "scope": "machine",
+          "markdownDescription": "Start of a capped log that is always kept (configuration, early warnings); at most a quarter of `#jobboard.maxLogMB#`. Stored in the registry's config.json (`jobrun config`), so it applies on every machine that uses the registry, also without VS Code; a JOBRUN_* environment variable takes precedence."
+        },
+        "jobboard.autoCleanDays": {
+          "type": "number",
+          "default": 0,
+          "minimum": 0,
+          "order": 14,
+          "scope": "machine",
+          "markdownDescription": "**Delete** finished jobs that ended more than this many days ago, with the logs jobrun wrote (logs it only read are kept). Checked at most once an hour. 0: never. Should be longer than `#jobboard.finishedDays#`. Stored in the registry's config.json (`jobrun config`), so it applies on every machine that uses the registry, also without VS Code; a JOBRUN_* environment variable takes precedence."
+        },
         "jobboard.command": {
           "type": "string",
           "default": "",
-          "description": "Path to the jobrun CLI. Empty: ~/.local/bin/jobrun if present, else jobrun on PATH."
+          "description": "Path to the jobrun CLI. Empty: ~/.local/bin/jobrun if present, else jobrun on PATH.",
+          "order": 30
         },
         "jobboard.registry": {
           "type": "string",
           "default": "",
-          "description": "Registry directory (JOBRUN_HOME). Empty: the CLI default ~/.jobs."
+          "description": "Registry directory (JOBRUN_HOME). Empty: the CLI default ~/.jobs.",
+          "order": 31
         },
         "jobboard.refreshSeconds": {
           "type": "number",
           "default": 10,
-          "minimum": 2
-        },
-        "jobboard.finishedDays": {
-          "type": "number",
-          "default": 3,
-          "description": "Show finished jobs of the last N days."
+          "minimum": 2,
+          "description": "Refresh the job list every N seconds while it is visible.",
+          "order": 20
         },
         "jobboard.notifyOnFinish": {
           "type": "boolean",
           "default": true,
-          "description": "Show a notification when a job finishes while this window is open."
+          "description": "Show a notification when a job finishes while this window is open.",
+          "markdownDeprecationMessage": "Use `#jobboard.notifyOn#`.",
+          "deprecationMessage": "Use jobboard.notifyOn.",
+          "order": 40
         },
         "jobboard.updateWhileUnfocused": {
           "type": "boolean",
           "default": false,
-          "description": "Keep redrawing the job list while VS Code is not focused (e.g. watched on a second monitor). Off: the list is redrawn once when the window regains focus; status bar and notifications stay live."
+          "description": "Keep redrawing the job list while VS Code is not focused (e.g. watched on a second monitor). Off: the list is redrawn once when the window regains focus; status bar and notifications stay live.",
+          "order": 20
         },
         "jobboard.resourceSeconds": {
           "type": "number",
           "default": 15,
           "minimum": 5,
-          "description": "Measure CPU, RAM, GPU and VRAM every N seconds while the Resources view is visible; values are means over this interval."
+          "description": "Measure CPU, RAM, GPU and VRAM every N seconds while the Resources view is visible; values are means over this interval.",
+          "order": 20
         }
       }
     },

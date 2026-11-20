@@ -282,7 +282,46 @@ A node's reserved total is Slurm's allocations (all users) plus the budgets of y
 - `jobrun sbatch` writes the Slurm log there too, unless you or the script set `--output`.
 - Removing a job (`rm`, `clean`, or the trash icon) also deletes the logs jobrun **wrote**. Logs it only
   **read**, such as your experiment's own log files, are never deleted.
-- Logs jobrun writes are capped at 512 MB (`--max-log-mb`). Beyond that, only the last 1 MB is kept.
+- Logs jobrun writes are capped at 512 MB (setting `max_log_mb`, or `--max-log-mb` per job). Beyond that, jobrun cuts
+  the **middle** of the log: it keeps the first 16 MB (`log_keep_head_mb`: configuration, early warnings) and the
+  newest 256 MB, with a line saying what was dropped in between. The job is not affected: it keeps writing to the
+  same file, and progress counting sees every line before it is cut. The Job Board shows how much was cut.
+- Logs of Slurm jobs and adopted processes are written by the job itself, so jobrun cannot cap them; the Job Board
+  marks them when they grow past `max_log_mb`.
+
+## Settings
+
+The **VS Code settings** (search for "Job Board") cover the dashboard:
+
+| Setting | Default | |
+|---|---|---|
+| `finishedDays` | 30 | Show finished jobs of the last N days (nothing is deleted) |
+| `notifyOn` | error, stalled | Notifications for: `done`, `error`, `stopped`, `cancelled`, `stalled`, `logTrimmed` |
+| `etaFormat` | clock | `clock` (ETA 16:40), `remaining` (ETA in 2h10m) or `both` |
+| `rowDetails` | all | Which of `rate`, `eta`, `lastStep`, `elapsed` a running job's row shows |
+| `groupBy` | status | `status` (Running / Finished), `host` (one section per machine or Slurm node) or `none` |
+| `statusBar` | running | Count `running` or `active` (also waiting) jobs, or `hidden` |
+| `diskWarnGB` | 5 | Warn when the disk with the registry or a running job's log has less free space |
+| `refreshSeconds` · `resourceSeconds` | 10 · 15 | How often the job list and the Resources view refresh |
+| `updateWhileUnfocused` | off | Keep redrawing while VS Code is not focused (e.g. on a second monitor) |
+| `command` · `registry` | | Path to `jobrun`; registry folder (`JOBRUN_HOME`) |
+
+Settings that jobrun itself uses live in the registry's `config.json`, so they hold on every machine that shares
+the registry, also for jobs started outside VS Code. The VS Code settings `stallFactor`, `stallMinSeconds`,
+`maxLogMB`, `logKeepHeadMB` and `autoCleanDays` write it; `jobrun config` shows and changes it from the terminal:
+
+```bash
+jobrun config                        # all settings, with their source (default, config, env)
+jobrun config auto_clean_days=90     # set; `--unset KEY` goes back to the default
+```
+
+| Key | Default | |
+|---|---|---|
+| `stall_factor` · `stall_min_s` | 3 · 60 | A running job is **stalled** (⚠) after this many average step times without progress, and at least this many seconds |
+| `max_log_mb` · `log_keep_head_mb` | 512 · 16 | Log cap, and the start of the log that is always kept (see [Logs](#logs)) |
+| `auto_clean_days` | 0 (never) | **Delete** finished jobs that ended more than N days ago, with the logs jobrun wrote; checked at most once an hour |
+
+An environment variable `JOBRUN_<KEY>` (e.g. `JOBRUN_AUTO_CLEAN_DAYS=0`) takes precedence over the file.
 
 ## Use with AI coding agents
 
@@ -306,6 +345,7 @@ a sensible progress unit, declares the job's CPU budget, checks `jobrun res` bef
 | `stop ID` / `--group G` | SIGTERM to the whole process tree, then SIGKILL after 10 s; `scancel` for Slurm |
 | `edit ID [options]` | Change name, group, `--after`, stages or progress settings, also while running |
 | `rm ID` · `clean [--days 7]` | Remove from the list (with the logs jobrun wrote) |
+| `config [KEY[=VALUE]]` | Show or change the [settings](#settings) |
 | `demo` | Start three short example jobs |
 | `setup` · `uninstall` | Install or remove the command, the VS Code extension and the agent skill |
 
@@ -322,7 +362,7 @@ nodes show up too.
 - The supervisor also reads the log's new lines every 2 s for stages and progress, so stage times are right even
   when no dashboard is open. For tracked and Slurm jobs, the readers do this.
 - **Readers** (`jobrun ls`, the sidebar every 10 s) work out status and progress: from the pid or heartbeat, from
-  `sacct`, and from the log. Finished jobs are cached. One refresh with 200 jobs takes about 0.06 s of CPU.
+  `sacct`, and from the log. Finished jobs are cached. One refresh with 300 finished jobs takes about 0.25 s.
 - A job whose supervisor disappears without recording an exit (e.g. after a reboot) shows as **lost** instead of
   running forever.
 

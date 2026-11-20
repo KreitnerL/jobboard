@@ -6,6 +6,7 @@ jobs and groups with progress, rate, ETA and elapsed time; open or follow logs; 
 Brings its own copy of the `jobrun` CLI, so it works right after installing: `jobrun` is available in VS Code's
 terminals, and GitHub Copilot gets the jobrun skill. To use `jobrun` in the terminal
 and let your coding agents register their jobs, click **Set Up Terminal and Agents** in the empty Jobs view (or run
-**Job Board: Set Up jobrun for Terminal and Agents**). **Run Demo Jobs** starts a few short example jobs. Settings: `jobboard.command`
-(path to `jobrun`), `jobboard.registry` (`JOBRUN_HOME`), `jobboard.refreshSeconds`, `jobboard.finishedDays`,
-`jobboard.notifyOnFinish`, `jobboard.updateWhileUnfocused` (redraw the list while VS Code is not focused, e.g. on a second monitor; off by default).
+**Job Board: Set Up jobrun for Terminal and Agents**). **Run Demo Jobs** starts a few short example jobs. Settings (search for "Job Board"): which events notify you (`jobboard.notifyOn`: failed or stalled
+jobs by default), how long finished jobs stay in the list, ETA format, row details, grouping by status or machine,
+the status bar count, a low-disk warning, and the settings jobrun itself uses: stall detection, log cap and
+auto-clean. See [Settings](https://github.com/KreitnerL/jobboard#settings).

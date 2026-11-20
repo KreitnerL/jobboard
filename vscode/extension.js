@@ -32,6 +32,54 @@ function config() {
   return vscode.workspace.getConfiguration('jobboard');
 }
 
+// A setting's value only when the user set it (user, remote or workspace settings), else undefined.
+function explicitValue(key) {
+  const inspected = config().inspect(key) || {};
+  return [inspected.workspaceFolderValue, inspected.workspaceValue, inspected.globalValue].find(v => v !== undefined);
+}
+
+// Settings that jobrun itself uses, kept in the registry's config.json so they also hold for jobs started outside
+// VS Code and on other machines: VS Code setting -> `jobrun config` key.
+const SHARED_SETTINGS = {
+  stallFactor: 'stall_factor', stallMinSeconds: 'stall_min_s', maxLogMB: 'max_log_mb', logKeepHeadMB: 'log_keep_head_mb',
+  autoCleanDays: 'auto_clean_days',
+};
+
+// Write the shared settings the user has set; a setting reset in VS Code (event) goes back to jobrun's default.
+// Settings never touched in VS Code are left alone, so a value set with `jobrun config` survives.
+async function syncSharedSettings(event) {
+  const args = [];
+  for (const [key, name] of Object.entries(SHARED_SETTINGS)) {
+    const value = explicitValue(key);
+    if (value !== undefined) args.push(`${name}=${value}`);
+    else if (event && event.affectsConfiguration(`jobboard.${key}`)) args.push('--unset', name);
+  }
+  if (!args.length) return;
+  try {
+    await jobrun(['config', ...args]);
+  } catch (err) {
+    vscode.window.showWarningMessage(`Job Board could not store its settings with jobrun (${err.message}); update jobrun with \`jobrun setup\`.`);
+  }
+}
+
+// Events that notify (jobboard.notifyOn); the old notifyOnFinish: false, if set and notifyOn is not, means none.
+function notifyEvents() {
+  if (explicitValue('notifyOn') === undefined && explicitValue('notifyOnFinish') === false) return new Set();
+  return new Set(config().get('notifyOn') || []);
+}
+
+let jobrunSettings = {};  // the effective jobrun settings, from `jobrun ls --json`
+
+function logBig(job) {
+  return !job.log_owned && jobrunSettings.max_log_mb > 0 && job.log_bytes > jobrunSettings.max_log_mb * 2 ** 20;
+}
+
+function logNote(job) {
+  if (job.log_dropped > 0) return `${bytes(job.log_dropped)} cut from the middle (log cap ${jobrunSettings.max_log_mb || '?'} MB)`;
+  if (logBig(job)) return `${bytes(job.log_bytes)}: larger than the log cap (${jobrunSettings.max_log_mb} MB), which applies only to logs jobrun writes`;
+  return '';
+}
+
 let extensionPath = '';
 
 function onPath(name) {
@@ -85,6 +133,12 @@ function clock(epoch) {
   return `${when.toLocaleDateString([], { weekday: 'short' })} ${time}`;
 }
 
+function eta(epoch) {
+  const left = `in ${duration(Math.max(0, epoch - Date.now() / 1000))}`;
+  const format = config().get('etaFormat');
+  return format === 'remaining' ? `ETA ${left}` : format === 'both' ? `ETA ${clock(epoch)} (${left})` : `ETA ${clock(epoch)}`;
+}
+
 function count(n) {
   if (n == null) return '';
   for (const [suffix, scale] of [['G', 1e9], ['M', 1e6], ['k', 1e3]]) {
@@ -121,14 +175,15 @@ function describe(job) {
   if (!job.jobs && job.status === 'cancelled') return `cancelled: ${job.reason || 'never started'}`;
   if (job.stage) parts.push(`${job.stage_no}/${job.stage_of || '?'} ${job.stage}`);
   if (ACTIVE.has(job.status)) {
+    const show = new Set(config().get('rowDetails') || ['rate', 'eta', 'lastStep', 'elapsed']);
     if (job.fraction != null) parts.push(`${bar(job.fraction)} ${Math.round(job.fraction * 100)}%`, `${count(job.done)}/${count(job.total)}`);
     else if (job.done != null) parts.push(`${count(job.done)} done`);
     else parts.push(job.status);
-    if (job.rate_per_s && !job.finishing) parts.push(rate(job.rate_per_s));
+    if (job.rate_per_s && !job.finishing && show.has('rate')) parts.push(rate(job.rate_per_s));
     if (job.finishing) parts.push('finishing');
-    else if (job.eta) parts.push(`ETA ${clock(job.eta)}`);
-    if (job.idle_s != null) parts.push(lastStep(job));
-    parts.push(duration(job.elapsed_s));
+    else if (job.eta && show.has('eta')) parts.push(eta(job.eta));
+    if (job.idle_s != null && (show.has('lastStep') || job.stalled)) parts.push(lastStep(job));
+    if (show.has('elapsed')) parts.push(duration(job.elapsed_s));
   } else {
     parts.push(job.reason ? `${job.status}: ${job.reason}` : job.status);
     if (job.done != null) parts.push(progressText(job));
@@ -150,7 +205,7 @@ function tooltip(job) {
     ['rate', rate(job.rate_per_s)], ['ETA', job.eta && new Date(job.eta * 1000).toLocaleString()],
     ['last progress', job.progress_at && `${new Date(job.progress_at * 1000).toLocaleString()} (${duration(Date.now() / 1000 - job.progress_at)} ago)`],
     ['average step', job.step_s && duration(job.step_s)],
-    ['cwd', job.cwd], ['log', job.log],
+    ['cwd', job.cwd], ['log', job.log], ['log size', logNote(job)],
     ['after', (job.after_names || []).join(', ')], ['waiting for', (job.waiting_for || []).join(', ')], ['reason', job.reason],
   ];
   for (const [key, value] of rows) if (value) md.appendMarkdown(`${key}: \`${value}\`  \n`);
@@ -203,6 +258,7 @@ class JobsProvider {
       if (Array.isArray(data)) [this.jobs, this.groups] = [data, []];  // jobrun < 0.1
       else if ((data.schema || 1) > JSON_SCHEMA) throw new Error('jobrun is newer than this extension; update the extension');
       else [this.jobs, this.groups] = [data.jobs || [], data.groups || []];
+      jobrunSettings = data.settings || {};
       this.jobs.forEach(normalize);
       this.groups.forEach(normalize);
       this.error = null;
@@ -213,6 +269,7 @@ class JobsProvider {
       this.busy = false;
     }
     this.loaded = true;
+    await this.checkDisks();
     this.updateStatusBar();
     this.render(force);
     if (this.again) {
@@ -231,31 +288,76 @@ class JobsProvider {
     this.render(true);
   }
 
-  // One message per finished ungrouped job, per failed group member, and per finished group.
+  // Messages for the events in jobboard.notifyOn: a job ended (done / error / stopped / cancelled; a group member
+  // that succeeded only through its group's message), started to stall, or had its log cut.
   notify() {
     const seen = this.previous;
-    this.previous = new Map([...this.jobs.map(job => [job.id, job.status]),
-      ...this.groups.map(g => [`group:${g.name}`, g.status])]);
-    if (!seen.size || !config().get('notifyOnFinish')) return;
-    const finished = (key, status) => seen.has(key) && ACTIVE.has(seen.get(key)) && !ACTIVE.has(status);
+    this.previous = new Map([
+      ...this.jobs.map(job => [job.id, { status: job.status, stalled: job.stalled, log: Boolean(logNote(job)) }]),
+      ...this.groups.map(g => [`group:${g.name}`, { status: g.status }])]);
+    const events = notifyEvents();
+    if (!seen.size || !events.size) return;
+    const EVENT = { done: 'done', ended: 'done', error: 'error', lost: 'error', stopped: 'stopped', cancelled: 'cancelled' };
+    const withLog = (show, text, job) => show(text, 'Open Log').then(choice => { if (choice) openLog(job); });
     for (const job of this.jobs) {
-      if (!finished(job.id, job.status) || (job.group && job.status === 'done')) continue;
-      const outcome = job.reason ? `${job.status}: ${job.reason}` : job.status;
-      const text = `Job "${job.name}"${job.group ? ` (${job.group})` : ''} ${outcome}${job.elapsed_s != null ? ` after ${duration(job.elapsed_s)}` : ''}`;
-      const show = job.status === 'done' ? vscode.window.showInformationMessage : vscode.window.showWarningMessage;
-      show(text, 'Open Log').then(choice => { if (choice) openLog(job); });
+      const before = seen.get(job.id);
+      if (!before) continue;
+      const label = `Job "${job.name}"${job.group ? ` (${job.group})` : ''}`;
+      if (ACTIVE.has(before.status) && !ACTIVE.has(job.status) && events.has(EVENT[job.status])
+          && !(job.group && job.status === 'done')) {
+        const outcome = job.reason ? `${job.status}: ${job.reason}` : job.status;
+        withLog(job.status === 'done' ? vscode.window.showInformationMessage : vscode.window.showWarningMessage,
+          `${label} ${outcome}${job.elapsed_s != null ? ` after ${duration(job.elapsed_s)}` : ''}`, job);
+      }
+      if (job.stalled && !before.stalled && events.has('stalled')) {
+        withLog(vscode.window.showWarningMessage, `${label} may hang: no step for ${duration(job.idle_s)} (average step ${duration(job.step_s)})`, job);
+      }
+      if (logNote(job) && !before.log && events.has('logTrimmed')) {
+        withLog(vscode.window.showInformationMessage, `${label}: log ${logNote(job)}`, job);
+      }
     }
     for (const g of this.groups) {
-      if (!finished(`group:${g.name}`, g.status)) continue;
+      const before = seen.get(`group:${g.name}`);
+      if (!before || !ACTIVE.has(before.status) || ACTIVE.has(g.status) || !events.has(g.failed ? 'error' : 'done')) continue;
       const counts = Object.entries(g.counts || {}).map(([status, n]) => `${n} ${status}`).join(', ');
       const text = `Group "${g.name}" finished after ${duration(g.elapsed_s)}: ${counts}`;
       (g.failed ? vscode.window.showWarningMessage : vscode.window.showInformationMessage)(text);
     }
   }
 
+  // Free space on the disks with the registry and with the logs of running jobs (jobboard.diskWarnGB); a message
+  // the first time a disk runs low in this window.
+  async checkDisks() {
+    const limit = (config().get('diskWarnGB') || 0) * 2 ** 30;
+    this.lowDisks = [];
+    if (!limit || !fs.promises.statfs) return;
+    const registry = config().get('registry') || process.env.JOBRUN_HOME || path.join(os.homedir(), '.jobs');
+    const dirs = new Map([[registry, 'registry']]);
+    for (const job of this.jobs) if (ACTIVE.has(job.status) && job.log) dirs.set(path.dirname(job.log), 'logs');
+    const devices = new Map();
+    for (const [dir, what] of dirs) {
+      try {
+        const device = fs.statSync(dir).dev;
+        if (devices.has(device)) { devices.get(device).what.add(what); continue; }
+        const info = await fs.promises.statfs(dir);
+        devices.set(device, { dir, free: info.bavail * info.bsize, what: new Set([what]) });
+      } catch (err) { /* not mounted here (e.g. a Slurm node's local disk) */ }
+    }
+    this.warned = this.warned || new Set();
+    for (const [device, disk] of devices) {
+      if (disk.free >= limit) { this.warned.delete(device); continue; }
+      this.lowDisks.push(disk);
+      if (!this.warned.has(device)) {
+        this.warned.add(device);
+        vscode.window.showWarningMessage(`Low disk space: ${bytes(disk.free)} free on the disk of ${disk.dir} (${[...disk.what].join(', ')}). Jobs may fail to write their output.`);
+      }
+    }
+  }
+
   updateStatusBar() {
-    const running = this.jobs.filter(job => ACTIVE.has(job.status));
-    if (!running.length) return this.statusBar.hide();
+    const mode = config().get('statusBar');
+    const running = this.jobs.filter(job => mode === 'active' ? ACTIVE.has(job.status) : job.status === 'running');
+    if (mode === 'hidden' || !running.length) return this.statusBar.hide();
     this.statusBar.text = `$(pulse) ${running.length} job${running.length > 1 ? 's' : ''}`;
     this.statusBar.tooltip = running.map(job => `${job.name}: ${describe(job)}`).join('\n');
     this.statusBar.show();
@@ -275,19 +377,34 @@ class JobsProvider {
       }
       if (!this.loaded) return [new vscode.TreeItem('Loading…')];
       if (!this.jobs.length) return [];  // shows the welcome content (Run Demo, Set Up) from package.json
-      const entries = [
-        ...this.groups.map(g => ({ ...g, members: this.jobs.filter(job => job.group === g.name) })),
-        ...this.jobs.filter(job => !job.group),
+      const warnings = (this.lowDisks || []).map(diskItem);
+      const entries = (jobs, prefix = '') => [
+        ...this.groups.map(g => ({ ...g, members: jobs.filter(job => job.group === g.name), prefix }))
+          .filter(g => g.members.length),
+        ...jobs.filter(job => !job.group),
       ];
-      const active = entries.filter(e => ACTIVE.has(e.status)).sort((a, b) => b.started - a.started);
-      const finished = entries.filter(e => !ACTIVE.has(e.status))
+      const active = list => list.filter(e => ACTIVE.has(e.status)).sort((a, b) => b.started - a.started);
+      const finished = list => list.filter(e => !ACTIVE.has(e.status))
         .sort((a, b) => (b.ended || b.started) - (a.ended || a.started));
-      return [section('Running', active, true), section('Finished', finished, false)];
+      const grouping = config().get('groupBy');
+      if (grouping === 'none') {
+        const all = entries(this.jobs);
+        return [...warnings, ...entryItems([...active(all), ...finished(all)])];
+      }
+      if (grouping === 'host') {
+        const hosts = [...new Set(this.jobs.map(job => job.host || 'unknown'))];
+        const sections = hosts.map(host => {
+          const list = entries(this.jobs.filter(job => (job.host || 'unknown') === host), `${host}/`);
+          return { host, list: [...active(list), ...finished(list)], busy: active(list).length };
+        }).sort((a, b) => (b.busy > 0) - (a.busy > 0) || a.host.localeCompare(b.host));
+        return [...warnings, ...sections.map(sec => section(sec.host, sec.list, sec.busy > 0, true))];
+      }
+      const all = entries(this.jobs);
+      return [...warnings, section('Running', active(all), true), section('Finished', finished(all), false)];
     }
-    if (element.entries) {
-      const groups = element.entries.filter(e => e.members);
-      return [...groups.map(groupItem), ...dependencyOrder(element.entries.filter(e => !e.members)).map(jobItem)];
-    }
+    if (element.entries) return element.ordered ? entryItems(element.entries) : [
+      ...element.entries.filter(e => e.members).map(groupItem),
+      ...dependencyOrder(element.entries.filter(e => !e.members)).map(jobItem)];
     if (element.group) return dependencyOrder(element.group.members).map(jobItem);
     if (element.job) return [...stageItems(element.job), ...detailItems(element.job)];
     return [];
@@ -323,17 +440,33 @@ function stageItems(job) {
   });
 }
 
-function section(label, entries, expanded) {
+// ordered: keep the entries' order (running first) instead of groups first, then jobs in dependency order
+function section(label, entries, expanded, ordered = false) {
   const item = new vscode.TreeItem(`${label} (${entries.length})`,
     expanded ? vscode.TreeItemCollapsibleState.Expanded : vscode.TreeItemCollapsibleState.Collapsed);
   item.id = `section-${label}`;
   item.entries = entries;
+  item.ordered = ordered;
+  if (ordered) item.iconPath = new vscode.ThemeIcon('server');
+  return item;
+}
+
+function entryItems(entries) {
+  return entries.map(e => e.members ? groupItem(e) : jobItem(e));
+}
+
+function diskItem(disk) {
+  const item = new vscode.TreeItem(`Low disk space: ${bytes(disk.free)} free`);
+  item.id = `disk:${disk.dir}`;
+  item.description = `${disk.dir} (${[...disk.what].join(', ')})`;
+  item.tooltip = `The disk of ${disk.dir} has ${bytes(disk.free)} free, less than jobboard.diskWarnGB. Jobs may fail to write their output.`;
+  item.iconPath = new vscode.ThemeIcon('warning', new vscode.ThemeColor('charts.orange'));
   return item;
 }
 
 function groupItem(group) {
   const item = new vscode.TreeItem(group.name, vscode.TreeItemCollapsibleState.Collapsed);
-  item.id = `group:${group.name}`;
+  item.id = `${group.prefix || ''}group:${group.name}`;
   item.group = group;
   item.description = describe(group);
   const [, color] = ICONS[group.status] || [];
@@ -359,7 +492,8 @@ function detailItems(job) {
   const where = [job.host, job.slurm_id && `slurm ${job.slurm_id}`, job.pid && `pid ${job.pid}`].filter(Boolean).join(', ');
   const details = [
     ['id', job.id, 'tag'], ['after', (job.after_names || []).join(', '), 'debug-step-into'], ['where', where, 'server'], ['started', job.started && new Date(job.started * 1000).toLocaleString(), 'calendar'],
-    ['cmd', job.cmd, 'terminal'], ['cwd', job.cwd, 'folder'], ['log', job.log, 'output'], ['last', job.last_line, 'note'],
+    ['cmd', job.cmd, 'terminal'], ['cwd', job.cwd, 'folder'], ['log', job.log, 'output'], ['log size', logNote(job), 'warning'],
+    ['last', job.last_line, 'note'],
   ];
   return details.filter(([, value]) => value).map(([key, value, icon]) => {
     const item = new vscode.TreeItem(key);
@@ -608,7 +742,7 @@ function activate(context) {
     resourceTimer = setInterval(() => resources.refresh(), Math.max(5, config().get('resourceSeconds')) * 1000);
   };
   schedule();
-  provider.refresh();
+  syncSharedSettings().finally(() => provider.refresh());
   resources.refresh();
   offerSetup(context);
 
@@ -616,8 +750,12 @@ function activate(context) {
     view, resourceView, provider.statusBar, { dispose: () => { clearInterval(timer); clearInterval(resourceTimer); } },
     resourceView.onDidChangeVisibility(event => { if (event.visible) resources.refresh(true); }),
     vscode.commands.registerCommand('jobboard.refreshResources', () => resources.refresh(true)),
-    vscode.workspace.onDidChangeConfiguration(event => {
-      if (event.affectsConfiguration('jobboard')) { schedule(); provider.refresh(); resources.refresh(); }
+    vscode.workspace.onDidChangeConfiguration(async event => {
+      if (!event.affectsConfiguration('jobboard')) return;
+      schedule();
+      if (Object.keys(SHARED_SETTINGS).some(key => event.affectsConfiguration(`jobboard.${key}`))) await syncSharedSettings(event);
+      provider.refresh(true);
+      resources.refresh();
     }),
     view.onDidChangeVisibility(event => { if (event.visible) provider.refresh(true); }),
     vscode.window.onDidChangeWindowState(state => {
