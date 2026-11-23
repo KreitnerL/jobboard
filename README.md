@@ -140,10 +140,14 @@ parallel workers that finish their short items first; on real tuning and rollout
 accurately than the run average or a time window.
 
 **Is it hanging?** Each running job also shows the time since its last step next to the average step time
-(`last step 1h05m ago (avg 14m10s)`; `LAST STEP` in `jobrun ls`). Once that gap exceeds 3 average steps (and at
-least a minute), the job is flagged as stalled: `⚠` and an orange icon in the sidebar, `!` in `jobrun ls`,
-`"stalled": true` in `ls --json`. The average covers the same last 15 steps as the rate, up to the last step. For loops with
-millions of steps, report by time, not per step, so the log stays small:
+(`last step 1h05m ago (avg 14m10s)`; `LAST STEP` in `jobrun ls`). Once that silence is longer than all of 4 average
+steps, twice the longest gap between its recent steps, and 5 minutes, the job is flagged as stalled: `⚠` and an
+orange icon in the sidebar, `!` in `jobrun ls`, `"stalled": true` in `ls --json`, and `jobrun wait --any` returns.
+The average and the gaps cover the same last 15 steps as the rate, up to the last step. The gap term matters for
+jobs whose steps arrive in bursts, such as parallel workers that finish together: their average step is much
+shorter than the usual pause between bursts. Jobs that are waiting, have no timed step yet in the current stage, or
+are past their total ("finishing") are never flagged. For loops with millions of steps, report by time, not per step,
+so the log stays small:
 
 ```python
 if time.monotonic() - last >= 10:
@@ -175,6 +179,23 @@ echo "JOBRUN_STAGE convert 2/2"
 ```
 
 `--stages download,convert` lists planned stages before they are reached.
+
+## Report problems
+
+A job that keeps running although something went wrong (a failed sub-task, a skipped input, a fallback) can say so
+with one line; jobrun cannot see such a failure otherwise:
+
+```bash
+echo "JOBRUN_EVENT error pipeline nu15 failed: see logs/nu15.log"   # Python: print("JOBRUN_EVENT error ...", flush=True)
+echo "JOBRUN_EVENT warn disk almost full, skipping checkpoints"
+```
+
+The level is `error` or `warn` (also `warning`; an optional colon after it is fine), the rest of the line is the
+message. The job is then marked as **degraded**: its message in the sidebar (red or yellow icon while it runs, with
+the newest events in the tooltip), in `jobrun ls` (`[error: pipeline nu15 failed ...]`) and in `ls --json` / `show`
+(`degraded`: the most severe level so far, `events`: the newest five, `event_count`). The status itself stays as it
+is, so the job still ends as done or error. Each new event is a notification (`notifyOn`: `event`) and wakes
+`jobrun wait --any`.
 
 ## Dependencies
 
@@ -225,11 +246,27 @@ dashboards don't keep querying Slurm. Stop uses `scancel`.
 ## Wait for jobs
 
 ```bash
-jobrun wait ID            # or --group G; exits 0 only if everything finished successfully
+jobrun wait ID ID2        # or --group G: until all have ended; exits 0 only if everything finished successfully
+jobrun wait --any ID ID2  # or --group G: until the first of them ends, reports a problem, or stalls
 ```
 
-This is useful in scripts and for agents. Waiting is separate from running: if the waiting shell dies, the job
-keeps running and stays tracked.
+`--any` returns as soon as one of the jobs **ends** (also when one has ended already), reports a new
+**`JOBRUN_EVENT`** ([Report problems](#report-problems)) or starts to **stall**. It prints one line per trigger, then
+the jobs that are still active, and exits 0 only if every trigger is a job that finished successfully (`done`):
+
+```
+261123-c35f  error     tune ilp     33% 1/3 (exit code 3)  after 4m02s
+261123-4c40  running   tune queue   JOBRUN_EVENT error: pipeline nu15 failed
+still active: 261123-6443 261123-4c40
+```
+
+Events and stalls count from the moment `wait --any` starts, so waiting again on the same jobs does not return for
+the same event. Jobs that have ended do: wait again for the ones listed as still active.
+
+Without `--any`, `wait` waits for all jobs, as before; that stays the default because scripts rely on
+`jobrun wait --group G && next-step`, which must not continue after the first job. Agents that watch several jobs
+should use `--any` (or one `wait` per job), so that a crash is reported at once instead of when the last job ends.
+Waiting is separate from running: if the waiting shell dies, the job keeps running and stays tracked.
 
 ## Resources
 
@@ -296,7 +333,7 @@ The **VS Code settings** (search for "Job Board") cover the dashboard:
 | Setting | Default | |
 |---|---|---|
 | `finishedDays` | 30 | Show finished jobs of the last N days (nothing is deleted) |
-| `notifyOn` | error, stalled | Notifications for: `done`, `error`, `stopped`, `cancelled`, `stalled`, `logTrimmed` |
+| `notifyOn` | done, error, stalled, event | Notifications for: `done`, `error`, `stopped`, `cancelled`, `stalled`, `event` (a `JOBRUN_EVENT` line), `logTrimmed` |
 | `etaFormat` | clock | `clock` (ETA 16:40), `remaining` (ETA in 2h10m) or `both` |
 | `rowDetails` | all | Which of `rate`, `eta`, `lastStep`, `elapsed` a running job's row shows |
 | `groupBy` | status | `status` (Running / Finished), `host` (one section per machine or Slurm node) or `none` |
@@ -307,8 +344,8 @@ The **VS Code settings** (search for "Job Board") cover the dashboard:
 | `command` · `registry` | | Path to `jobrun`; registry folder (`JOBRUN_HOME`) |
 
 Settings that jobrun itself uses live in the registry's `config.json`, so they hold on every machine that shares
-the registry, also for jobs started outside VS Code. The VS Code settings `stallFactor`, `stallMinSeconds`,
-`maxLogMB`, `logKeepHeadMB` and `autoCleanDays` write it; `jobrun config` shows and changes it from the terminal:
+the registry, also for jobs started outside VS Code. The VS Code settings `stallFactor`, `stallGapFactor`,
+`stallMinSeconds`, `maxLogMB`, `logKeepHeadMB` and `autoCleanDays` write it; `jobrun config` shows and changes it from the terminal:
 
 ```bash
 jobrun config                        # all settings, with their source (default, config, env)
@@ -317,7 +354,7 @@ jobrun config auto_clean_days=90     # set; `--unset KEY` goes back to the defau
 
 | Key | Default | |
 |---|---|---|
-| `stall_factor` · `stall_min_s` | 3 · 60 | A running job is **stalled** (⚠) after this many average step times without progress, and at least this many seconds |
+| `stall_factor` · `stall_gap_factor` · `stall_min_s` | 4 · 2 · 300 | A running job is **stalled** (⚠) after this many average step times without progress, this many times the longest recent gap between steps (0: ignore gaps), and at least this many seconds |
 | `max_log_mb` · `log_keep_head_mb` | 512 · 16 | Log cap, and the start of the log that is always kept (see [Logs](#logs)) |
 | `auto_clean_days` | 0 (never) | **Delete** finished jobs that ended more than N days ago, with the logs jobrun wrote; checked at most once an hour |
 
@@ -341,7 +378,7 @@ a sensible progress unit, declares the job's CPU budget, checks `jobrun res` bef
 | `ls [--all] [--json]` | List jobs (finished ones from the last 3 days unless `--all`) |
 | `res [--json]` | CPU, RAM, GPU, VRAM per node: used and reserved, per job |
 | `show ID` · `log ID [-f]` | Details as JSON · tail the log |
-| `wait ID` / `--group G` | Block until finished |
+| `wait [--any] ID` / `--group G` | Block until all have ended; `--any`: until one ends, reports a `JOBRUN_EVENT` or stalls |
 | `stop ID` / `--group G` | SIGTERM to the whole process tree, then SIGKILL after 10 s; `scancel` for Slurm |
 | `edit ID [options]` | Change name, group, `--after`, stages or progress settings, also while running |
 | `rm ID` · `clean [--days 7]` | Remove from the list (with the logs jobrun wrote) |
@@ -351,6 +388,17 @@ a sensible progress unit, declares the job's CPU budget, checks `jobrun res` bef
 
 Common options: `--name`, `--group`, `--after`, `--stages`, `--stage-at`, `--log`, `--count-regex`, `--progress-regex`,
 `--total`, and the budget `--cpus`, `--mem`, `--gpus`.
+
+## Log markers
+
+Lines a program can print (anywhere in a line; one per line) to tell jobrun what it is doing:
+
+| Marker | |
+|---|---|
+| `JOBRUN_PROGRESS 246/600` | progress of the current stage ([Progress](#progress)) |
+| `JOBRUN_STAGE convert 2/3` | a new stage begins; `2/3` is optional ([Stages](#stages)) |
+| `JOBRUN_BUDGET cpus=12 mem=96G gpus=1` | what the job has been given, any subset of the keys ([Resources](#resources)) |
+| `JOBRUN_EVENT error <message>` · `JOBRUN_EVENT warn <message>` | a problem while the job keeps running ([Report problems](#report-problems)) |
 
 ## How it works
 

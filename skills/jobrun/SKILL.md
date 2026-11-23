@@ -14,7 +14,7 @@ The user watches all long jobs on a dashboard fed by `jobrun`. A job that is not
 2. Always pass a short, specific `--name` (variant, dataset, N), and `--group "<what> <YYYY-MM-DD>"` for a set of
    related jobs. Use one job per independently running process (e.g. one per tuning variant).
 3. Do not research a program's internals to register it: name + group is enough. Progress is detected
-   automatically (tqdm bars, `[12/100]` counters, `JOBRUN_STAGE` / `JOBRUN_PROGRESS` lines). Add
+   automatically (tqdm bars, `[12/100]` counters, `JOBRUN_STAGE` / `JOBRUN_PROGRESS` lines; problems: `JOBRUN_EVENT`). Add
    `--count-regex '...' --total N` only when the progress line is obvious from the log (e.g. `Trial 7 completed`,
    finishing out of order). A job past its total shows as "finishing"; that is fine.
 4. Multi-step work:
@@ -27,10 +27,22 @@ The user watches all long jobs on a dashboard fed by `jobrun`. A job that is not
    - If a program you will run repeatedly prints no usable progress, propose adding marker lines to its code once
      (`print(f"JOBRUN_PROGRESS {done}/{total}", flush=True)`, throttled to ~10 s in fast loops) instead of
      encoding its internals in regexes.
+   - A program that keeps running when part of its work fails (a queue runner whose sub-pipeline crashed, a skipped
+     input) must say so: `print(f"JOBRUN_EVENT error {message}", flush=True)` (or `warn`). The job is then marked
+     degraded on the dashboard and in `jobrun ls`, the user is notified, and `jobrun wait --any` wakes you. Propose
+     adding such a line where a program only writes a marker file or a log message on failure.
 5. After launching, tell the user the job id (or group). To check on jobs use `jobrun ls` / `jobrun show ID`
    instead of reading logs.
-6. To wait for completion, run `jobrun wait ID` (or `--group G`) in the background; the job keeps running and
-   stays on the dashboard even if the waiting shell dies.
+6. **Always arm a watch right after launching** a job whose result you will report or act on: run
+   `jobrun wait --any ID` as a background command of your own (e.g. Claude Code: Bash with `run_in_background`),
+   so you are woken when it ends, reports a problem (`JOBRUN_EVENT`) or stalls, and report the outcome without
+   being asked. For several jobs, arm one `jobrun wait --any ID` per job or a single
+   `jobrun wait --any ID1 ID2 ...` (or `--any --group G`); never a plain `jobrun wait A B`, which returns only when
+   the last job has ended and so hides an early crash. `--any` prints one line per trigger (the job's new status,
+   the event message, or "stalled") and the jobs still active; exit 0 means only successful ends. Report or act,
+   then arm a new `wait --any` for the jobs still active. A jobrun job is detached and never notifies the session
+   by itself; it keeps running and stays on the dashboard even if the waiting shell dies. If the session cannot
+   run background commands, tell the user that you will not notice the end on your own.
 7. Do not stop or remove jobs you did not start unless the user asks.
 8. Before starting jobs that need many cores, much RAM or a GPU, check `jobrun res`: per node it shows what is
    used and reserved, and each job's used / reserved, so you can size new jobs to what is free.
@@ -49,7 +61,7 @@ jobrun run --name NAME [--group G] [--after JOB] [--stages a,b] -- CMD ...   # d
 jobrun run --fg ...                                                # foreground, output also on stdout
 jobrun sbatch --name NAME [--group G] [--after SLURM_JOB] [--log PATTERN] -- SBATCH_ARGS... SCRIPT
 jobrun track --pid PID [--log FILE] | --slurm ID                   # adopt a running job
-jobrun ls | res | show ID | wait ID | log ID [-f] | edit ID [options] | stop ID | stop --group G | rm ID
+jobrun ls | res | show ID | wait --any ID | log ID [-f] | edit ID [options] | stop ID | stop --group G | rm ID
 ```
 
 Progress options (default: auto-detect tqdm bars `12/100 [`, counters `[12/100]`, `JOBRUN_PROGRESS 12/100`):
@@ -77,8 +89,8 @@ jobrun run --group "wp3 2026-11-02" --name "tune ilp" --after "prepare n100" -- 
 # Slurm
 jobrun sbatch --name "train unet fold0" -- job.sbatch
 
-# Wait in the background, then report
-jobrun wait --group "tuning 2026-11-02"
+# Watch in the background (returns on the first end, JOBRUN_EVENT or stall), report, re-arm for the rest
+jobrun wait --any --group "tuning 2026-11-02"
 ```
 
 If `jobrun` is not on PATH, the job runs unmonitored: say so to the user instead of silently skipping registration,

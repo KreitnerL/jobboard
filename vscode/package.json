@@ -239,8 +239,10 @@
           "order": 2,
           "uniqueItems": true,
           "default": [
+            "done",
             "error",
-            "stalled"
+            "stalled",
+            "event"
           ],
           "items": {
             "type": "string",
@@ -250,6 +252,7 @@
               "stopped",
               "cancelled",
               "stalled",
+              "event",
               "logTrimmed"
             ],
             "enumDescriptions": [
@@ -257,7 +260,8 @@
               "A job failed (non-zero exit, signal, time limit, out of memory) or its supervisor vanished (lost).",
               "A job was stopped while running.",
               "A waiting job was cancelled, e.g. because a dependency failed.",
-              "A running job has made no progress for several average step times (see Stall Factor).",
+              "A running job has made no progress for far longer than usual (see Stall Factor).",
+              "A job reported a problem with a `JOBRUN_EVENT error|warn <message>` log line.",
               "jobrun cut the middle out of a job's log (see Max Log MB), or a log it does not write grew past that size."
             ]
           },
@@ -347,15 +351,23 @@
         },
         "jobboard.stallFactor": {
           "type": "number",
-          "default": 3,
+          "default": 4,
           "minimum": 1,
           "order": 10,
           "scope": "machine",
-          "markdownDescription": "A running job counts as stalled (⚠) after this many average step times without progress, and at least `#jobboard.stallMinSeconds#`. Stored in the registry's config.json (`jobrun config`), so it applies on every machine that uses the registry, also without VS Code; a JOBRUN_* environment variable takes precedence."
+          "markdownDescription": "A running job counts as stalled (⚠) after this many average step times without progress, also more than `#jobboard.stallGapFactor#` times the longest recent gap between steps, and at least `#jobboard.stallMinSeconds#`. Stored in the registry's config.json (`jobrun config`), so it applies on every machine that uses the registry, also without VS Code; a JOBRUN_* environment variable takes precedence."
+        },
+        "jobboard.stallGapFactor": {
+          "type": "number",
+          "default": 2,
+          "minimum": 0,
+          "order": 11,
+          "scope": "machine",
+          "description": "A job counts as stalled only after this many times the longest gap between its recent steps without progress, so jobs whose steps arrive in bursts (parallel workers) are not flagged during their usual pauses. 0: ignore gaps. Stored in the registry's config.json (`jobrun config`), so it applies on every machine that uses the registry, also without VS Code; a JOBRUN_* environment variable takes precedence."
         },
         "jobboard.stallMinSeconds": {
           "type": "number",
-          "default": 60,
+          "default": 300,
           "minimum": 0,
           "order": 11,
           "scope": "machine",

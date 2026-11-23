@@ -21,6 +21,7 @@ const ICONS = {
   lost: ['warning', 'charts.orange'],               // supervisor vanished, outcome unknown
   ended: ['circle-large-outline', undefined],       // tracked process ended, exit code unknown
 };
+const DEGRADED_COLORS = { error: 'charts.red', warn: 'charts.yellow' };  // a running job that reported JOBRUN_EVENT
 const LEGACY_STATUS = { failed: 'error', timeout: 'error', oom: 'error', killed: 'stopped', skipped: 'cancelled', pending: 'waiting' };
 
 function normalize(item) {
@@ -41,7 +42,8 @@ function explicitValue(key) {
 // Settings that jobrun itself uses, kept in the registry's config.json so they also hold for jobs started outside
 // VS Code and on other machines: VS Code setting -> `jobrun config` key.
 const SHARED_SETTINGS = {
-  stallFactor: 'stall_factor', stallMinSeconds: 'stall_min_s', maxLogMB: 'max_log_mb', logKeepHeadMB: 'log_keep_head_mb',
+  stallFactor: 'stall_factor', stallGapFactor: 'stall_gap_factor', stallMinSeconds: 'stall_min_s', maxLogMB: 'max_log_mb',
+  logKeepHeadMB: 'log_keep_head_mb',
   autoCleanDays: 'auto_clean_days',
 };
 
@@ -157,15 +159,25 @@ function progressText(item) {
   return item.total ? `${count(item.done)}/${count(item.total)}` : `${count(item.done)} done`;
 }
 
-// Time since the last step next to the average step time, so a hanging job stands out; ⚠ once it is a
-// few average steps overdue (`stalled`, decided by jobrun).
+// Time since the last step next to the average step time, so a hanging job stands out; ⚠ once it is well
+// overdue (`stalled`, decided by jobrun).
 function lastStep(job) {
   const average = job.step_s ? ` (avg ${duration(job.step_s)})` : '';
   return `${job.stalled ? '⚠ ' : ''}last step ${duration(job.idle_s)} ago${average}`;
 }
 
+// The newest problem a job reported with a JOBRUN_EVENT line (a group: the most severe level among its jobs).
+function eventText(job) {
+  if (!job.degraded) return '';
+  const newest = (job.events || []).slice(-1)[0];
+  if (!newest) return `⚠ ${job.degraded}`;
+  const more = job.event_count > 1 ? ` (+${job.event_count - 1} more)` : '';
+  return `⚠ ${newest.level}: ${newest.message}${more}`;
+}
+
 function describe(job) {
   const parts = [];
+  if (job.degraded) parts.push(eventText(job));
   if (job.jobs) {
     const other = Object.entries(job.counts || {}).filter(([status]) => status !== 'done' && !ACTIVE.has(status))
       .map(([status, n]) => `${n} ${status}`);
@@ -209,7 +221,16 @@ function tooltip(job) {
     ['after', (job.after_names || []).join(', ')], ['waiting for', (job.waiting_for || []).join(', ')], ['reason', job.reason],
   ];
   for (const [key, value] of rows) if (value) md.appendMarkdown(`${key}: \`${value}\`  \n`);
-  if (job.stalled) md.appendMarkdown(`\n*No step for ${duration(job.idle_s)}, several times the average step (${duration(job.step_s)}): the job may hang.*\n\n`);
+  if (job.stalled) md.appendMarkdown(`\n*No step for ${duration(job.idle_s)}, far longer than the average step (${duration(job.step_s)}) and the usual pauses between steps: the job may hang.*\n\n`);
+  if ((job.events || []).length) {
+    md.appendMarkdown(`\n**Reported problems** (JOBRUN_EVENT, ${job.event_count} in total${job.event_count > job.events.length ? `, newest ${job.events.length}` : ''}):\n\n`);
+    for (const event of job.events) {
+      md.appendMarkdown(`- ${event.level}${event.at ? ` at ${new Date(event.at * 1000).toLocaleTimeString()}` : ''}: `);
+      md.appendText(event.message);
+      md.appendMarkdown('\n');
+    }
+    md.appendMarkdown('\n');
+  }
   if (job.finishing) md.appendMarkdown('\n*At or past its total but still running: a final phase the progress pattern does not count, or a too small total.*\n\n');
   if (job.cmd) md.appendCodeblock(job.cmd, 'shell');
   if (job.last_line) md.appendCodeblock(job.last_line, 'text');
@@ -289,11 +310,12 @@ class JobsProvider {
   }
 
   // Messages for the events in jobboard.notifyOn: a job ended (done / error / stopped / cancelled; a group member
-  // that succeeded only through its group's message), started to stall, or had its log cut.
+  // that succeeded only through its group's message), started to stall, reported a problem (JOBRUN_EVENT), or had
+  // its log cut.
   notify() {
     const seen = this.previous;
     this.previous = new Map([
-      ...this.jobs.map(job => [job.id, { status: job.status, stalled: job.stalled, log: Boolean(logNote(job)) }]),
+      ...this.jobs.map(job => [job.id, { status: job.status, stalled: job.stalled, log: Boolean(logNote(job)), events: job.event_count || 0 }]),
       ...this.groups.map(g => [`group:${g.name}`, { status: g.status }])]);
     const events = notifyEvents();
     if (!seen.size || !events.size) return;
@@ -311,6 +333,12 @@ class JobsProvider {
       }
       if (job.stalled && !before.stalled && events.has('stalled')) {
         withLog(vscode.window.showWarningMessage, `${label} may hang: no step for ${duration(job.idle_s)} (average step ${duration(job.step_s)})`, job);
+      }
+      if ((job.event_count || 0) > (before.events || 0) && events.has('event')) {
+        const newest = (job.events || []).slice(-1)[0];
+        const more = job.event_count - (before.events || 0) > 1 ? ` (+${job.event_count - (before.events || 0) - 1} more)` : '';
+        if (newest) withLog(newest.level === 'error' ? vscode.window.showErrorMessage : vscode.window.showWarningMessage,
+          `${label} reported ${newest.level === 'error' ? 'an error' : 'a warning'}: ${newest.message}${more}`, job);
       }
       if (logNote(job) && !before.log && events.has('logTrimmed')) {
         withLog(vscode.window.showInformationMessage, `${label}: log ${logNote(job)}`, job);
@@ -469,7 +497,8 @@ function groupItem(group) {
   item.id = `${group.prefix || ''}group:${group.name}`;
   item.group = group;
   item.description = describe(group);
-  const [, color] = ICONS[group.status] || [];
+  let [, color] = ICONS[group.status] || [];
+  if (group.degraded && ACTIVE.has(group.status)) color = DEGRADED_COLORS[group.degraded];
   item.iconPath = new vscode.ThemeIcon('layers', color && new vscode.ThemeColor(color));
   item.tooltip = `${group.name}: ${group.status}\n${describe(group)}`;
   item.contextValue = ACTIVE.has(group.status) ? 'group-active' : 'group-finished';
@@ -482,7 +511,8 @@ function jobItem(job) {
   item.job = job;
   item.description = describe(job);
   item.tooltip = tooltip(job);
-  const [icon, color] = job.stalled ? ['sync~spin', 'charts.orange'] : ICONS[job.status] || ['circle-outline', undefined];
+  let [icon, color] = job.stalled ? ['sync~spin', 'charts.orange'] : ICONS[job.status] || ['circle-outline', undefined];
+  if (job.degraded && ACTIVE.has(job.status)) color = DEGRADED_COLORS[job.degraded];
   item.iconPath = new vscode.ThemeIcon(icon, color && new vscode.ThemeColor(color));
   item.contextValue = ACTIVE.has(job.status) ? 'job-active' : 'job-finished';
   return item;
