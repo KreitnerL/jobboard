@@ -207,7 +207,7 @@ def test_trim_waits_for_the_scan(tmp_path, monkeypatch):
 
 
 def test_settings_come_from_env_then_config_file_then_default(jobrun, monkeypatch):
-    assert json.loads(jobrun("config", "--json").stdout)["stall_factor"] == 3
+    assert json.loads(jobrun("config", "--json").stdout)["stall_factor"] == 4
     jobrun("config", "stall_factor=5", "auto_clean_days=30")
     assert json.loads((jobrun.home / "config.json").read_text()) == {"stall_factor": 5, "auto_clean_days": 30}
     assert jobrun("config", "stall_factor").stdout.strip() == "5"
@@ -216,7 +216,7 @@ def test_settings_come_from_env_then_config_file_then_default(jobrun, monkeypatc
     assert jobrun("config", "stall_factor").stdout.strip() == "7"
     monkeypatch.delenv("JOBRUN_STALL_FACTOR")
     jobrun("config", "--unset", "stall_factor")
-    assert json.loads(jobrun("config", "--json").stdout)["stall_factor"] == 3
+    assert json.loads(jobrun("config", "--json").stdout)["stall_factor"] == 4
     assert jobrun("config", "nope=1", check=False).returncode
 
 
@@ -287,6 +287,110 @@ def test_wait_blocks_until_done_and_reports_failure(jobrun):
     assert out.returncode == 1
     assert "done" in out.stdout and "error" in out.stdout
     assert jobrun("wait", "ok", "--interval", "0.2").returncode == 0
+
+
+def test_wait_any_returns_when_the_first_job_fails(jobrun):
+    jobrun("run", "--group", "any", "--name", "slow", "--", "sleep 300")
+    jobrun("run", "--group", "any", "--name", "crash", "--", "sleep 0.5; exit 3")
+    started = time.time()
+    out = jobrun("wait", "--any", "--group", "any", "--interval", "0.2", check=False)
+    assert time.time() - started < 20 and out.returncode == 1
+    lines = out.stdout.splitlines()
+    assert "error" in lines[0] and "crash" in lines[0] and "exit code 3" in lines[0]
+    assert lines[-1] == f"still active: {rows(jobrun)['slow']['id']}"
+    out = jobrun("wait", "--any", "crash", "--interval", "0.2", check=False)  # already ended: returns at once
+    assert out.returncode == 1 and "crash" in out.stdout
+
+
+def test_wait_any_exits_0_when_a_job_succeeds(jobrun):
+    jobrun("run", "--name", "quick", "--", "sleep 0.3")
+    jobrun("run", "--name", "slower", "--", "sleep 300")
+    out = jobrun("wait", "--any", "quick", "slower", "--interval", "0.2", check=False)
+    assert out.returncode == 0 and "done" in out.stdout and "still active" in out.stdout
+
+
+def test_event_marker_degrades_the_job_and_wakes_wait_any(jobrun):
+    script = "echo '[1/4] a'; sleep 1; echo 'JOBRUN_EVENT error pipeline nu15 failed'; echo '[2/4] b'; sleep 300"
+    jobrun("run", "--name", "runner", "--", script)
+    out = jobrun("wait", "--any", "runner", "--interval", "0.2", check=False)
+    assert out.returncode == 1
+    assert out.stdout.splitlines()[0].endswith("JOBRUN_EVENT error: pipeline nu15 failed")
+    row = rows(jobrun)["runner"]
+    assert (row["status"], row["degraded"], row["event_count"], row["done"]) == ("running", "error", 1, 2)
+    assert row["events"][0]["message"] == "pipeline nu15 failed" and row["events"][0]["at"]
+    assert "[error: pipeline nu15 failed]" in jobrun("ls").stdout
+    env = dict(os.environ, JOBRUN_HOME=str(jobrun.home))
+    with pytest.raises(subprocess.TimeoutExpired):  # an event seen before the wait started does not wake it
+        subprocess.run([sys.executable, str(JOBRUN), "wait", "--any", "runner", "--interval", "0.2"], env=env,
+                       capture_output=True, timeout=2)
+
+
+def test_event_levels_are_parsed_and_the_most_severe_is_kept(tmp_path):
+    log = tmp_path / "events.log"
+    log.write_text("JOBRUN_EVENT warn disk low\nJOBRUN_EVENT errors are not a level\n\x1b[31mJOBRUN_EVENT ERROR: boom\x1b[0m\n"
+                   "JOBRUN_EVENT warning: slow\n")
+    meta, scan = {"id": "x", "log": str(log), "started": 0.0}, {}
+    jobrun_module.scan_log(meta, scan, 1.0)
+    assert [(e["level"], e["message"]) for e in scan["events"]] == [("warn", "disk low"), ("error", "boom"),
+                                                                     ("warn", "slow")]
+    assert (scan["event_count"], scan["degraded"]) == (3, "error")
+
+
+def test_bursty_steps_are_not_stalled_during_their_usual_pauses(monkeypatch):
+    for key in jobrun_module.SETTINGS:
+        monkeypatch.delenv(f"JOBRUN_{key.upper()}", raising=False)
+    monkeypatch.setattr(jobrun_module, "config_file", lambda: {})
+    stage = jobrun_module._new_stage(None, 0.0)
+    done = 0
+    for burst in range(1, 5):  # 8 parallel workers finish together every 600 s: a mean step of 75 s
+        for _ in range(8):
+            done += 1
+            jobrun_module._set_progress(stage, done, 100, 600.0 * burst)
+    step_s = jobrun_module.step_seconds(stage)
+    assert step_s == pytest.approx(75)
+    assert not jobrun_module.is_stalled(stage, 900.0, step_s)  # 12 mean steps, but well within twice the usual pause
+    assert jobrun_module.is_stalled(stage, 1300.0, step_s)
+    steady = jobrun_module._new_stage(None, 0.0)
+    for step in range(1, 21):  # one step every 10 s: the minimum decides
+        jobrun_module._set_progress(steady, step, 100, 10.0 * step)
+    assert not jobrun_module.is_stalled(steady, 250.0, 10.0) and jobrun_module.is_stalled(steady, 301.0, 10.0)
+
+
+def _shift_scan(home: Path, job_id: str, seconds: float) -> None:
+    """Pretend the job's steps happened `seconds` earlier."""
+    scan_file = next(home.glob(f"jobs/{job_id}.scan*.json"))
+    scan = json.loads(scan_file.read_text())
+    stage = scan["stages"][-1]
+    stage["history"] = [[t - seconds, d] for t, d in stage["history"]]
+    stage["progress_at"] -= seconds
+    scan_file.write_text(json.dumps(scan))
+
+
+def test_wait_any_returns_when_a_job_starts_to_stall(jobrun):
+    jobrun("run", "--name", "hangs", "--count-regex", "completed", "--total", "10", "--",
+           "echo 'Trial 0 completed'; sleep 0.3; echo 'Trial 1 completed'; sleep 300")
+    deadline = time.time() + 10
+    while rows(jobrun).get("hangs", {}).get("done") != 2 and time.time() < deadline:
+        time.sleep(0.2)
+    row = rows(jobrun)["hangs"]
+    assert not row["stalled"]
+    env = dict(os.environ, JOBRUN_HOME=str(jobrun.home))
+    waiter = subprocess.Popen([sys.executable, str(JOBRUN), "wait", "--any", "hangs", "--interval", "0.2"], env=env,
+                              stdout=subprocess.PIPE, text=True)
+    time.sleep(1)
+    _shift_scan(jobrun.home, row["id"], 3600)
+    out, _ = waiter.communicate(timeout=10)
+    assert waiter.returncode == 1 and "stalled: no step for 1h00m" in out
+
+
+def test_finishing_job_is_not_stalled(jobrun):
+    jobrun("run", "--name", "final phase", "--", "echo '[1/2] a'; sleep 0.3; echo '[2/2] b'; sleep 300")
+    deadline = time.time() + 10
+    while rows(jobrun).get("final phase", {}).get("done") != 2 and time.time() < deadline:
+        time.sleep(0.2)
+    _shift_scan(jobrun.home, rows(jobrun)["final phase"]["id"], 3600)
+    row = rows(jobrun)["final phase"]
+    assert row["finishing"] and row["idle_s"] >= 3600 and not row["stalled"]
 
 
 def test_slurm_log_pattern_expansion():

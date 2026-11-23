@@ -57,10 +57,13 @@ RATE_STEPS = 15
 # User settings, in $JOBRUN_HOME/config.json (`jobrun config`, or the Job Board's VS Code settings, which write it):
 # one file for every machine that shares the registry. Environment variables JOBRUN_<KEY> take precedence.
 SETTINGS = {
-    # a running job is "stalled" when its last step is stall_factor average steps ago, and at least stall_min_s:
-    # a hint that it may hang, shown next to the time since the last step
-    "stall_factor": (3.0, "a job is stalled after this many average step times without progress"),
-    "stall_min_s": (60.0, "... and at least this many seconds"),
+    # a running job is "stalled" when its last step is longer ago than all three: stall_factor average steps,
+    # stall_gap_factor times the longest gap between its recent steps, and stall_min_s. A hint that it may hang,
+    # shown next to the time since the last step. The gap term keeps jobs whose steps arrive in bursts (parallel
+    # workers finishing together, a mean step far shorter than the usual pause between bursts) from being flagged.
+    "stall_factor": (4.0, "a job is stalled after this many average step times without progress"),
+    "stall_gap_factor": (2.0, "... and this many times the longest gap between its recent steps (0: ignore gaps)"),
+    "stall_min_s": (300.0, "... and at least this many seconds"),
     # logs jobrun writes: beyond max_log_mb, the middle is cut; the first log_keep_head_mb and the newest
     # max_log_mb / 2 are kept
     "max_log_mb": (512.0, "cap for the logs jobrun writes (0: no cap); beyond it the middle of the log is cut"),
@@ -89,6 +92,10 @@ PROGRESS_PATTERNS = [
 STAGE_MARKER = re.compile(r"JOBRUN_STAGE\s+(?P<name>.+?)(?:\s+(?P<index>\d+)/(?P<of>\d+))?\s*$")
 # "JOBRUN_BUDGET cpus=12 mem=96G gpus=1": what the job has been given from now on (any subset of the keys)
 BUDGET_MARKER = re.compile(r"JOBRUN_BUDGET((?:\s+(?:cpus|mem|gpus)=[\w.]+)+)")
+# "JOBRUN_EVENT error <message>" / "JOBRUN_EVENT warn <message>": a problem the job reports while it keeps running
+EVENT_MARKER = re.compile(r"JOBRUN_EVENT\s+(?P<level>error|warn(?:ing)?)\b:?\s*(?P<message>.*?)\s*$", re.I)
+EVENTS_KEPT = 20  # the newest events kept per job; event_count counts all of them
+EVENT_LEVELS = ("warn", "error")  # in order of severity
 ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 INTERPRETERS = {"uv", "run", "bash", "sh", "srun", "nohup", "env", "time", "exec"}
 SLURM_STATES = {  # sacct state -> (status, reason)
@@ -653,6 +660,22 @@ def step_seconds(stage: dict) -> float | None:
     return (t1 - t0) / (d1 - d0) if d1 > d0 and t1 > t0 else None
 
 
+def longest_gap(stage: dict) -> float:
+    """The longest time between two consecutive progress updates in the rate window (0 when unknown)."""
+    history = stage.get("history") or []
+    return max((b[0] - a[0] for a, b in zip(history, history[1:])), default=0.0)
+
+
+def is_stalled(stage: dict, idle_s: float | None, step_s: float | None) -> bool:
+    """Whether the time since the last step exceeds stall_factor average steps, stall_gap_factor times the longest
+    recent gap and stall_min_s. The average alone flags jobs whose steps arrive in bursts: many steps at once, then
+    a pause several times the mean step."""
+    if not idle_s or not step_s:
+        return False
+    return idle_s > max(setting("stall_factor") * step_s, setting("stall_gap_factor") * longest_gap(stage),
+                        setting("stall_min_s"))
+
+
 def scan_log(meta: dict, scan: dict, now: float, final: bool = False) -> None:
     """Advance over the log's new lines: stage markers, count-mode matches and progress lines (newest wins).
 
@@ -690,6 +713,16 @@ def scan_log(meta: dict, scan: dict, now: float, final: bool = False) -> None:
             stages.append(new)
 
     def handle_line(line: str) -> None:
+        if "JOBRUN_EVENT" in line:
+            marker = EVENT_MARKER.search(ANSI.sub("", line))
+            if marker:
+                level = "warn" if marker["level"].lower().startswith("warn") else "error"
+                scan["event_count"] = scan.get("event_count", 0) + 1
+                events = scan.setdefault("events", [])
+                events.append({"n": scan["event_count"], "level": level, "message": marker["message"][:300], "at": when})
+                del events[:-EVENTS_KEPT]
+                scan["degraded"] = max(level, scan.get("degraded") or level, key=EVENT_LEVELS.index)
+                return
         if "JOBRUN_BUDGET" in line:
             marker = BUDGET_MARKER.search(ANSI.sub("", line))
             if marker:
@@ -848,7 +881,6 @@ def snapshot(meta: dict, slurm: dict) -> dict:
         done=done, total=total, fraction=done / total if done is not None and total else None,
         rate_per_s=rate, eta=eta, last_line=last_log_line(meta), progress_at=current.get("progress_at"),
         step_s=step_s, idle_s=idle_s,
-        stalled=bool(idle_s and step_s and idle_s > max(setting("stall_factor") * step_s, setting("stall_min_s"))),
         # at or past the total but still running: an untracked final phase (or a too small --total)
         finishing=status in ACTIVE and bool(total) and done is not None and done >= total,
         stage=current["name"] if stage_list else None,
@@ -857,6 +889,11 @@ def snapshot(meta: dict, slurm: dict) -> dict:
         stage_of=(current["of"] or len(planned) or None) if stage_list else None,
         stages=stage_list, reason=reason,
     )
+    # a finishing job has no steps left to time its silence against
+    row["stalled"] = not row["finishing"] and is_stalled(current, idle_s, step_s)
+    # problems the job reported itself (JOBRUN_EVENT lines); degraded is the most severe level seen
+    events = scan.get("events") or []
+    row.update(events=events[-5:], event_count=scan.get("event_count", 0), degraded=scan.get("degraded"))
     row["host"] = slurm_info.get("host") or row["host"]
     try:  # the log's size, and what jobrun cut out of a log it writes (see trim_log)
         row["log_bytes"] = os.path.getsize(meta["log"]) if meta.get("log") else None
@@ -887,12 +924,15 @@ def snapshots(metas: list[dict]) -> list[dict]:
     by_id = {r["id"]: r for r in rows}
     now = time.time()
     for row in rows:
-        row.setdefault("after", [])  # final rows cached by older versions lack it
+        row.setdefault("after", [])  # final rows cached by older versions lack these
+        row.setdefault("events", [])
+        row.setdefault("event_count", 0)
+        row.setdefault("degraded", None)
         deps = [d for d in (by_id.get(dep) or snapshot_or_none(dep, slurm) for dep in row["after"]) if d]
         row["after_names"] = [d["name"] for d in deps]
         if row["status"] == "running" and any(d["status"] in ACTIVE for d in deps):
             # registered with --after but started early: the command waits for its dependency by itself
-            row.update(status="waiting", elapsed_s=None, eta=None, rate_per_s=None)
+            row.update(status="waiting", elapsed_s=None, eta=None, rate_per_s=None, idle_s=None, stalled=False)
         if row["status"] == "waiting":
             row["waiting_for"] = [d["name"] + ("" if d["status"] in ACTIVE else f" ({d['status']})")
                                   for d in deps if d["status"] != "done"] or (
@@ -943,6 +983,7 @@ def group_rows(rows: list[dict]) -> list[dict]:
             "eta": max(etas) if etas else None, "started": started, "ended": ended,
             "finishing": bool(active) and all(r.get("finishing") for r in active),
             "stalled": any(r.get("stalled") for r in active),
+            "degraded": max((r["degraded"] for r in jobs if r.get("degraded")), key=EVENT_LEVELS.index, default=None),
             "elapsed_s": (ended or time.time()) - started,
         })
     return groups
@@ -1876,7 +1917,23 @@ def fmt_idle(row: dict) -> str:
     return f"{fmt_duration(row['idle_s'])} ago{average}{' !' if row.get('stalled') else ''}"
 
 
+def fmt_event(row: dict) -> str:
+    """The newest problem the job reported (JOBRUN_EVENT), for a group the most severe level among its jobs."""
+    if not row.get("degraded"):
+        return ""
+    newest = (row.get("events") or [None])[-1]
+    if not newest:
+        return f"[{row['degraded']}]"
+    more = f" (+{row['event_count'] - 1} more)" if row.get("event_count", 0) > 1 else ""
+    return f"[{newest['level']}: {newest['message'][:60]}{more}]"
+
+
 def fmt_progress(row: dict) -> str:
+    text = _fmt_progress(row)
+    return f"{text}  {fmt_event(row)}".strip() if row.get("degraded") else text
+
+
+def _fmt_progress(row: dict) -> str:
     if row.get("status") == "waiting":
         return "waiting for " + ", ".join(row.get("waiting_for") or ["dependencies"])
     if row.get("status") == "cancelled":
@@ -2325,17 +2382,66 @@ def cmd_config(args) -> int:
     return 0
 
 
+def _wait_line(row: dict, detail: str) -> str:
+    return f"{row['id']}  {row['status']:<9} {row['name']}  {detail}".rstrip()
+
+
 def cmd_wait(args) -> int:
-    """Block until the selected jobs finish; exit 0 only if all of them are done."""
-    ids = [m["id"] for m in select(args)]
+    """Block until the selected jobs finish; exit 0 only if all of them are done. With --any, return as soon as
+    one of them ends, reports a new JOBRUN_EVENT or starts to stall; exit 0 only if every trigger is a job that
+    finished successfully."""
+    ids = list(dict.fromkeys(m["id"] for m in select(args)))
+
+    def load() -> dict[str, dict]:
+        return {r["id"]: r for r in snapshots([m for m in (read_json(_file(i, ".json")) for i in ids) if m])}
+
+    if not args.any:
+        while True:
+            rows = list(load().values())
+            if all(r["status"] not in ACTIVE for r in rows):
+                break
+            time.sleep(args.interval)
+        for r in rows:
+            print(_wait_line(r, f"{fmt_progress(r)}  {fmt_duration(r['elapsed_s'])}"))
+        return 0 if rows and all(r["status"] == "done" for r in rows) else 1
+    # events and stalls count from now on, so waiting again on the same jobs does not return for old ones
+    rows = load()
+    baseline = {i: (r.get("event_count", 0), bool(r.get("stalled"))) for i, r in rows.items()}
     while True:
-        rows = snapshots([m for m in (read_json(_file(i, ".json")) for i in ids) if m])
-        if all(r["status"] not in ACTIVE for r in rows):
+        lines, ok = [], True
+        for job_id in ids:
+            row = rows.get(job_id)
+            if row is None:
+                lines.append(f"{job_id}  removed from the registry")
+                ok = False
+                continue
+            seen_events, was_stalled = baseline.get(job_id, (0, False))
+            if row["status"] not in ACTIVE:
+                lines.append(_wait_line(row, f"{fmt_progress(row)}  after {fmt_duration(row['elapsed_s'])}"))
+                ok = ok and row["status"] == "done"
+            new = row.get("event_count", 0) - seen_events
+            if new > 0:
+                shown = [e for e in row.get("events") or [] if e.get("n", 0) > seen_events]
+                for event in shown:
+                    lines.append(_wait_line(row, f"JOBRUN_EVENT {event['level']}: {event['message']}"))
+                if new > len(shown):
+                    lines.append(_wait_line(row, f"... and {new - len(shown)} earlier events (jobrun show {job_id})"))
+                ok = False
+            if row["status"] in ACTIVE and row.get("stalled") and not was_stalled:
+                lines.append(_wait_line(row, f"stalled: no step for {fmt_duration(row['idle_s'])} "
+                                             f"(average step {fmt_duration(row['step_s'])})"))
+                ok = False
+            baseline[job_id] = (baseline.get(job_id, (0, False))[0], bool(row.get("stalled")))
+        if lines:
             break
         time.sleep(args.interval)
-    for r in rows:
-        print(f"{r['id']}  {r['status']:<7} {r['name']}  {fmt_progress(r)}  {fmt_duration(r['elapsed_s'])}".rstrip())
-    return 0 if rows and all(r["status"] == "done" for r in rows) else 1
+        rows = load()
+    for line in lines:
+        print(line)
+    active = [i for i in ids if i in rows and rows[i]["status"] in ACTIVE]
+    if active:
+        print(f"still active: {' '.join(active)}")
+    return 0 if ok else 1
 
 
 def cmd_edit(args) -> int:
@@ -2489,9 +2595,13 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--after", action="append", metavar="JOB", help="replace the dependencies ('' for none)")
     p.set_defaults(func=cmd_edit)
 
-    p = sub.add_parser("wait", help="block until jobs finish (exit 1 if any did not succeed)")
+    p = sub.add_parser("wait", help="block until jobs finish (exit 1 if any did not succeed); --any: until one "
+                                    "ends, reports a JOBRUN_EVENT or stalls")
     p.add_argument("ids", nargs="*")
     p.add_argument("--group", help="all jobs of this group")
+    p.add_argument("--any", action="store_true",
+                   help="return as soon as one job ends, reports a new JOBRUN_EVENT or starts to stall (one line per "
+                        "trigger; exit 0 only if every trigger is a job that finished successfully)")
     p.add_argument("--interval", type=float, default=30, help="seconds between checks (default 30)")
     p.set_defaults(func=cmd_wait)
 
