@@ -475,9 +475,7 @@ python -m pytest -q tests
 cd vscode && npx @vscode/vsce package -o jobboard.vsix && code --install-extension jobboard.vsix
 ```
 
-Packaging the extension bundles `jobrun.py` and the skill into it (`vscode/scripts/bundle.js`). To release, bump
-the version in `jobrun.py`, `pyproject.toml` and `vscode/package.json` (a test checks that they agree) and push a
-tag `vX.Y.Z`: the release workflow publishes `jobboard.vsix` and `install.sh`.
+Packaging the extension bundles `jobrun.py` and the skill into it (`vscode/scripts/bundle.js`).
 
 ## License
 

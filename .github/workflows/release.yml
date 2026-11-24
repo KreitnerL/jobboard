@@ -1,7 +1,8 @@
 name: release
 
 # Push a tag like v0.5.0 (matching VERSION in jobrun.py) to publish a release with the VS Code extension;
-# `jobrun setup` and install.sh download jobboard.vsix from there.
+# `jobrun setup` and install.sh download jobboard.vsix from there. The release text is docs/releases/<tag>.md
+# (written from .github/release-notes-template.md); without that file, GitHub's generated notes are used.
 on:
   push:
     tags: ["v*"]
@@ -31,8 +32,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         # a release made by hand in the GitHub UI (which also pushes the tag) gets the files attached instead
         run: |
+          notes="docs/releases/$GITHUB_REF_NAME.md"
+          if [ -f "$notes" ]; then text=(--notes-file "$notes"); else text=(--generate-notes); fi
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
             gh release upload "$GITHUB_REF_NAME" vscode/jobboard.vsix install.sh --clobber
+            if [ -f "$notes" ]; then gh release edit "$GITHUB_REF_NAME" --notes-file "$notes"; fi
           else
-            gh release create "$GITHUB_REF_NAME" vscode/jobboard.vsix install.sh --title "$GITHUB_REF_NAME" --generate-notes
+            gh release create "$GITHUB_REF_NAME" vscode/jobboard.vsix install.sh --title "$GITHUB_REF_NAME" "${text[@]}"
           fi
