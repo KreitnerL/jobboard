@@ -920,6 +920,13 @@ def test_pool_last_worker_failed_with_items_open_is_an_error():
 
 def test_pool_without_workers_waits_and_stopped_pool_is_stopped():
     assert jobrun_module.pool_row(POOL, [], now=310.0)["status"] == "waiting"
+    # an empty pool can be stopped, and gives up on its own when no worker joins
+    row = jobrun_module.pool_row(POOL, [], now=310.0, stopped=True)
+    assert row["status"] == "stopped" and row["reason"]
+    later = POOL["started"] + jobrun_module.POOL_EMPTY_S + 1
+    row = jobrun_module.pool_row(POOL, [], now=later)
+    assert row["status"] == "cancelled" and "no workers" in row["reason"]
+    assert jobrun_module.pool_row(POOL, [member("m", role="monitor")], now=later)["status"] == "waiting"
     row = jobrun_module.pool_row(POOL, [member("a", "stopped"), member("b", "done")], now=310.0, stopped=True)
     assert (row["status"], row["degraded"]) == ("stopped", None)
 
@@ -948,6 +955,17 @@ def test_pool_workers_report_items_and_the_pool_finishes(jobrun):
     pool_line = next(i for i, l in enumerate(lines) if "queue" in l)
     assert f"2 workers on {socket.gethostname()}" in lines[pool_line] and "100% 6/6" in lines[pool_line] and "└ w" in lines[pool_line + 1]
     assert "6" not in lines[pool_line + 1].split("└")[1].split("done")[0]  # workers show no progress of their own
+
+
+def test_empty_pool_can_be_stopped_and_removed(jobrun):
+    """A pool no worker joined runs nothing: stop marks it stopped, rm removes it without --force."""
+    jobrun("pool", "never joined", "--group", "batch")
+    jobrun("pool", "also empty")
+    assert rows(jobrun)["never joined"]["status"] == "waiting"
+    jobrun("stop", "never joined")
+    assert rows(jobrun)["never joined"]["status"] == "stopped"
+    out = jobrun("rm", "also empty")
+    assert "removed" in out.stdout and "also empty" not in rows(jobrun)
 
 
 def test_pool_with_open_items_warns_and_wait_fails(jobrun):

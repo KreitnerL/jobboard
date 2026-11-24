@@ -596,7 +596,9 @@ function jobItem(job, jobs = []) {
   if (job.pool && job.status === 'running') icon = job.role === 'monitor' ? 'eye' : 'gear~spin';
   item.iconPath = new vscode.ThemeIcon(icon, color && new vscode.ThemeColor(color));
   if (job.kind === 'pool' && job.incomplete) item.iconPath = new vscode.ThemeIcon('warning', new vscode.ThemeColor('charts.yellow'));
-  item.contextValue = `${job.kind === 'pool' ? 'pool' : 'job'}-${ACTIVE.has(job.status) ? 'active' : 'finished'}`;
+  // a pool no job has joined runs nothing: it can be removed at once
+  const empty = job.kind === 'pool' && !(job.workers || []).length && !(job.monitors || []).length;
+  item.contextValue = `${job.kind === 'pool' ? 'pool' : 'job'}-${ACTIVE.has(job.status) && !empty ? 'active' : 'finished'}`;
   return item;
 }
 

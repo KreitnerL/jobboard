@@ -992,6 +992,9 @@ def snapshot_or_none(job_id: str, slurm: dict) -> dict | None:
     return snapshots([meta])[0] if meta.get("kind") == "pool" else snapshot(meta, slurm)
 
 
+POOL_EMPTY_S = 600  # a pool no job joined (e.g. its workers failed to launch) is cancelled after this long
+
+
 def pool_row(meta: dict, members: list[dict], now: float, stopped: bool = False) -> dict:
     """A pool's row from its members' rows (and stopped: `jobrun stop` was called on the pool).
 
@@ -999,7 +1002,8 @@ def pool_row(meta: dict, members: list[dict], now: float, stopped: bool = False)
     JOBRUN_PROGRESS line); without one, the sum of the workers' items (JOBRUN_ITEM) out of the pool's total.
     Members with role "monitor" only report progress; all others are workers. The pool runs while any worker runs;
     a worker that fails is a warning, the pool fails only when no worker succeeded or items are left after a
-    failure. All workers succeeding with items left is a warning too: the count may be stale, or items were skipped.
+    failure. A pool without members waits for its first worker, at most POOL_EMPTY_S; a stopped one is stopped.
+    All workers succeeding with items left is a warning too: the count may be stale, or items were skipped.
     Sets each worker's share of the items on its row.
     """
     workers = [r for r in members if r.get("role") != "monitor"]
@@ -1029,10 +1033,14 @@ def pool_row(meta: dict, members: list[dict], now: float, stopped: bool = False)
     reason, incomplete = None, False
     if active:
         status = next(s for s in ("running", "starting", "waiting", "unknown") if any(r["status"] == s for r in active))
+    elif stopped and (not workers or any(r["status"] == "stopped" for r in workers)):
+        status = "stopped"
+        if not workers:
+            reason = "stopped before any worker joined"
+    elif not members and now - (meta.get("started") or now) > POOL_EMPTY_S:
+        status, reason = "cancelled", f"no workers joined within {fmt_duration(POOL_EMPTY_S)}"
     elif not workers:
         status = "waiting"
-    elif stopped and any(r["status"] == "stopped" for r in workers):
-        status = "stopped"
     else:
         succeeded = [r for r in workers if r["status"] in ("done", "ended")]
         if not succeeded:
@@ -2530,7 +2538,8 @@ def remove(meta: dict, keep_log: bool = False) -> None:
 
 def cmd_rm(args) -> int:
     for meta, row in zip(metas := select(args, missing_ok=True, workers=True), snapshots(metas)):
-        if row["status"] in ACTIVE and not args.force:
+        empty_pool = row.get("kind") == "pool" and not row.get("workers") and not row.get("monitors")
+        if row["status"] in ACTIVE and not args.force and not empty_pool:  # an empty pool has nothing to stop
             print(f"{meta['id']} is {row['status']}; stop it first or pass --force", file=sys.stderr)
             continue
         remove(meta, args.keep_log)

@@ -208,6 +208,7 @@ item. `--item-regex` counts lines of programs that print no markers.
 | all workers ended, list complete | done (with a warning if a worker failed) |
 | all workers ended successfully, items left | done, with a warning: items may be unprocessed, or the count is stale |
 | a worker failed and items are left, or every worker failed | error |
+| no job joined yet | waiting; cancelled after 10 minutes; `stop` or `rm` ends it at once |
 
 `--after POOL` waits for the whole pool, `stop POOL` stops all its workers, `stop WORKER` only that one. `wait`
 treats a pool that ended with items left as unsuccessful (exit 1), and `wait --any POOL` wakes on a worker that
