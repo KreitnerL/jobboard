@@ -11,8 +11,20 @@ The user watches all long jobs on a dashboard fed by `jobrun`. A job that is not
 
 1. Launch every command expected to take more than ~2 minutes through `jobrun`; submit Slurm jobs with
    `jobrun sbatch`. Adopt jobs that are already running with `jobrun track`.
-2. Always pass a short, specific `--name` (variant, dataset, N), and `--group "<what> <YYYY-MM-DD>"` for a set of
-   related jobs. Use one job per independently running process (e.g. one per tuning variant).
+2. Always pass a short, specific `--name` (variant, dataset, N). Use one job per independently running process
+   (e.g. one per tuning variant). Use `--group` only for jobs launched together as **one batch of the same kind**:
+   variants of one sweep, seeds or folds of one config, the configs of one ablation table. The dashboard treats a
+   group as one unit: one row with summed progress and the ETA of its slowest job, one "group finished"
+   notification, and `stop --group` / `wait --group` act on every member. So a job belongs in a group only if the
+   user would want it in that row, that ETA and that stop.
+   - Name the group after the batch, not the project or topic: `"lr sweep 2026-11-24"`,
+     `"seeds resnet50 2026-11-24"`, never `"myproject 2026-11-24"` or `"experiments"`.
+   - **New launch, new group.** Add to an existing group only when the job is a missing member of that same
+     batch: a re-run of a crashed variant, a forgotten seed, a top-up the user would expect under the same row.
+     A follow-up analysis, an evaluation of the batch's results, a re-run with changed settings, or anything
+     launched in a later step of the conversation gets its own group (or none).
+   - If unsure, start a new group. Two rows cost nothing; a mixed row hides the real ETA.
+   - A single job needs no group. Dependent steps (prepare -> train) are a chain (`--after`), not a group.
 3. Do not research a program's internals to register it: name + group is enough. Progress is detected
    automatically (tqdm bars, `[12/100]` counters, `JOBRUN_STAGE` / `JOBRUN_PROGRESS` lines; problems: `JOBRUN_EVENT`). Add
    `--count-regex '...' --total N` only when the progress line is obvious from the log (e.g. `Trial 7 completed`,
@@ -51,7 +63,7 @@ The user watches all long jobs on a dashboard fed by `jobrun`. A job that is not
    Otherwise pass it at launch: `jobrun run --cpus 10 --mem 96G -- …`, or `jobrun edit ID --cpus 10` later.
    A memory cap set via `systemd-run --scope -p MemoryMax=…` is picked up automatically.
 8. To fix a registration (name, group, `--after`, stages, progress options), use `jobrun edit ID ...`; it never
-   touches the running command. For a script that prints no stage markers and cannot be changed while it runs,
+   touches the running command. A job that ended up in the wrong group moves with `jobrun edit ID --group NEW`. For a script that prints no stage markers and cannot be changed while it runs,
    `--stage-at NAME=REGEX` starts stage NAME at the first log line matching REGEX.
 
 ## Commands
@@ -77,14 +89,14 @@ Progress options (default: auto-detect tqdm bars `12/100 [`, counters `[12/100]`
 
 ```bash
 # Tuning sweep: one job per variant, progress = completed trials
-for v in ilp slogs2d smac; do
+for v in small base large; do
   jobrun run --group "tuning 2026-11-02" --name "$v" \
     --count-regex 'Trial \d+ completed' --total 100 -- python tune.py --variant "$v"
 done
 
-# Dataset (two stages printed by the script) -> tuning that needs it
-jobrun run --group "wp3 2026-11-02" --name "prepare n100" -- python prepare.py --n 100
-jobrun run --group "wp3 2026-11-02" --name "tune ilp" --after "prepare n100" -- python tune.py ilp.yml
+# Dataset (two stages printed by the script) -> tuning that needs it: a chain, no group needed
+jobrun run --name "prepare n100" -- python prepare.py --n 100
+jobrun run --name "tune base n100" --after "prepare n100" -- python tune.py base.yml
 
 # Slurm
 jobrun sbatch --name "train unet fold0" -- job.sbatch
