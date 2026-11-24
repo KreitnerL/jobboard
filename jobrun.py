@@ -76,7 +76,7 @@ SETTINGS = {
 RES_MIN_S = float(os.environ.get("JOBRUN_RES_MIN_S", 3))  # `jobrun res` within this many seconds of the last sample returns that sample (several dashboards)
 RES_FIRST_S = 0.5  # without an earlier sample, the means cover this short first interval
 JSON_SCHEMA = 2  # version of `ls --json`; bump on incompatible changes (the VS Code extension checks it)
-VERSION = "0.6.0"  # keep in sync with pyproject.toml and vscode/package.json (tested)
+VERSION = "0.7.0"  # keep in sync with pyproject.toml and vscode/package.json (tested)
 SUPERVISOR_VERSION = 2  # supervisors from 2 on reload edited settings
 ACTIVE = ("starting", "waiting", "running", "unknown")
 # "lost" may recover (NFS hiccup, supervisor between child exit and exit file), so it is never cached.

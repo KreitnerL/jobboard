@@ -1,7 +1,7 @@
 {
   "name": "jobrun",
   "description": "Teaches Claude Code to launch long-running jobs through jobrun, so they show up on the Job Board with progress, rate and ETA. Needs the jobrun command (see the README).",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "author": { "name": "Linus Kreitner" },
   "homepage": "https://github.com/KreitnerL/jobboard",
   "repository": "https://github.com/KreitnerL/jobboard",
