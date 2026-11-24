@@ -25,6 +25,7 @@ The user watches all long jobs on a dashboard fed by `jobrun`. A job that is not
      launched in a later step of the conversation gets its own group (or none).
    - If unsure, start a new group. Two rows cost nothing; a mixed row hides the real ETA.
    - A single job needs no group. Dependent steps (prepare -> train) are a chain (`--after`), not a group.
+     Processes that share one list of work items are a pool (rule 4), not a group.
 3. Do not research a program's internals to register it: name + group is enough. Progress is detected
    automatically (tqdm bars, `[12/100]` counters, `JOBRUN_STAGE` / `JOBRUN_PROGRESS` lines; problems: `JOBRUN_EVENT`). Add
    `--count-regex '...' --total N` only when the progress line is obvious from the log (e.g. `Trial 7 completed`,
@@ -36,6 +37,15 @@ The user watches all long jobs on a dashboard fed by `jobrun`. A job that is not
    - Separate commands that depend on each other: one job each, chained with `--after <id or name>`. Never write
      polling loops (`while pgrep ...`); jobrun waits (status "waiting", no elapsed time), starts the job when the
      dependency succeeded, and marks it "cancelled" if the dependency failed.
+   - Several processes, on one or several hosts (local and/or Slurm), working through one shared list: a **pool**,
+     one job per worker, each launched with `--pool "<list> <YYYY-MM-DD>"`. The dashboard shows the pool as one job
+     with one progress bar, rate and ETA for the whole list; its workers show under it without progress of their
+     own. Progress comes from any member printing `JOBRUN_PROGRESS done/total` for the whole list, or else from
+     workers printing `JOBRUN_ITEM <label>` per finished item, summed against `jobrun pool NAME --total N`. A process
+     that only reports progress joins with `--role monitor`. To add a worker later, launch it with the same `--pool`; move a running
+     job in with `jobrun edit ID --pool P`. `--after P`, `wait --any P` and `stop P` act on the whole pool. A pool
+     whose workers all succeeded with items left ends "done" with a warning: check the list (unprocessed items, or
+     a stale count) before the next step.
    - If a program you will run repeatedly prints no usable progress, propose adding marker lines to its code once
      (`print(f"JOBRUN_PROGRESS {done}/{total}", flush=True)`, throttled to ~10 s in fast loops) instead of
      encoding its internals in regexes.
@@ -70,6 +80,8 @@ The user watches all long jobs on a dashboard fed by `jobrun`. A job that is not
 
 ```bash
 jobrun run --name NAME [--group G] [--after JOB] [--stages a,b] -- CMD ...   # detached; prints id + log
+jobrun run --pool P --name WORKER [--role monitor] -- CMD ...      # worker of pool P (created if new)
+jobrun pool NAME [--group G] [--total N]                           # create a pool explicitly
 jobrun run --fg ...                                                # foreground, output also on stdout
 jobrun sbatch --name NAME [--group G] [--after SLURM_JOB] [--log PATTERN] -- SBATCH_ARGS... SCRIPT
 jobrun track --pid PID [--log FILE] | --slurm ID                   # adopt a running job
@@ -100,6 +112,10 @@ jobrun run --name "tune base n100" --after "prepare n100" -- python tune.py base
 
 # Slurm
 jobrun sbatch --name "train unet fold0" -- job.sbatch
+
+# Pool: workers on this machine and on a Slurm node share one queue; the pool is one row with the list's ETA
+jobrun run    --pool "eval queue 2026-11-24" --name local --cpus 16 -- python worker.py queue.yml
+jobrun sbatch --pool "eval queue 2026-11-24" --name node-b -- worker.sbatch queue.yml
 
 # Watch in the background (returns on the first end, JOBRUN_EVENT or stall), report, re-arm for the rest
 jobrun wait --any --group "tuning 2026-11-02"

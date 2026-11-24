@@ -187,6 +187,26 @@
           "command": "jobboard.removeGroup",
           "when": "view == jobboard.jobs && viewItem == group-finished",
           "group": "3_manage@2"
+        },
+        {
+          "command": "jobboard.stop",
+          "when": "view == jobboard.jobs && viewItem == pool-active",
+          "group": "inline@2"
+        },
+        {
+          "command": "jobboard.remove",
+          "when": "view == jobboard.jobs && viewItem == pool-finished",
+          "group": "inline@2"
+        },
+        {
+          "command": "jobboard.stop",
+          "when": "view == jobboard.jobs && viewItem == pool-active",
+          "group": "3_manage@1"
+        },
+        {
+          "command": "jobboard.remove",
+          "when": "view == jobboard.jobs && viewItem == pool-finished",
+          "group": "3_manage@2"
         }
       ],
       "commandPalette": [

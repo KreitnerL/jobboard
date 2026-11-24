@@ -310,15 +310,15 @@ def test_wait_any_exits_0_when_a_job_succeeds(jobrun):
 
 
 def test_event_marker_degrades_the_job_and_wakes_wait_any(jobrun):
-    script = "echo '[1/4] a'; sleep 1; echo 'JOBRUN_EVENT error pipeline nu15 failed'; echo '[2/4] b'; sleep 300"
+    script = "echo '[1/4] a'; sleep 1; echo 'JOBRUN_EVENT error pipeline case15 failed'; echo '[2/4] b'; sleep 300"
     jobrun("run", "--name", "runner", "--", script)
     out = jobrun("wait", "--any", "runner", "--interval", "0.2", check=False)
     assert out.returncode == 1
-    assert out.stdout.splitlines()[0].endswith("JOBRUN_EVENT error: pipeline nu15 failed")
+    assert out.stdout.splitlines()[0].endswith("JOBRUN_EVENT error: pipeline case15 failed")
     row = rows(jobrun)["runner"]
     assert (row["status"], row["degraded"], row["event_count"], row["done"]) == ("running", "error", 1, 2)
-    assert row["events"][0]["message"] == "pipeline nu15 failed" and row["events"][0]["at"]
-    assert "[error: pipeline nu15 failed]" in jobrun("ls").stdout
+    assert row["events"][0]["message"] == "pipeline case15 failed" and row["events"][0]["at"]
+    assert "[error: pipeline case15 failed]" in jobrun("ls").stdout
     env = dict(os.environ, JOBRUN_HOME=str(jobrun.home))
     with pytest.raises(subprocess.TimeoutExpired):  # an event seen before the wait started does not wake it
         subprocess.run([sys.executable, str(JOBRUN), "wait", "--any", "runner", "--interval", "0.2"], env=env,
@@ -852,3 +852,146 @@ def test_demo_starts_a_group(jobrun):
     assert "jobrun demo" in out
     group = [r for r in listing(jobrun)["jobs"] if r.get("group") == "jobrun demo"]
     assert len(group) == len(jobrun_module.DEMO_JOBS)
+
+
+# ---------------------------------------------------------------- pools
+
+def member(name, status="running", **fields):
+    """A worker row as snapshots() returns it, with only the fields pool_row reads."""
+    row = {"id": f"id-{name}", "name": name, "host": "node-a", "slurm_id": None, "status": status, "reason": None,
+           "started": 100.0, "ended": None if status in jobrun_module.ACTIVE else 200.0, "done": None, "total": None,
+           "rate_per_s": None, "progress_at": None, "idle_s": None, "step_s": None, "stalled": False,
+           "events": [], "event_count": 0, "degraded": None, "items": None, "item_rate": None, "item_label": None,
+           "item_at": None, "item_idle_s": None, "item_stalled": False, "role": None, "budget": None,
+           "last_line": None}
+    row.update(fields)
+    return row
+
+
+POOL = {"id": "pool-1", "name": "queue", "kind": "pool", "group": None, "total": None, "started": 50.0, "cwd": "/"}
+
+
+def test_pool_takes_the_newest_reading_of_the_whole_list_not_the_sum():
+    monitor = member("monitor", role="monitor", done=40, total=100, progress_at=300.0, rate_per_s=0.5)
+    worker = member("w1", done=38, total=100, progress_at=290.0, items=10, item_rate=0.1)
+    row = jobrun_module.pool_row(POOL, [monitor, worker], now=310.0)
+    assert (row["status"], row["done"], row["total"], row["rate_per_s"]) == ("running", 40, 100, 0.5)
+    assert row["eta"] == 310.0 + 60 / 0.5
+    assert (row["workers"], row["active_workers"]) == (["id-w1"], 1)  # the monitor is no worker
+    assert jobrun_module.pool_where(row) == "1 worker + monitor on node-a"
+
+
+def test_pool_sums_worker_items_without_a_reading_and_sets_shares():
+    a = member("a", items=30, item_rate=0.2, host="node-a")
+    b = member("b", items=10, item_rate=0.1, host="node-b")
+    row = jobrun_module.pool_row({**POOL, "total": 100}, [a, b], now=310.0)
+    assert (row["done"], row["total"], round(row["rate_per_s"], 6)) == (40, 100, 0.3)
+    assert row["hosts"] == ["node-a", "node-b"]
+    assert (a["share"], b["share"]) == (0.75, 0.25)
+
+
+def test_pool_failed_worker_degrades_but_the_pool_keeps_running():
+    crashed = member("b", status="error", reason="out of memory", items=3)
+    row = jobrun_module.pool_row(POOL, [member("a", items=5), crashed], now=310.0)
+    assert (row["status"], row["degraded"], row["event_count"]) == ("running", "warn", 1)
+    assert "b" in row["events"][0]["message"] and "out of memory" in row["events"][0]["message"]
+
+
+def test_pool_done_when_the_list_is_complete_even_if_a_worker_failed():
+    row = jobrun_module.pool_row({**POOL, "total": 8}, [member("a", "done", items=5), member("b", "error", items=3)],
+                                 now=310.0)
+    assert (row["status"], row["incomplete"], row["degraded"]) == ("done", False, "warn")
+
+
+def test_pool_all_workers_succeeded_but_items_open_warns():
+    row = jobrun_module.pool_row({**POOL, "total": 10}, [member("a", "done", items=3), member("b", "done", items=3)],
+                                 now=310.0)
+    assert (row["status"], row["incomplete"], row["degraded"]) == ("done", True, "warn")
+    assert "6/10" in row["events"][-1]["message"] and row["reason"]
+
+
+def test_pool_last_worker_failed_with_items_open_is_an_error():
+    row = jobrun_module.pool_row({**POOL, "total": 10}, [member("a", "done", items=3), member("b", "error", items=3)],
+                                 now=310.0)
+    assert row["status"] == "error" and "4 of 10" in row["reason"]
+    row = jobrun_module.pool_row(POOL, [member("a", "error"), member("b", "lost")], now=310.0)
+    assert row["status"] == "error"
+
+
+def test_pool_without_workers_waits_and_stopped_pool_is_stopped():
+    assert jobrun_module.pool_row(POOL, [], now=310.0)["status"] == "waiting"
+    row = jobrun_module.pool_row(POOL, [member("a", "stopped"), member("b", "done")], now=310.0, stopped=True)
+    assert (row["status"], row["degraded"]) == ("stopped", None)
+
+
+def test_pool_stall_follows_the_progress_source():
+    source = member("monitor", role="monitor", done=5, total=10, progress_at=300.0, stalled=True, idle_s=900.0)
+    assert jobrun_module.pool_row(POOL, [source, member("a")], now=310.0)["stalled"]
+    busy = member("b", items=4, item_stalled=False)
+    assert not jobrun_module.pool_row(POOL, [member("a", items=4, item_stalled=True), busy], now=310.0)["stalled"]
+
+
+def test_pool_workers_report_items_and_the_pool_finishes(jobrun):
+    jobrun("pool", "queue", "--total", "6", "--group", "batch")
+    for name in ("w1", "w2"):
+        jobrun("run", "--pool", "queue", "--name", name, "--",
+               "for i in 1 2 3; do echo \"JOBRUN_ITEM case $i\"; sleep 0.2; done")
+    wait_for(jobrun, "queue", "done")
+    data = listing(jobrun)
+    pool = next(r for r in data["jobs"] if r["kind"] == "pool")
+    workers = [r for r in data["jobs"] if r.get("pool") == pool["id"]]
+    assert (pool["done"], pool["total"], pool["incomplete"], pool["group"]) == (6, 6, False, "batch")
+    assert sorted((w["name"], w["items"], w["group"]) for w in workers) == [("w1", 3, None), ("w2", 3, None)]
+    assert workers[0]["item_label"] == "case 3"
+    assert data["groups"][0]["jobs"] == 1  # the pool counts once in its group
+    lines = jobrun("ls").stdout.splitlines()
+    pool_line = next(i for i, l in enumerate(lines) if "queue" in l)
+    assert f"2 workers on {socket.gethostname()}" in lines[pool_line] and "100% 6/6" in lines[pool_line] and "└ w" in lines[pool_line + 1]
+    assert "6" not in lines[pool_line + 1].split("└")[1].split("done")[0]  # workers show no progress of their own
+
+
+def test_pool_with_open_items_warns_and_wait_fails(jobrun):
+    jobrun("run", "--pool", "short", "--name", "w1", "--", "echo 'JOBRUN_PROGRESS 2/5'")
+    out = jobrun("wait", "short", "--interval", "0.2", check=False)
+    assert out.returncode == 1 and "2/5" in out.stdout
+    pool = rows(jobrun)["short"]
+    assert (pool["status"], pool["incomplete"], pool["degraded"]) == ("done", True, "warn")
+
+
+def test_after_a_pool_waits_for_all_workers(jobrun, monkeypatch):
+    monkeypatch.setenv("JOBRUN_WAIT_POLL_S", "0.5")
+    jobrun("run", "--pool", "list", "--name", "fast", "--", "echo JOBRUN_ITEM")
+    jobrun("run", "--pool", "list", "--name", "slow", "--", "sleep 2; echo JOBRUN_ITEM")
+    jobrun("run", "--name", "next", "--after", "list", "--", "true")
+    wait_for(jobrun, "fast", "done")
+    assert rows(jobrun)["next"]["status"] == "waiting"
+    nxt = wait_for(jobrun, "next", "done")
+    assert nxt["started"] >= rows(jobrun)["slow"]["ended"] - 0.5
+
+
+def test_stop_pool_stops_every_worker_and_wait_any_sees_a_crash(jobrun):
+    jobrun("run", "--pool", "busy", "--name", "a", "--", "sleep 300")
+    jobrun("run", "--pool", "busy", "--name", "b", "--", "sleep 300")
+    jobrun("run", "--pool", "busy", "--name", "c", "--", "sleep 2; exit 3")
+    out = jobrun("wait", "--any", "busy", "--interval", "0.2", check=False)
+    assert out.returncode == 1 and "c" in out.stdout and "exit code 3" in out.stdout
+    assert rows(jobrun)["busy"]["status"] == "running"
+    jobrun("stop", "busy", "--grace", "2")
+    found = rows(jobrun)
+    assert (found["a"]["status"], found["b"]["status"], found["busy"]["status"]) == ("stopped", "stopped", "stopped")
+
+
+def test_edit_moves_running_jobs_into_a_pool_that_takes_their_group(jobrun):
+    jobrun("run", "--group", "old", "--name", "watch", "--", "echo 'JOBRUN_PROGRESS 3/9'; sleep 300")
+    jobrun("run", "--group", "old", "--name", "w", "--", "sleep 300")
+    wait_for(jobrun, "w", "running")
+    jobrun("edit", "watch", "--pool", "joined", "--role", "monitor")
+    jobrun("edit", "w", "--pool", "joined")
+    time.sleep(0.5)
+    found = rows(jobrun)
+    pool = found["joined"]
+    assert (pool["group"], pool["done"], pool["total"], pool["workers"]) == ("old", 3, 9, [found["w"]["id"]])
+    assert found["w"]["group"] is None and found["watch"]["role"] == "monitor"
+    assert "└ watch" in (line := next(l for l in jobrun("ls").stdout.splitlines() if "└ watch" in l)) and "monitor" in line
+    jobrun("edit", "w", "--pool", "")
+    assert rows(jobrun)["w"]["pool"] is None

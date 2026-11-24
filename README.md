@@ -18,8 +18,9 @@ the jobs they start show up on the board too. One installer sets up all three ([
   closes, an SSH session drops or an agent's watcher dies.
 - **Resources at a glance.** CPU, RAM, GPU and VRAM per node, and for each job what it uses next to what it
   reserved, so you see how much room is left for the next job.
-- **Groups, stages, dependencies.** Watch a whole sweep at once, see which stage of a pipeline a job is in, and
-  chain jobs so one starts when the other has finished.
+- **Groups, pools, stages, dependencies.** Watch a whole sweep at once, let workers on several nodes share one
+  list as a single job, see which stage of a pipeline a job is in, and chain jobs so one starts when the other has
+  finished.
 - **Tiny.** A single Python file that needs nothing beyond the standard library, plus a VS Code extension
   written in plain JavaScript.
 - **Agent-friendly.** Comes with a skill, so Claude Code, Codex, Cursor or Copilot register every job they start.
@@ -167,6 +168,51 @@ jobrun stop --group "sweep 2026-11-02"
 The sidebar shows one row per group: jobs finished, progress summed over all jobs, combined rate, and the ETA of
 the slowest job. You get one notification when the group finishes, plus one for each job that fails.
 
+## Pools
+
+A pool is one job that several workers work through together: processes on this machine, Slurm jobs on other
+nodes, started at once or added later. The list shows the pool as one row with the progress, rate and ETA of the
+whole list; its workers are listed under it with their status and host, without progress bars of their own.
+
+```bash
+jobrun pool "eval queue 2026-11-24" --total 4500                          # optional: create it first
+jobrun run    --pool "eval queue 2026-11-24" --name local --cpus 24 -- python worker.py queue.yml
+jobrun sbatch --pool "eval queue 2026-11-24" --name node-b -- worker.sbatch queue.yml
+jobrun edit ID --pool "eval queue 2026-11-24"                             # move a running job into the pool
+```
+
+`--pool NAME` joins the newest pool with that name (or id) and creates it if there is none; `jobrun pool NAME`
+always creates a new one. A pool's group (`--group`) belongs to the pool, which counts as one job in it.
+
+```
+ID           STATUS   NAME                  PROGRESS          RATE      ETA        WHERE
+261124-9a0c  running  eval queue            47% 2118/4500     3.19/min  Wed 00:04  2 workers on ws-1, node-b
+261124-0f8c  running    └ local                                                       ws-1
+261124-89f1  running    └ node-b                                                      node-b slurm:360348
+```
+
+**Progress of the list** is the newest reading any member reports: a progress bar, a counter or a
+`JOBRUN_PROGRESS done/total` line about the whole list (not summed: every reading is about the same list). A
+member that only reports, and works on no items, joins with `--role monitor`.
+
+**Without a reading of the whole list**, workers can print `JOBRUN_ITEM [label]` after each finished item; the
+pool's progress is then the sum of these items out of the pool's `--total`, and the label shows as the worker's last
+item. `--item-regex` counts lines of programs that print no markers.
+
+**Status:**
+
+| Situation | Pool |
+|---|---|
+| a worker runs | running |
+| a worker fails while others run | running, with a warning (the others take over its items) |
+| all workers ended, list complete | done (with a warning if a worker failed) |
+| all workers ended successfully, items left | done, with a warning: items may be unprocessed, or the count is stale |
+| a worker failed and items are left, or every worker failed | error |
+
+`--after POOL` waits for the whole pool, `stop POOL` stops all its workers, `stop WORKER` only that one. `wait`
+treats a pool that ended with items left as unsuccessful (exit 1), and `wait --any POOL` wakes on a worker that
+fails. In the sidebar, expand a pool to see its workers with their status, host and last item.
+
 ## Stages
 
 A program announces its phases with one line each; progress, rate and ETA then apply per stage, and the
@@ -186,13 +232,13 @@ A job that keeps running although something went wrong (a failed sub-task, a ski
 with one line; jobrun cannot see such a failure otherwise:
 
 ```bash
-echo "JOBRUN_EVENT error pipeline nu15 failed: see logs/nu15.log"   # Python: print("JOBRUN_EVENT error ...", flush=True)
+echo "JOBRUN_EVENT error pipeline case15 failed: see logs/case15.log"   # Python: print("JOBRUN_EVENT error ...", flush=True)
 echo "JOBRUN_EVENT warn disk almost full, skipping checkpoints"
 ```
 
 The level is `error` or `warn` (also `warning`; an optional colon after it is fine), the rest of the line is the
 message. The job is then marked as **degraded**: its message in the sidebar (red or yellow icon while it runs, with
-the newest events in the tooltip), in `jobrun ls` (`[error: pipeline nu15 failed ...]`) and in `ls --json` / `show`
+the newest events in the tooltip), in `jobrun ls` (`[error: pipeline case15 failed ...]`) and in `ls --json` / `show`
 (`degraded`: the most severe level so far, `events`: the newest five, `event_count`). The status itself stays as it
 is, so the job still ends as done or error. Each new event is a notification (`notifyOn`: `event`) and wakes
 `jobrun wait --any`.
@@ -201,7 +247,7 @@ is, so the job still ends as done or error. Each new event is a notification (`n
 
 ```bash
 jobrun run --name "prepare n100" -- python prepare.py --n 100
-jobrun run --name "tune ilp" --after "prepare n100" -- python tune.py ilp.yml
+jobrun run --name "tune base" --after "prepare n100" -- python tune.py base.yml
 ```
 
 The second job is **waiting** (no elapsed time) until the first one succeeds, then starts; if the first one fails,
@@ -224,7 +270,7 @@ comma-separated. With `jobrun sbatch --after <slurm job>`, Slurm's own `--depend
 ## Changing a running job
 
 ```bash
-jobrun edit ID --name "nu15 pipeline" --group "sweep" --after "nu15 tuning"     # also --after '' to clear
+jobrun edit ID --name "case15 pipeline" --group "sweep" --after "case15 tuning"     # also --after '' to clear
 jobrun edit ID --stages tune,rollout --stage-at 'rollout=JOBRUN_PROGRESS' --count-regex 'Trial \d+ completed' --total 100
 ```
 
@@ -255,8 +301,8 @@ jobrun wait --any ID ID2  # or --group G: until the first of them ends, reports 
 the jobs that are still active, and exits 0 only if every trigger is a job that finished successfully (`done`):
 
 ```
-261123-c35f  error     tune ilp     33% 1/3 (exit code 3)  after 4m02s
-261123-4c40  running   tune queue   JOBRUN_EVENT error: pipeline nu15 failed
+261123-c35f  error     tune base    33% 1/3 (exit code 3)  after 4m02s
+261123-4c40  running   tune queue   JOBRUN_EVENT error: pipeline case15 failed
 still active: 261123-6443 261123-4c40
 ```
 
@@ -373,6 +419,7 @@ a sensible progress unit, declares the job's CPU budget, checks `jobrun res` bef
 | Command | |
 |---|---|
 | `run [--fg] -- CMD` | Run under supervision: detached by default; `--fg` stays in the foreground and also prints the output |
+| `pool NAME` | Create a [pool](#pools); workers join it with `--pool` on `run`, `sbatch`, `track` or `edit` |
 | `sbatch -- ARGS` | Submit with `sbatch` and track |
 | `track --pid PID` / `--slurm ID` | Adopt a running process or Slurm job; a process's log is detected from its stdout |
 | `ls [--all] [--json]` | List jobs (finished ones from the last 3 days unless `--all`) |
@@ -386,8 +433,8 @@ a sensible progress unit, declares the job's CPU budget, checks `jobrun res` bef
 | `demo` | Start three short example jobs |
 | `setup` · `uninstall` | Install or remove the command, the VS Code extension and the agent skill |
 
-Common options: `--name`, `--group`, `--after`, `--stages`, `--stage-at`, `--log`, `--count-regex`, `--progress-regex`,
-`--total`, and the budget `--cpus`, `--mem`, `--gpus`.
+Common options: `--name`, `--group`, `--pool`, `--role`, `--after`, `--stages`, `--stage-at`, `--log`, `--count-regex`,
+`--progress-regex`, `--item-regex`, `--total`, and the budget `--cpus`, `--mem`, `--gpus`.
 
 ## Log markers
 
@@ -399,6 +446,7 @@ Lines a program can print (anywhere in a line; one per line) to tell jobrun what
 | `JOBRUN_STAGE convert 2/3` | a new stage begins; `2/3` is optional ([Stages](#stages)) |
 | `JOBRUN_BUDGET cpus=12 mem=96G gpus=1` | what the job has been given, any subset of the keys ([Resources](#resources)) |
 | `JOBRUN_EVENT error <message>` · `JOBRUN_EVENT warn <message>` | a problem while the job keeps running ([Report problems](#report-problems)) |
+| `JOBRUN_ITEM [label]` | a pool's worker finished one item of the shared list ([Pools](#pools)) |
 
 ## How it works
 

@@ -175,7 +175,34 @@ function eventText(job) {
   return `⚠ ${newest.level}: ${newest.message}${more}`;
 }
 
-function describe(job) {
+// A pool's workers: how many run, on how many hosts, and how many failed.
+// A pool's members: running workers (all while none runs), monitors, the machines the workers run on, failures.
+function workersText(pool, jobs) {
+  const members = jobs.filter(job => job.pool === pool.id && job.role !== 'monitor');
+  const failed = members.filter(job => ['error', 'lost'].includes(job.status)).length;
+  const n = pool.active_workers || members.length;
+  const monitors = (pool.monitors || []).length;
+  const hosts = pool.hosts || [];
+  const where = hosts.length > 3 ? ` on ${hosts.length} hosts` : hosts.length ? ` on ${hosts.join(', ')}` : '';
+  const monitor = monitors === 1 ? ' + monitor' : monitors ? ` + ${monitors} monitors` : '';
+  return `${n} worker${n === 1 ? '' : 's'}${monitor}${where}${failed ? ` · ${failed} failed` : ''}`;
+}
+
+// A pool's worker: where it runs and what it does; the one progress bar is on the pool's row.
+function describeWorker(job) {
+  const parts = [];
+  if (job.degraded) parts.push(eventText(job));
+  if (job.status === 'waiting') return `waiting for ${(job.waiting_for || []).join(', ') || 'dependencies'}`;
+  parts.push(job.reason ? `${job.status}: ${job.reason}` : job.status);
+  if (job.role === 'monitor') parts.push('monitor');
+  parts.push([job.host, job.slurm_id && `slurm ${job.slurm_id}`].filter(Boolean).join(' '));
+  if (job.item_label && ACTIVE.has(job.status)) parts.push(`last: ${job.item_label}`);
+  parts.push(duration(job.elapsed_s));
+  return parts.filter(Boolean).join(' · ');
+}
+
+function describe(job, jobs = []) {
+  if (job.pool) return describeWorker(job);
   const parts = [];
   if (job.degraded) parts.push(eventText(job));
   if (job.jobs) {
@@ -183,6 +210,7 @@ function describe(job) {
       .map(([status, n]) => `${n} ${status}`);
     parts.push(`${job.finished}/${job.jobs} jobs${other.length ? ` (${other.join(', ')})` : ''}`);
   }
+  if (job.kind === 'pool') parts.push(workersText(job, jobs));
   if (!job.jobs && job.status === 'waiting') return `waiting for ${(job.waiting_for || []).join(', ') || 'dependencies'}`;
   if (!job.jobs && job.status === 'cancelled') return `cancelled: ${job.reason || 'never started'}`;
   if (job.stage) parts.push(`${job.stage_no}/${job.stage_of || '?'} ${job.stage}`);
@@ -207,7 +235,8 @@ function describe(job) {
 
 function tooltip(job) {
   const md = new vscode.MarkdownString();
-  const where = [job.host, job.slurm_id && `slurm ${job.slurm_id}`, job.pid && `pid ${job.pid}`].filter(Boolean).join(', ');
+  const where = job.kind === 'pool' ? (job.hosts || []).join(', ')
+    : [job.host, job.slurm_id && `slurm ${job.slurm_id}`, job.pid && `pid ${job.pid}`].filter(Boolean).join(', ');
   md.appendMarkdown(`$(${(ICONS[job.status] || ['circle-outline'])[0].split('~')[0]}) **${job.name}** — ${job.status}\n\n`);
   md.supportThemeIcons = true;
   const rows = [
@@ -219,6 +248,8 @@ function tooltip(job) {
     ['average step', job.step_s && duration(job.step_s)],
     ['cwd', job.cwd], ['log', job.log], ['log size', logNote(job)],
     ['after', (job.after_names || []).join(', ')], ['waiting for', (job.waiting_for || []).join(', ')], ['reason', job.reason],
+    ['workers', job.kind === 'pool' && `${job.active_workers} running of ${(job.workers || []).length}${(job.monitors || []).length ? `, ${job.monitors.length} monitor` : ''}`],
+    ['last item', job.item_label],
   ];
   for (const [key, value] of rows) if (value) md.appendMarkdown(`${key}: \`${value}\`  \n`);
   if (job.stalled) md.appendMarkdown(`\n*No step for ${duration(job.idle_s)}, far longer than the average step (${duration(job.step_s)}) and the usual pauses between steps: the job may hang.*\n\n`);
@@ -231,6 +262,8 @@ function tooltip(job) {
     }
     md.appendMarkdown('\n');
   }
+  if (job.incomplete) md.appendMarkdown(`\n*All workers ended, but the list is at ${job.done}/${job.total}. Check whether items were left unprocessed, or whether the count is stale.*\n\n`);
+  if (job.pool) md.appendMarkdown('\n*Worker of a pool: the progress, rate and ETA of the whole list are on the pool\'s row.*\n\n');
   if (job.finishing) md.appendMarkdown('\n*At or past its total but still running: a final phase the progress pattern does not count, or a too small total.*\n\n');
   if (job.cmd) md.appendCodeblock(job.cmd, 'shell');
   if (job.last_line) md.appendCodeblock(job.last_line, 'text');
@@ -320,11 +353,16 @@ class JobsProvider {
     const events = notifyEvents();
     if (!seen.size || !events.size) return;
     const EVENT = { done: 'done', ended: 'done', error: 'error', lost: 'error', stopped: 'stopped', cancelled: 'cancelled' };
-    const withLog = (show, text, job) => show(text, 'Open Log').then(choice => { if (choice) openLog(job); });
+    const withLog = (show, text, job) => job.log ? show(text, 'Open Log').then(choice => { if (choice) openLog(job); }) : show(text);
+    const pools = new Set(this.jobs.filter(job => job.kind === 'pool').map(job => job.id));
     for (const job of this.jobs) {
       const before = seen.get(job.id);
       if (!before) continue;
-      const label = `Job "${job.name}"${job.group ? ` (${job.group})` : ''}`;
+      const label = `${job.kind === 'pool' ? 'Pool' : 'Job'} "${job.name}"${job.group ? ` (${job.group})` : ''}`;
+      if (pools.has(job.pool)) {  // its end, failure, stall and events reach the user through its pool's row
+        if (logNote(job) && !before.log && events.has('logTrimmed')) withLog(vscode.window.showInformationMessage, `${label}: log ${logNote(job)}`, job);
+        continue;
+      }
       if (ACTIVE.has(before.status) && !ACTIVE.has(job.status) && events.has(EVENT[job.status])
           && !(job.group && job.status === 'done')) {
         const outcome = job.reason ? `${job.status}: ${job.reason}` : job.status;
@@ -384,10 +422,10 @@ class JobsProvider {
 
   updateStatusBar() {
     const mode = config().get('statusBar');
-    const running = this.jobs.filter(job => mode === 'active' ? ACTIVE.has(job.status) : job.status === 'running');
+    const running = this.jobs.filter(job => job.kind !== 'pool' && (mode === 'active' ? ACTIVE.has(job.status) : job.status === 'running'));
     if (mode === 'hidden' || !running.length) return this.statusBar.hide();
     this.statusBar.text = `$(pulse) ${running.length} job${running.length > 1 ? 's' : ''}`;
-    this.statusBar.tooltip = running.map(job => `${job.name}: ${describe(job)}`).join('\n');
+    this.statusBar.tooltip = running.map(job => `${job.name}: ${describe(job, this.jobs)}`).join('\n');
     this.statusBar.show();
   }
 
@@ -406,6 +444,9 @@ class JobsProvider {
       if (!this.loaded) return [new vscode.TreeItem('Loading…')];
       if (!this.jobs.length) return [];  // shows the welcome content (Run Demo, Set Up) from package.json
       const warnings = (this.lowDisks || []).map(diskItem);
+      // a pool's workers are listed under the pool
+      const pools = new Set(this.jobs.filter(job => job.kind === 'pool').map(job => job.id));
+      const top = this.jobs.filter(job => !pools.has(job.pool));
       const entries = (jobs, prefix = '') => [
         ...this.groups.map(g => ({ ...g, members: jobs.filter(job => job.group === g.name), prefix }))
           .filter(g => g.members.length),
@@ -416,24 +457,31 @@ class JobsProvider {
         .sort((a, b) => (b.ended || b.started) - (a.ended || a.started));
       const grouping = config().get('groupBy');
       if (grouping === 'none') {
-        const all = entries(this.jobs);
-        return [...warnings, ...entryItems([...active(all), ...finished(all)])];
+        const all = entries(top);
+        return [...warnings, ...entryItems([...active(all), ...finished(all)], this.jobs)];
       }
       if (grouping === 'host') {
-        const hosts = [...new Set(this.jobs.map(job => job.host || 'unknown'))];
+        const hostOf = job => job.kind === 'pool' ? 'pools' : job.host || 'unknown';
+        const hosts = [...new Set(top.map(hostOf))];
         const sections = hosts.map(host => {
-          const list = entries(this.jobs.filter(job => (job.host || 'unknown') === host), `${host}/`);
+          const list = entries(top.filter(job => hostOf(job) === host), `${host}/`);
           return { host, list: [...active(list), ...finished(list)], busy: active(list).length };
         }).sort((a, b) => (b.busy > 0) - (a.busy > 0) || a.host.localeCompare(b.host));
         return [...warnings, ...sections.map(sec => section(sec.host, sec.list, sec.busy > 0, true))];
       }
-      const all = entries(this.jobs);
+      const all = entries(top);
       return [...warnings, section('Running', active(all), true), section('Finished', finished(all), false)];
     }
-    if (element.entries) return element.ordered ? entryItems(element.entries) : [
-      ...element.entries.filter(e => e.members).map(groupItem),
-      ...dependencyOrder(element.entries.filter(e => !e.members)).map(jobItem)];
-    if (element.group) return dependencyOrder(element.group.members).map(jobItem);
+    const item = job => jobItem(job, this.jobs);
+    if (element.entries) return element.ordered ? entryItems(element.entries, this.jobs) : [
+      ...element.entries.filter(e => e.members).map(g => groupItem(g, this.jobs)),
+      ...dependencyOrder(element.entries.filter(e => !e.members)).map(item)];
+    if (element.group) return dependencyOrder(element.group.members).map(item);
+    if (element.job && element.job.kind === 'pool') {
+      const members = dependencyOrder(this.jobs.filter(job => job.pool === element.job.id));
+      const monitor = job => job.role === 'monitor';
+      return [...members.filter(monitor), ...members.filter(job => !monitor(job))].map(item);  // details: tooltip
+    }
     if (element.job) return [...stageItems(element.job), ...detailItems(element.job)];
     return [];
   }
@@ -479,8 +527,8 @@ function section(label, entries, expanded, ordered = false) {
   return item;
 }
 
-function entryItems(entries) {
-  return entries.map(e => e.members ? groupItem(e) : jobItem(e));
+function entryItems(entries, jobs) {
+  return entries.map(e => e.members ? groupItem(e, jobs) : jobItem(e, jobs));
 }
 
 function diskItem(disk) {
@@ -492,34 +540,38 @@ function diskItem(disk) {
   return item;
 }
 
-function groupItem(group) {
+function groupItem(group, jobs) {
   const item = new vscode.TreeItem(group.name, vscode.TreeItemCollapsibleState.Collapsed);
   item.id = `${group.prefix || ''}group:${group.name}`;
   item.group = group;
-  item.description = describe(group);
+  item.description = describe(group, jobs);
   let [, color] = ICONS[group.status] || [];
   if (group.degraded && ACTIVE.has(group.status)) color = DEGRADED_COLORS[group.degraded];
   item.iconPath = new vscode.ThemeIcon('layers', color && new vscode.ThemeColor(color));
-  item.tooltip = `${group.name}: ${group.status}\n${describe(group)}`;
+  item.tooltip = `${group.name}: ${group.status}\n${describe(group, jobs)}`;
   item.contextValue = ACTIVE.has(group.status) ? 'group-active' : 'group-finished';
   return item;
 }
 
-function jobItem(job) {
+function jobItem(job, jobs = []) {
   const item = new vscode.TreeItem(job.name, vscode.TreeItemCollapsibleState.Collapsed);
   item.id = job.id;
   item.job = job;
-  item.description = describe(job);
+  item.description = describe(job, jobs);
   item.tooltip = tooltip(job);
   let [icon, color] = job.stalled ? ['sync~spin', 'charts.orange'] : ICONS[job.status] || ['circle-outline', undefined];
   if (job.degraded && ACTIVE.has(job.status)) color = DEGRADED_COLORS[job.degraded];
+  // a pool's members while they run: a gear for workers, an eye for monitors, so they read as parts of the pool
+  if (job.pool && job.status === 'running') icon = job.role === 'monitor' ? 'eye' : 'gear~spin';
   item.iconPath = new vscode.ThemeIcon(icon, color && new vscode.ThemeColor(color));
-  item.contextValue = ACTIVE.has(job.status) ? 'job-active' : 'job-finished';
+  if (job.kind === 'pool' && job.incomplete) item.iconPath = new vscode.ThemeIcon('warning', new vscode.ThemeColor('charts.yellow'));
+  item.contextValue = `${job.kind === 'pool' ? 'pool' : 'job'}-${ACTIVE.has(job.status) ? 'active' : 'finished'}`;
   return item;
 }
 
 function detailItems(job) {
-  const where = [job.host, job.slurm_id && `slurm ${job.slurm_id}`, job.pid && `pid ${job.pid}`].filter(Boolean).join(', ');
+  const where = job.kind === 'pool' ? (job.hosts || []).join(', ')
+    : [job.host, job.slurm_id && `slurm ${job.slurm_id}`, job.pid && `pid ${job.pid}`].filter(Boolean).join(', ');
   const details = [
     ['id', job.id, 'tag'], ['after', (job.after_names || []).join(', '), 'debug-step-into'], ['where', where, 'server'], ['started', job.started && new Date(job.started * 1000).toLocaleString(), 'calendar'],
     ['cmd', job.cmd, 'terminal'], ['cwd', job.cwd, 'folder'], ['log', job.log, 'output'], ['log size', logNote(job), 'warning'],
@@ -583,7 +635,8 @@ function shareItem(id, job, used, reserved, fmt, extra) {
     (r ? `reserved: ${cores(r.cpus)} CPUs · ${bytes(r.mem)} RAM · ${cores(r.gpus)} GPU\nfrom: ${r.source.split('+').map(k => SOURCES[k] || k).join(', ')}`
       : 'No budget: not a Slurm job, no JOBRUN_BUDGET line or --cpus/--mem/--gpus, no cgroup limit.') +
     (job.kind === 'slurm' ? '\nUsage from sstat.' : '\nRAM is the resident memory of its processes (shared pages count once per process).');
-  item.iconPath = new vscode.ThemeIcon(fraction != null && fraction > 0.9 ? 'warning' : 'sync~spin',
+  const running = job.pool ? (job.role === 'monitor' ? 'eye' : 'gear~spin') : 'sync~spin';  // as in the Jobs view
+  item.iconPath = new vscode.ThemeIcon(fraction != null && fraction > 0.9 ? 'warning' : running,
     new vscode.ThemeColor(fraction != null && fraction > 0.9 ? 'charts.orange' : 'charts.blue'));
   return item;
 }
@@ -824,13 +877,14 @@ function activate(context) {
       return run(['rm', '--group', item.group.name]);
     }),
     vscode.commands.registerCommand('jobboard.stop', async item => {
-      const choice = await vscode.window.showWarningMessage(
-        `Stop "${item.job.name}" (${item.job.slurm_id ? `slurm ${item.job.slurm_id}` : `pid ${item.job.pid}`})?`,
-        { modal: true }, 'Stop', 'Kill now');
+      const running = provider.jobs.filter(job => job.pool === item.job.id && ACTIVE.has(job.status)).length;
+      const what = item.job.kind === 'pool' ? `pool "${item.job.name}" with its ${running} running worker${running === 1 ? '' : 's'}`
+        : `"${item.job.name}" (${item.job.slurm_id ? `slurm ${item.job.slurm_id}` : `pid ${item.job.pid}`})`;
+      const choice = await vscode.window.showWarningMessage(`Stop ${what}?`, { modal: true }, 'Stop', 'Kill now');
       if (choice) run(['stop', item.job.id, ...(choice === 'Kill now' ? ['--force'] : [])], `Stopped ${item.job.name}`);
     }),
     vscode.commands.registerCommand('jobboard.remove', item => {
-      provider.drop(job => job.id === item.job.id);
+      provider.drop(job => job.id === item.job.id || (job.pool === item.job.id && !ACTIVE.has(job.status)));
       return run(['rm', item.job.id]);
     }),
     vscode.commands.registerCommand('jobboard.clean', async () => {

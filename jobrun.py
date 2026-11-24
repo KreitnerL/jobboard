@@ -14,6 +14,9 @@ The registry is a directory of small files ($JOBRUN_HOME, default ~/.jobs):
 Progress is parsed from the job's log, so commands need no changes. Recognised by default:
 tqdm bars ("412/1000 [01:23<..."), bracketed counters ("[412/1000] ...") and explicit
 "JOBRUN_PROGRESS 412/1000" lines. Stdlib only, so it runs under any python3 >= 3.8.
+
+A pool (kind "pool") is a job without a process of its own: several workers, on any hosts, work through one shared
+list. Workers are ordinary jobs whose metadata names the pool; the pool's row is computed from theirs (pool_row).
 """
 from __future__ import annotations
 
@@ -96,6 +99,8 @@ BUDGET_MARKER = re.compile(r"JOBRUN_BUDGET((?:\s+(?:cpus|mem|gpus)=[\w.]+)+)")
 EVENT_MARKER = re.compile(r"JOBRUN_EVENT\s+(?P<level>error|warn(?:ing)?)\b:?\s*(?P<message>.*?)\s*$", re.I)
 EVENTS_KEPT = 20  # the newest events kept per job; event_count counts all of them
 EVENT_LEVELS = ("warn", "error")  # in order of severity
+# "JOBRUN_ITEM [label]": the worker that prints it finished one item of its pool's shared list
+ITEM_MARKER = re.compile(r"JOBRUN_ITEM\b(?:\s+(?P<label>.*?))?\s*$")
 ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 INTERPRETERS = {"uv", "run", "bash", "sh", "srun", "nohup", "env", "time", "exec"}
 SLURM_STATES = {  # sacct state -> (status, reason)
@@ -698,6 +703,7 @@ def scan_log(meta: dict, scan: dict, now: float, final: bool = False) -> None:
     patterns = [re.compile(meta["progress_regex"])] if meta.get("progress_regex") else PROGRESS_PATTERNS
     default_total = meta.get("total")
     rules = [(name, re.compile(rule)) for name, rule in meta.get("stage_rules") or []]
+    item_rule = re.compile(meta["item_regex"]) if meta.get("item_regex") else None
     # Catching up on a log that was written long before this first scan (`jobrun edit`, a tracked job): the times
     # of the stage changes in it are unknown, so they are recorded as None rather than as now.
     backfill = not scan.get("offset") and now - (meta.get("started") or now) > 60
@@ -713,6 +719,14 @@ def scan_log(meta: dict, scan: dict, now: float, final: bool = False) -> None:
             stages.append(new)
 
     def handle_line(line: str) -> None:
+        item = ITEM_MARKER.search(ANSI.sub("", line)) if "JOBRUN_ITEM" in line else None
+        if item or (item_rule and item_rule.search(line)):  # one item of a pool's list, counted per worker
+            items = scan.get("items") or _new_stage("items", meta.get("started") or now)
+            _set_progress(items, (items["done"] or 0) + 1, None, when)
+            items["label"] = (item["label"] or None) if item else ANSI.sub("", line).strip()[:200]
+            scan["items"] = items
+            if item:
+                return
         if "JOBRUN_EVENT" in line:
             marker = EVENT_MARKER.search(ANSI.sub("", line))
             if marker:
@@ -867,7 +881,8 @@ def snapshot(meta: dict, slurm: dict) -> dict:
     step_s = step_seconds(current) if status in ACTIVE else None
     # time since the last step, or since the stage began when it has no step yet
     since = current.get("progress_at") or (current.get("started") if done is None and len(stages) > 1 else None)
-    idle_s = now - since if status == "running" and since else None
+    # the supervisor may record a step after `now` was taken: never a negative time since it
+    idle_s = max(0.0, now - since) if status == "running" and since else None
     planned = meta.get("stages") or []
     stage_list = stage_rows(meta, stages, status, ended)
     row = {key: meta.get(key) for key in ("id", "name", "group", "kind", "host", "slurm_id", "pid", "cwd", "log")}
@@ -894,6 +909,14 @@ def snapshot(meta: dict, slurm: dict) -> dict:
     # problems the job reported itself (JOBRUN_EVENT lines); degraded is the most severe level seen
     events = scan.get("events") or []
     row.update(events=events[-5:], event_count=scan.get("event_count", 0), degraded=scan.get("degraded"))
+    # a pool's worker: the items it finished itself (JOBRUN_ITEM, --item-regex), their rate and the last one
+    items = scan.get("items")
+    item_idle = now - items["progress_at"] if items and items.get("progress_at") and status == "running" else None
+    row.update(pool=meta.get("pool"), role=meta.get("role"), items=items["done"] if items else None,
+               item_rate=stage_rate(items, now, started) if items and status in ACTIVE else None,
+               item_label=items.get("label") if items else None, item_at=items.get("progress_at") if items else None,
+               item_idle_s=item_idle,
+               item_stalled=bool(items) and status == "running" and is_stalled(items, item_idle, step_seconds(items)))
     row["host"] = slurm_info.get("host") or row["host"]
     try:  # the log's size, and what jobrun cut out of a log it writes (see trim_log)
         row["log_bytes"] = os.path.getsize(meta["log"]) if meta.get("log") else None
@@ -910,6 +933,10 @@ def snapshot(meta: dict, slurm: dict) -> dict:
 
 
 def snapshots(metas: list[dict]) -> list[dict]:
+    """Rows in the order of metas. Pools are computed from their workers' rows, loaded as needed."""
+    order = [m["id"] for m in metas]
+    pools = [m for m in metas if m.get("kind") == "pool"]
+    metas = [m for m in metas if m.get("kind") != "pool"]
     open_slurm = [m for m in metas
                   if m.get("kind") == "slurm" and not (read_json(_file(m["id"], ".state.json"), {}) or {}).get("final")]
     for meta in open_slurm:
@@ -928,6 +955,9 @@ def snapshots(metas: list[dict]) -> list[dict]:
         row.setdefault("events", [])
         row.setdefault("event_count", 0)
         row.setdefault("degraded", None)
+        for key in ("pool", "role", "items", "item_rate", "item_label", "item_at", "item_idle_s"):
+            row.setdefault(key, None)
+        row.setdefault("item_stalled", False)
         deps = [d for d in (by_id.get(dep) or snapshot_or_none(dep, slurm) for dep in row["after"]) if d]
         row["after_names"] = [d["name"] for d in deps]
         if row["status"] == "running" and any(d["status"] in ACTIVE for d in deps):
@@ -945,12 +975,115 @@ def snapshots(metas: list[dict]) -> list[dict]:
             start = max(d["ended"] or 0 for d in deps)  # time spent waiting is not part of the job's runtime
             if start > (row["started"] or 0):
                 row["started"], row["elapsed_s"] = start, (row["ended"] or now) - start
-    return rows
+    if pools:
+        ids = {p["id"] for p in pools}
+        extra = [m for m in load_jobs() if m.get("pool") in ids and m["id"] not in by_id and m.get("kind") != "pool"]
+        workers = rows + (snapshots(extra) if extra else [])
+        for pool in pools:
+            by_id[pool["id"]] = pool_row(pool, [r for r in workers if r.get("pool") == pool["id"]], time.time(),
+                                         _file(pool["id"], ".stopped").exists())
+    return [by_id[job_id] for job_id in order]
 
 
 def snapshot_or_none(job_id: str, slurm: dict) -> dict | None:
     meta = read_json(_file(job_id, ".json"))
-    return snapshot(meta, slurm) if meta else None
+    if not meta:
+        return None
+    return snapshots([meta])[0] if meta.get("kind") == "pool" else snapshot(meta, slurm)
+
+
+def pool_row(meta: dict, members: list[dict], now: float, stopped: bool = False) -> dict:
+    """A pool's row from its members' rows (and stopped: `jobrun stop` was called on the pool).
+
+    Progress is the newest reading of the whole list that any member reports (a progress bar, counter or
+    JOBRUN_PROGRESS line); without one, the sum of the workers' items (JOBRUN_ITEM) out of the pool's total.
+    Members with role "monitor" only report progress; all others are workers. The pool runs while any worker runs;
+    a worker that fails is a warning, the pool fails only when no worker succeeded or items are left after a
+    failure. All workers succeeding with items left is a warning too: the count may be stale, or items were skipped.
+    Sets each worker's share of the items on its row.
+    """
+    workers = [r for r in members if r.get("role") != "monitor"]
+    active = [r for r in workers if r["status"] in ACTIVE]
+    readings = [r for r in members if r.get("done") is not None and r.get("total")]
+    source = max(readings, key=lambda r: (r.get("progress_at") or 0, r["done"])) if readings else None
+    counted = [r for r in workers if r.get("items") is not None]
+    items = sum(r["items"] for r in counted) if counted else None
+    for r in workers:
+        r["share"] = r["items"] / items if items and r.get("items") is not None else None
+    done, total = (source["done"], source["total"]) if source else (items, meta.get("total"))
+    live = source if source and source["status"] in ACTIVE else None
+    item_rate = sum(r.get("item_rate") or 0 for r in active) or None
+    rate = ((live or {}).get("rate_per_s") or item_rate) if active else None
+    open_items = bool(total) and done is not None and done < total
+    starts = [r["started"] for r in members if r.get("started")]
+    started = min(starts) if starts else meta.get("started") or now
+    ended = max(r.get("ended") or r.get("started") or now for r in workers) if workers and not active else None
+    events = [{**e, "message": f"{r['name']}: {e['message']}"} for r in members for e in r.get("events") or []]
+    if not stopped:
+        for r in members:
+            if r["status"] in ("error", "lost"):
+                cause = f"{r['status']}: {r['reason']}" if r.get("reason") else r["status"]
+                what = "monitor" if r.get("role") == "monitor" else "worker"
+                events.append({"level": "warn", "at": r.get("ended"),
+                               "message": f"{what} {r['name']} on {r.get('host') or '?'} ended ({cause})"})
+    reason, incomplete = None, False
+    if active:
+        status = next(s for s in ("running", "starting", "waiting", "unknown") if any(r["status"] == s for r in active))
+    elif not workers:
+        status = "waiting"
+    elif stopped and any(r["status"] == "stopped" for r in workers):
+        status = "stopped"
+    else:
+        succeeded = [r for r in workers if r["status"] in ("done", "ended")]
+        if not succeeded:
+            status = next(s for s in ("error", "lost", "stopped", "cancelled") if any(r["status"] == s for r in workers))
+        elif open_items and len(succeeded) < len(workers):
+            status, reason = "error", f"no workers left; {total - done} of {total} items open"
+        else:
+            status = "done" if any(r["status"] == "done" for r in succeeded) else "ended"
+            if open_items:
+                incomplete, reason = True, f"all workers ended at {done}/{total}"
+                events.append({"level": "warn", "at": ended, "message":
+                               f"all workers ended, but progress is {done}/{total}: items may be unprocessed, or the "
+                               f"count is stale; check the list"})
+    events.sort(key=lambda e: e.get("at") or 0)
+    hidden = sum(r.get("event_count") or 0 for r in members) - sum(len(r.get("events") or []) for r in members)
+    events = [{**e, "n": hidden + i + 1} for i, e in enumerate(events)]
+    levels = [e["level"] for e in events] + [r["degraded"] for r in members if r.get("degraded")]
+    if live:
+        stalled, idle_s, step_s = bool(live.get("stalled")), live.get("idle_s"), live.get("step_s")
+        idle_s = max(0.0, idle_s) if idle_s is not None else None
+    else:
+        counting = [r for r in active if r.get("items")]
+        idles = [r["item_idle_s"] for r in counting if r.get("item_idle_s") is not None]
+        stalled = bool(counting) and all(r.get("item_stalled") for r in counting)
+        idle_s, step_s = (min(idles) if idles else None), None
+    finishing = bool(active) and bool(total) and done is not None and done >= total
+    newest = max((r for r in workers if r.get("item_at")), key=lambda r: r["item_at"], default=None)
+    last_line = (f"{newest['name']}: {newest['item_label']}" if newest and newest.get("item_label")
+                 else (source or {}).get("last_line"))
+    waiting_for = [w for r in active if r["status"] == "waiting" for w in r.get("waiting_for") or []]
+    return {
+        "id": meta["id"], "name": meta.get("name"), "group": meta.get("group"), "kind": "pool", "host": None,
+        "slurm_id": None, "pid": None, "cwd": meta.get("cwd"), "log": None, "budget": None, "log_owned": False,
+        "after": [], "after_names": [], "cmd": "", "status": status, "exit_code": None, "started": started,
+        "ended": ended, "elapsed_s": None if status == "waiting" else (ended or now) - started,
+        "done": done, "total": total, "fraction": done / total if done is not None and total else None,
+        "rate_per_s": rate, "eta": now + (total - done) / rate if rate and open_items and active else None,
+        "last_line": last_line,
+        "progress_at": max([r.get("progress_at") or 0 for r in members] + [r.get("item_at") or 0 for r in members],
+                           default=0) or None,
+        "step_s": step_s, "idle_s": idle_s if status == "running" else None, "finishing": finishing,
+        "stage": None, "stage_no": None, "stage_of": None, "stages": [], "reason": reason,
+        "stalled": stalled and status == "running" and not finishing,
+        "events": events[-5:], "event_count": hidden + len(events),
+        "degraded": max(levels, key=EVENT_LEVELS.index) if levels else None,
+        "log_bytes": None, "log_dropped": 0, "pool": None, "role": None, "items": items,
+        "item_rate": item_rate if active else None, "workers": [r["id"] for r in workers],
+        "monitors": [r["id"] for r in members if r.get("role") == "monitor"], "active_workers": len(active),
+        "hosts": sorted({r["host"] for r in (active or workers) if r.get("host")}), "incomplete": incomplete,
+        **({"waiting_for": waiting_for or ["workers"]} if status == "waiting" else {}),
+    }
 
 
 def group_rows(rows: list[dict]) -> list[dict]:
@@ -1354,6 +1487,7 @@ def resources(rows: list[dict]) -> dict:
             if len(on) > 1:  # Slurm reports a multi-node job as a whole
                 usage = {k: (v / len(on) if isinstance(v, float) and k != "gpu_util" else v) for k, v in usage.items()}
             members.append({"id": r["id"], "name": r["name"], "group": r.get("group"), "kind": r.get("kind"),
+                            "pool": r.get("pool"), "role": r.get("role"),
                             "measured": r["id"] in jobs_usage, **usage,
                             "reserved": job_reservation(r, reservations.get(str(r.get("slurm_id"))), limits.get(r["id"]))})
         node["jobs"] = members
@@ -1928,6 +2062,18 @@ def fmt_event(row: dict) -> str:
     return f"[{newest['level']}: {newest['message'][:60]}{more}]"
 
 
+def pool_where(row: dict) -> str:
+    """"2 workers + monitor on ws-1, node-b": the pool's workers (running ones while any run), its monitors, and the
+    machines its workers run on."""
+    n, monitors, hosts = row["active_workers"] or len(row["workers"]), len(row.get("monitors") or []), row["hosts"]
+    text = f"{n} worker{'s' * (n != 1)}"
+    if monitors:
+        text += " + monitor" if monitors == 1 else f" + {monitors} monitors"
+    if hosts:
+        text += f" on {', '.join(hosts)}" if len(hosts) <= 3 else f" on {len(hosts)} hosts"
+    return text
+
+
 def fmt_progress(row: dict) -> str:
     text = _fmt_progress(row)
     return f"{text}  {fmt_event(row)}".strip() if row.get("degraded") else text
@@ -1938,6 +2084,9 @@ def _fmt_progress(row: dict) -> str:
         return "waiting for " + ", ".join(row.get("waiting_for") or ["dependencies"])
     if row.get("status") == "cancelled":
         return row.get("reason") or "never started"
+    if row.get("pool"):  # a pool's worker: the list's progress is on the pool's row only
+        reason = f" ({row['reason']})" if row.get("reason") else ""
+        return f"monitor{reason}" if row.get("role") == "monitor" else reason.strip()
     stage = ""
     if row.get("stage"):
         stage = f"[{row['stage_no']}/{row['stage_of'] or '?'} {row['stage']}] "
@@ -1996,9 +2145,57 @@ def parse_budget(text: str) -> dict:
 
 
 def progress_options(args) -> dict:
-    return {"budget": budget(args), "group": args.group, "progress_regex": args.progress_regex, "count_regex": args.count_regex,
-            "total": args.total, "stages": [s.strip() for s in args.stages.split(",")] if args.stages else None,
-            "stage_rules": stage_rules(args.stage_at)}
+    options = {"budget": budget(args), "group": args.group, "progress_regex": args.progress_regex,
+               "count_regex": args.count_regex, "item_regex": args.item_regex, "total": args.total,
+               "stages": [s.strip() for s in args.stages.split(",")] if args.stages else None,
+               "stage_rules": stage_rules(args.stage_at), "role": None if args.role in (None, "worker") else args.role}
+    if args.pool:  # the group belongs to the pool, which shows as one job in it
+        options.update(pool=join_pool(args.pool, args.group), group=None)
+    return options
+
+
+def find_pool(key: str) -> dict | None:
+    """The pool with this id, else the newest pool with this name."""
+    pools = [m for m in load_jobs() if m.get("kind") == "pool"]
+    hits = [m for m in pools if m["id"] == key] or [m for m in pools if m.get("name") == key]
+    return hits[-1] if hits else None
+
+
+def create_pool(name: str, group: str | None, total: int | None) -> dict:
+    meta = {"id": allocate_id(), "name": name, "kind": "pool", "group": group or None, "total": total,
+            "started": time.time(), "host": HOST, "cwd": os.getcwd()}
+    write_json(_file(meta["id"], ".json"), meta)
+    return meta
+
+
+def join_pool(key: str, group: str | None, inherit: str | None = None) -> str:
+    """The id of the pool named key (id or name), created when there is none. group: the pool's group, which
+    must match an existing pool's; inherit: a group for a pool that has none (a job moved into the pool)."""
+    pool = find_pool(key)
+    if pool is None:
+        pool = create_pool(key, group or inherit, None)
+        print(f"jobrun: new pool {pool['id']}  {key}", file=sys.stderr)
+        return pool["id"]
+    if group and pool.get("group") not in (None, group):
+        sys.exit(f"jobrun: pool {key!r} is in group {pool['group']!r}; leave out --group (workers take their "
+                 f"pool's group) or use another pool")
+    if not pool.get("group") and (group or inherit):
+        pool = update_meta(pool["id"], group=group or inherit)
+    workers = sum(m.get("pool") == pool["id"] and m.get("role") != "monitor" for m in load_jobs())
+    print(f"jobrun: joining pool {pool['id']}  {pool['name']} ({workers} workers so far, created "
+          f"{fmt_duration(time.time() - pool['started'])} ago)", file=sys.stderr)
+    return pool["id"]
+
+
+def cmd_pool(args) -> int:
+    """Create a pool; workers join it with --pool."""
+    existing = find_pool(args.name)
+    if existing and existing["id"] != args.name:
+        print(f"jobrun: another pool is named {args.name!r} ({existing['id']}); --pool {args.name!r} joins the "
+              f"new one", file=sys.stderr)
+    pool = create_pool(args.name, args.group, args.total)
+    print(f"{pool['id']}  {pool['name']}")
+    return 0
 
 
 def stage_rules(values: list[str] | None) -> list[list[str]] | None:
@@ -2111,10 +2308,17 @@ def cmd_sbatch(args) -> int:
 
 
 def visible_rows(days: float | None) -> list[dict]:
-    """Rows to show; a group stays complete as long as any member is visible."""
+    """Rows to show; a group or pool stays complete as long as any member is visible."""
     rows = snapshots(load_jobs())
-    shown = {r.get("group") for r in rows if r.get("group") and visible(r, days)}
-    return [r for r in rows if visible(r, days) or r.get("group") in shown]
+
+    def with_pools(keep: set) -> set:
+        pools = {r.get("pool") or r["id"] for r in rows if r["id"] in keep and (r.get("pool") or r["kind"] == "pool")}
+        return keep | {r["id"] for r in rows if (r.get("pool") or r["id"]) in pools}
+
+    keep = with_pools({r["id"] for r in rows if visible(r, days)})
+    groups = {r["group"] for r in rows if r.get("group") and r["id"] in keep}
+    keep = with_pools(keep | {r["id"] for r in rows if r.get("group") in groups})
+    return [r for r in rows if r["id"] in keep]
 
 
 def cmd_ls(args) -> int:
@@ -2131,12 +2335,22 @@ def cmd_ls(args) -> int:
     table = [("ID", "STATUS", "NAME", "PROGRESS", "RATE", "ETA", "LAST STEP", "ELAPSED", "WHERE")]
 
     def line(r, job_id, name, where=""):
-        table.append((job_id, r["status"], name, fmt_progress(r), fmt_rate(r["rate_per_s"]),
-                      "finishing" if r.get("finishing") else fmt_eta(r["eta"]), fmt_idle(r), fmt_duration(r["elapsed_s"]),
-                      where))
+        worker = bool(r.get("pool"))  # a pool's worker: progress, rate and ETA are the pool's
+        table.append((job_id, r["status"], name, fmt_progress(r), "" if worker else fmt_rate(r["rate_per_s"]),
+                      "" if worker else "finishing" if r.get("finishing") else fmt_eta(r["eta"]),
+                      "" if worker else fmt_idle(r),
+                      fmt_duration(r["elapsed_s"]), where))
 
+    def where(r):
+        if r.get("kind") == "pool":
+            return pool_where(r)
+        return ((r["host"] or "") + (f" slurm:{r['slurm_id']}" if r["slurm_id"] else "")).strip()
+
+    pools = {r["id"] for r in rows if r.get("kind") == "pool"}
     by_name = {g["name"]: g for g in groups}
     for r in dependency_order(rows):
+        if r.get("pool") in pools:
+            continue  # listed under its pool
         group = r.get("group")
         if group and group in by_name:
             g = by_name.pop(group)
@@ -2147,8 +2361,12 @@ def cmd_ls(args) -> int:
         else:
             members = [r]
         for member in members:
-            where = (member["host"] or "") + (f" slurm:{member['slurm_id']}" if member["slurm_id"] else "")
-            line(member, member["id"], ("  " if group else "") + (member["name"] or "")[:40], where.strip())
+            indent = "  " if group else ""
+            line(member, member["id"], indent + (member["name"] or "")[:40], where(member))
+            if member.get("kind") == "pool":
+                members_of = [w for w in rows if w.get("pool") == member["id"]]
+                for worker in sorted(dependency_order(members_of), key=lambda w: w.get("role") != "monitor"):
+                    line(worker, worker["id"], f"{indent}  └ {(worker['name'] or '')[:36]}", where(worker))
     widths = [max(len(row[i]) for row in table) for i in range(len(table[0]))]
     for row in table:
         print("  ".join(cell.ljust(w) for cell, w in zip(row, widths)).rstrip())
@@ -2222,8 +2440,9 @@ def cmd_show(args) -> int:
     return 0
 
 
-def select(args, missing_ok: bool = False) -> list[dict]:
-    """Jobs named by ids and/or --group; missing_ok tolerates ids and groups that are already gone."""
+def select(args, missing_ok: bool = False, workers: bool = False) -> list[dict]:
+    """Jobs named by ids and/or --group; missing_ok tolerates ids and groups that are already gone. workers: also
+    the members of the selected pools (to stop or remove them with their pool)."""
     if not args.ids and not args.group:
         sys.exit("jobrun: give job ids or --group")
     metas = resolve(args.ids, missing_ok) if args.ids else []
@@ -2232,6 +2451,9 @@ def select(args, missing_ok: bool = False) -> list[dict]:
         if not members and not missing_ok:
             sys.exit(f"jobrun: no jobs in group {args.group!r}")
         metas += [m for m in members if m["id"] not in {x["id"] for x in metas}]
+    pools = {m["id"] for m in metas if m.get("kind") == "pool"}
+    if workers and pools:
+        metas += [m for m in load_jobs() if m.get("pool") in pools and m["id"] not in {x["id"] for x in metas}]
     return metas
 
 
@@ -2257,11 +2479,14 @@ def signal_local(meta: dict, sig: int) -> list[int]:
 def cmd_stop(args) -> int:
     """SIGTERM every selected job at once, then one shared grace period before SIGKILL."""
     rc, local = 0, []
-    for meta, row in zip(metas := select(args), snapshots(metas)):
+    for meta, row in zip(metas := select(args, workers=True), snapshots(metas)):
         if row["status"] not in ACTIVE:
             print(f"{meta['id']} is not running ({row['status']})")
             continue
         _file(meta["id"], ".stopped").touch()
+        if meta.get("kind") == "pool":  # its workers follow in metas
+            print(f"stopping pool {meta['id']}  {meta.get('name')}")
+            continue
         if row["status"] == "waiting" and meta.get("kind") == "process":  # only the supervisor exists yet
             meta = {**meta, "pid": meta.get("supervisor_pid"), "pgid": None, "proc_start": None}
         if meta.get("kind") == "slurm" or (meta.get("slurm_id") and meta.get("host") != HOST):
@@ -2304,7 +2529,7 @@ def remove(meta: dict, keep_log: bool = False) -> None:
 
 
 def cmd_rm(args) -> int:
-    for meta, row in zip(metas := select(args, missing_ok=True), snapshots(metas)):
+    for meta, row in zip(metas := select(args, missing_ok=True, workers=True), snapshots(metas)):
         if row["status"] in ACTIVE and not args.force:
             print(f"{meta['id']} is {row['status']}; stop it first or pass --force", file=sys.stderr)
             continue
@@ -2403,7 +2628,8 @@ def cmd_wait(args) -> int:
             time.sleep(args.interval)
         for r in rows:
             print(_wait_line(r, f"{fmt_progress(r)}  {fmt_duration(r['elapsed_s'])}"))
-        return 0 if rows and all(r["status"] == "done" for r in rows) else 1
+        # a pool whose workers all succeeded with items left (incomplete) needs a look before the next step
+        return 0 if rows and all(r["status"] == "done" and not r.get("incomplete") for r in rows) else 1
     # events and stalls count from now on, so waiting again on the same jobs does not return for old ones
     rows = load()
     baseline = {i: (r.get("event_count", 0), bool(r.get("stalled"))) for i, r in rows.items()}
@@ -2418,7 +2644,7 @@ def cmd_wait(args) -> int:
             seen_events, was_stalled = baseline.get(job_id, (0, False))
             if row["status"] not in ACTIVE:
                 lines.append(_wait_line(row, f"{fmt_progress(row)}  after {fmt_duration(row['elapsed_s'])}"))
-                ok = ok and row["status"] == "done"
+                ok = ok and row["status"] == "done" and not row.get("incomplete")
             new = row.get("event_count", 0) - seen_events
             if new > 0:
                 shown = [e for e in row.get("events") or [] if e.get("n", 0) > seen_events]
@@ -2450,11 +2676,20 @@ def cmd_edit(args) -> int:
     progress = {"progress_regex": args.progress_regex, "count_regex": args.count_regex, "total": args.total,
                 "stages": [s.strip() for s in args.stages.split(",") if s.strip()] if args.stages is not None else None,
                 "stage_rules": stage_rules(args.stage_at) if args.stage_at else None,
-                "progress_file": str(Path(args.log).expanduser().resolve()) if args.log else None}
+                "progress_file": str(Path(args.log).expanduser().resolve()) if args.log else None,
+                "item_regex": args.item_regex}
     progress = {key: value for key, value in progress.items() if value is not None}
     if args.log and meta.get("kind") != "process":
         progress["log"] = progress.pop("progress_file")  # tracked and Slurm jobs are parsed from their log
     other = {key: value for key, value in (("name", args.name), ("group", args.group)) if value is not None}
+    if args.pool is not None:
+        if meta.get("kind") == "pool":
+            sys.exit("jobrun edit: a pool cannot join a pool")
+        other["pool"] = join_pool(args.pool, args.group, inherit=meta.get("group")) if args.pool else None
+        if args.pool:
+            other["group"] = None  # the group belongs to the pool
+    if args.role is not None:
+        other["role"] = None if args.role == "worker" else args.role
     if budget(args):
         other["budget"] = budget(args, meta.get("budget"))
     if args.after is not None:
@@ -2505,6 +2740,12 @@ def main(argv: list[str] | None = None) -> int:
         p.add_argument("--cpus", type=float, help="CPU cores budgeted for the job (shown as reserved; not enforced)")
         p.add_argument("--mem", help="RAM budgeted for the job, e.g. 20G (shown as reserved; not enforced)")
         p.add_argument("--gpus", type=float, help="GPUs budgeted for the job (shown as reserved; not enforced)")
+        p.add_argument("--pool", help="join this pool (id or name; created if there is none): a worker of a list "
+                                      "that several jobs work through together")
+        p.add_argument("--role", choices=("worker", "monitor"),
+                       help="in a pool: monitor = only reports the list's progress, works on no items")
+        p.add_argument("--item-regex", help="in a pool: each log line matching this regex is one item this worker "
+                                            "finished (like a JOBRUN_ITEM line)")
 
     p = sub.add_parser("run", help="run a command under supervision (detached unless --fg)")
     progress_args(p)
@@ -2530,6 +2771,12 @@ def main(argv: list[str] | None = None) -> int:
                    help="start only after these jobs (ids or names, comma-separated) finished successfully")
     p.add_argument("sbatch_args", nargs=argparse.REMAINDER)
     p.set_defaults(func=cmd_sbatch)
+
+    p = sub.add_parser("pool", help="create a pool: one job that several workers, on any hosts, work through")
+    p.add_argument("name")
+    p.add_argument("--group", help="group of the pool (its workers take it)")
+    p.add_argument("--total", type=int, help="items in the list, when no member reports the list's progress")
+    p.set_defaults(func=cmd_pool)
 
     p = sub.add_parser("ls", help="list jobs")
     p.add_argument("--json", action="store_true")
