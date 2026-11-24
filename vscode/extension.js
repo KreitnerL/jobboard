@@ -669,8 +669,7 @@ function shareItem(id, job, used, reserved, fmt, extra) {
       : 'No budget: not a Slurm job, no JOBRUN_BUDGET line or --cpus/--mem/--gpus, no cgroup limit.') +
     (job.kind === 'slurm' ? '\nUsage from sstat.' : '\nRAM is the resident memory of its processes (shared pages count once per process).');
   const running = job.pool ? (job.role === 'monitor' ? 'eye' : 'gear~spin') : 'sync~spin';  // as in the Jobs view
-  item.iconPath = new vscode.ThemeIcon(fraction != null && fraction > 0.9 ? 'warning' : running,
-    new vscode.ThemeColor(fraction != null && fraction > 0.9 ? 'charts.orange' : 'charts.blue'));
+  item.iconPath = new vscode.ThemeIcon(running, new vscode.ThemeColor('charts.blue'));
   return item;
 }
 
