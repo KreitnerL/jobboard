@@ -201,8 +201,9 @@ function describeWorker(job) {
   return parts.filter(Boolean).join(' · ');
 }
 
-function describe(job, jobs = []) {
-  if (job.pool) return describeWorker(job);
+// part: 'all' (one row), 'head' (what comes before the progress) or 'tail' (the progress and what follows it)
+function describe(job, jobs = [], part = 'all') {
+  if (job.pool) return part === 'tail' ? '' : describeWorker(job);
   const parts = [];
   if (job.degraded) parts.push(eventText(job));
   if (job.jobs) {
@@ -211,10 +212,12 @@ function describe(job, jobs = []) {
     parts.push(`${job.finished}/${job.jobs} jobs${other.length ? ` (${other.join(', ')})` : ''}`);
   }
   if (job.kind === 'pool') parts.push(workersText(job, jobs));
-  if (!job.jobs && job.status === 'waiting') return `waiting for ${(job.waiting_for || []).join(', ') || 'dependencies'}`;
-  if (!job.jobs && job.status === 'cancelled') return `cancelled: ${job.reason || 'never started'}`;
+  if (!job.jobs && job.status === 'waiting') return part === 'tail' ? '' : `waiting for ${(job.waiting_for || []).join(', ') || 'dependencies'}`;
+  if (!job.jobs && job.status === 'cancelled') return part === 'tail' ? '' : `cancelled: ${job.reason || 'never started'}`;
   if (job.stage) parts.push(`${job.stage_no}/${job.stage_of || '?'} ${job.stage}`);
+  let cut = null;
   if (ACTIVE.has(job.status)) {
+    cut = parts.length;
     const show = new Set(config().get('rowDetails') || ['rate', 'eta', 'lastStep', 'elapsed']);
     if (job.fraction != null) parts.push(`${bar(job.fraction)} ${Math.round(job.fraction * 100)}%`, `${count(job.done)}/${count(job.total)}`);
     else if (job.done != null) parts.push(`${count(job.done)} done`);
@@ -230,7 +233,27 @@ function describe(job, jobs = []) {
     parts.push(duration(job.elapsed_s));
     if (job.ended) parts.push(`ended ${clock(job.ended)}`);
   }
+  if (part === 'head') return parts.slice(0, cut ?? parts.length).join(' · ');
+  if (part === 'tail') return cut == null ? '' : parts.slice(cut).join(' · ');
   return parts.join(' · ');
+}
+
+// Rows the user has expanded. With jobboard.progressRow, an expanded running job or group shows its progress on a
+// row of its own under the name (progressItem), so a narrow sidebar still shows it; collapsed rows keep one line.
+const expandedRows = new Set();
+
+function progressSplit(entry, jobs) {
+  return config().get('progressRow') !== false && expandedRows.has(entry.id) && !entry.pool
+    && ACTIVE.has(entry.status) && describe(entry, jobs, 'tail') !== '';
+}
+
+function progressItem(entry, jobs) {
+  const item = new vscode.TreeItem('');
+  item.id = `${entry.id}-progress`;
+  item.description = describe(entry, jobs, 'tail');  // grey, as on the collapsed row
+  item.tooltip = describe(entry, jobs);
+  item.iconPath = new vscode.ThemeIcon('pulse');
+  return item;
 }
 
 function tooltip(job) {
@@ -473,16 +496,23 @@ class JobsProvider {
       return [...warnings, section('Running', active(all), true), section('Finished', finished(all), false)];
     }
     const item = job => jobItem(job, this.jobs);
+    const entry = element.group || element.job;
+    // a row VS Code shows expanded (e.g. restored after a reload) without an expand event: redraw it split
+    if (entry && entry.id && !expandedRows.has(entry.id)) {
+      expandedRows.add(entry.id);
+      if (progressSplit(entry, this.jobs)) setTimeout(() => this.render(true), 0);
+    }
+    const progress = entry && progressSplit(entry, this.jobs) ? [progressItem(entry, this.jobs)] : [];
     if (element.entries) return element.ordered ? entryItems(element.entries, this.jobs) : [
       ...element.entries.filter(e => e.members).map(g => groupItem(g, this.jobs)),
       ...dependencyOrder(element.entries.filter(e => !e.members)).map(item)];
-    if (element.group) return dependencyOrder(element.group.members).map(item);
+    if (element.group) return [...progress, ...dependencyOrder(element.group.members).map(item)];
     if (element.job && element.job.kind === 'pool') {
       const members = dependencyOrder(this.jobs.filter(job => job.pool === element.job.id));
       const monitor = job => job.role === 'monitor';
-      return [...members.filter(monitor), ...members.filter(job => !monitor(job))].map(item);  // details: tooltip
+      return [...progress, ...[...members.filter(monitor), ...members.filter(job => !monitor(job))].map(item)];  // details: tooltip
     }
-    if (element.job) return [...stageItems(element.job), ...detailItems(element.job)];
+    if (element.job) return [...progress, ...stageItems(element.job), ...detailItems(element.job)];
     return [];
   }
 }
@@ -544,7 +574,8 @@ function groupItem(group, jobs) {
   const item = new vscode.TreeItem(group.name, vscode.TreeItemCollapsibleState.Collapsed);
   item.id = `${group.prefix || ''}group:${group.name}`;
   item.group = group;
-  item.description = describe(group, jobs);
+  group.id = item.id;
+  item.description = describe(group, jobs, progressSplit(group, jobs) ? 'head' : 'all');
   let [, color] = ICONS[group.status] || [];
   if (group.degraded && ACTIVE.has(group.status)) color = DEGRADED_COLORS[group.degraded];
   item.iconPath = new vscode.ThemeIcon('layers', color && new vscode.ThemeColor(color));
@@ -557,7 +588,7 @@ function jobItem(job, jobs = []) {
   const item = new vscode.TreeItem(job.name, vscode.TreeItemCollapsibleState.Collapsed);
   item.id = job.id;
   item.job = job;
-  item.description = describe(job, jobs);
+  item.description = describe(job, jobs, progressSplit(job, jobs) ? 'head' : 'all');
   item.tooltip = tooltip(job);
   let [icon, color] = job.stalled ? ['sync~spin', 'charts.orange'] : ICONS[job.status] || ['circle-outline', undefined];
   if (job.degraded && ACTIVE.has(job.status)) color = DEGRADED_COLORS[job.degraded];
@@ -808,6 +839,14 @@ function activate(context) {
   const provider = new JobsProvider();
   const view = vscode.window.createTreeView('jobboard.jobs', { treeDataProvider: provider, showCollapseAll: true });
   provider.view = view;
+  const toggled = (element, open) => {
+    const entry = element.group || element.job;
+    if (!entry || !entry.id) return;
+    if (open) expandedRows.add(entry.id); else expandedRows.delete(entry.id);
+    if (config().get('progressRow') !== false) provider.render(true);
+  };
+  context.subscriptions.push(view.onDidExpandElement(e => toggled(e.element, true)),
+    view.onDidCollapseElement(e => toggled(e.element, false)));
   const run = (args, message) => jobrun(args)
     .then(out => { if (message) vscode.window.setStatusBarMessage(message || out.trim(), 4000); })
     .catch(err => vscode.window.showErrorMessage(`jobrun ${args[0]}: ${err.message}`))

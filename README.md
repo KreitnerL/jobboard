@@ -382,6 +382,7 @@ The **VS Code settings** (search for "Job Board") cover the dashboard:
 | `notifyOn` | done, error, stalled, event | Notifications for: `done`, `error`, `stopped`, `cancelled`, `stalled`, `event` (a `JOBRUN_EVENT` line), `logTrimmed` |
 | `etaFormat` | clock | `clock` (ETA 16:40), `remaining` (ETA in 2h10m) or `both` |
 | `rowDetails` | all | Which of `rate`, `eta`, `lastStep`, `elapsed` a running job's row shows |
+| `progressRow` | on | An expanded running job, pool or group shows its progress on its own row under the name; collapsed rows keep one line |
 | `groupBy` | status | `status` (Running / Finished), `host` (one section per machine or Slurm node) or `none` |
 | `statusBar` | running | Count `running` or `active` (also waiting) jobs, or `hidden` |
 | `diskWarnGB` | 5 | Warn when the disk with the registry or a running job's log has less free space |

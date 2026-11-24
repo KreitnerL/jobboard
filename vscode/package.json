@@ -330,6 +330,12 @@
           },
           "description": "What a running job's row shows after its progress. Hidden parts stay in the tooltip; a stalled job always shows its last step."
         },
+        "jobboard.progressRow": {
+          "type": "boolean",
+          "default": true,
+          "order": 4,
+          "description": "When a running job, pool or group is expanded, show its progress on a row of its own under the name, so a narrow sidebar still shows it. Collapsed rows keep everything on one line."
+        },
         "jobboard.groupBy": {
           "type": "string",
           "enum": [
