@@ -978,7 +978,8 @@ def test_pool_workers_report_items_and_the_pool_finishes(jobrun):
     lines = jobrun("ls").stdout.splitlines()
     pool_line = next(i for i, l in enumerate(lines) if "queue" in l)
     assert f"2 workers on {socket.gethostname()}" in lines[pool_line] and "100% 6/6" in lines[pool_line] and "└ w" in lines[pool_line + 1]
-    assert "6" not in lines[pool_line + 1].split("└")[1].split("done")[0]  # workers show no progress of their own
+    worker = lines[pool_line + 1].split("└")[1].split("done")[0].replace(socket.gethostname(), "")
+    assert "6" not in worker  # workers show no progress of their own (the host name may contain digits)
 
 
 def test_empty_pool_can_be_stopped_and_removed(jobrun):
