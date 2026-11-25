@@ -376,7 +376,10 @@ A node's reserved total is Slurm's allocations (all users) plus the budgets of y
   calls, and NVML only **while one of your jobs has the GPU open**. Querying an idle GPU would wake its driver (~2 s),
   so without a GPU job the GPU row shows only reservations.
 - **Other nodes** are seen through Slurm only: reservations of all users, slurmd's load average and free memory (which
-  lag by minutes), and the usage of your own Slurm jobs (`sstat`). Their GPU utilization is not available.
+  lag by minutes and can read near zero on a busy node), and the usage of your own Slurm jobs (`sstat`). Such a node
+  shows what is **reserved** first, and its bar fills with the larger of reserved and used: a reserved core is not
+  free for a new job whatever the load says. Used is at least the sum of your jobs on the node, marked
+  "(your jobs)" when that is higher than slurmd's figure. Their GPU utilization is not available.
 
 ## Logs
 

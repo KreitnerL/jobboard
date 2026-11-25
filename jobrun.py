@@ -2429,11 +2429,16 @@ def cmd_res(args) -> int:
                   if node.get("coarse") else "")
         print(f"\n{node['host']}{' (this machine)' if node.get('local') else ''}{coarse}")
         cpu = f"{node['cpu']:.1f}" if node.get("cpu") is not None else "?"
-        jobs_note = lambda flag: "   (your jobs; Slurm reports less)" if node.get(flag) else ""
-        print(f"  CPU    {cpu:>6} / {node.get('cpus') or '?'} cores   reserved {reserved['cpus']:g}"
-              f"{jobs_note('cpu_from_jobs')}")
-        print(f"  RAM    {fmt_bytes(node.get('mem')):>6} / {fmt_bytes(node.get('mem_total'))}   reserved "
-              f"{fmt_bytes(reserved['mem'])}{jobs_note('mem_from_jobs')}")
+        jobs_note = lambda flag: " (your jobs; Slurm reports less)" if node.get(flag) else ""
+        if node.get("coarse"):  # a Slurm node: reserved first, a reserved core is not free whatever the load says
+            print(f"  CPU    reserved {reserved['cpus']:>4g} / {node.get('cpus') or '?'} cores   used {cpu}"
+                  f"{jobs_note('cpu_from_jobs')}")
+            print(f"  RAM    reserved {fmt_bytes(reserved['mem']):>4} / {fmt_bytes(node.get('mem_total'))}   used "
+                  f"{fmt_bytes(node.get('mem'))}{jobs_note('mem_from_jobs')}")
+        else:
+            print(f"  CPU    {cpu:>6} / {node.get('cpus') or '?'} cores   reserved {reserved['cpus']:g}")
+            print(f"  RAM    {fmt_bytes(node.get('mem')):>6} / {fmt_bytes(node.get('mem_total'))}   reserved "
+                  f"{fmt_bytes(reserved['mem'])}")
         for gpu in node.get("gpus") or []:
             print(f"  GPU{gpu['index']}   {gpu['util']:5.0f}%   vram {fmt_bytes(gpu['vram'])} / {fmt_bytes(gpu['vram_total'])}"
                   f"   {gpu['name']}")

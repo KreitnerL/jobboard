@@ -779,12 +779,23 @@ class ResourcesProvider {
         job.vram ? `VRAM ${bytes(job.vram)}` : '', r ? `${cores(r)} GPU reserved` : 'no GPU reserved'].filter(Boolean).join(' · ');
       return item;
     };
-    const items = [
+    // A Slurm node: what is reserved comes first and fills the bar when it exceeds the use, since a reserved core is
+    // not available to a new job whatever the (coarse) load says.
+    const usedNote = (fromJobs, fallback) => fromJobs ? ' (your jobs)' : fallback;
+    const share = (used, held, total) => total && (used != null || held) ? Math.max(used || 0, held || 0) / total : null;
+    const items = node.coarse ? [
+      resourceItem(`${id}:cpu`, 'CPU', share(node.cpu, reserved.cpus, node.cpus),
+        `${cores(reserved.cpus)} / ${node.cpus || '?'} cores reserved · ${cores(node.cpu)} used${usedNote(node.cpu_from_jobs, ' (load)')}`,
+        'Reserved: Slurm allocations of all users plus the budgets of your other jobs. Used: slurmd\'s load average, ' +
+        'or the sum of your jobs on the node when that is higher.', 'pulse', cpuItems),
+      resourceItem(`${id}:ram`, 'RAM', share(node.mem, reserved.mem, node.mem_total),
+        `${bytes(reserved.mem)} / ${bytes(node.mem_total)} reserved · ${bytes(node.mem)} used${usedNote(node.mem_from_jobs, '')}`,
+        null, 'database', ramItems),
+    ] : [
       resourceItem(`${id}:cpu`, 'CPU', node.cpus && node.cpu != null ? node.cpu / node.cpus : null,
-        `${cores(node.cpu)} / ${node.cpus || '?'} cores${node.cpu_from_jobs ? ' (your jobs)' : node.coarse ? ' (load)' : ''} · ${cores(reserved.cpus)} reserved`,
-        null, 'pulse', cpuItems),
+        `${cores(node.cpu)} / ${node.cpus || '?'} cores · ${cores(reserved.cpus)} reserved`, null, 'pulse', cpuItems),
       resourceItem(`${id}:ram`, 'RAM', node.mem_total && node.mem != null ? node.mem / node.mem_total : null,
-        `${bytes(node.mem)} / ${bytes(node.mem_total)}${node.mem_from_jobs ? ' (your jobs)' : ''} · ${bytes(reserved.mem)} reserved`, null, 'database', ramItems),
+        `${bytes(node.mem)} / ${bytes(node.mem_total)} · ${bytes(reserved.mem)} reserved`, null, 'database', ramItems),
     ];
     for (const gpu of node.gpus || []) {
       items.push(resourceItem(`${id}:gpu${gpu.index}`, `GPU ${gpu.index}`, gpu.util / 100,
