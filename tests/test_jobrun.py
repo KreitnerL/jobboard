@@ -1013,3 +1013,46 @@ def test_edit_moves_running_jobs_into_a_pool_that_takes_their_group(jobrun):
     assert "└ watch" in (line := next(l for l in jobrun("ls").stdout.splitlines() if "└ watch" in l)) and "monitor" in line
     jobrun("edit", "w", "--pool", "")
     assert rows(jobrun)["w"]["pool"] is None
+
+
+def test_wait_any_on_a_pool_wakes_when_one_worker_succeeds(jobrun):
+    jobrun("run", "--pool", "t pool", "--name", "w1", "--", "sleep 3")
+    jobrun("run", "--pool", "t pool", "--name", "w2", "--", "sleep 300")
+    pool_id = rows(jobrun)["t pool"]["id"]
+    started = time.time()
+    out = jobrun("wait", "--any", "t pool", "--interval", "0.2", check=False)
+    assert time.time() - started < 20 and out.returncode == 0
+    lines = out.stdout.splitlines()
+    assert len(lines) == 2 and "w1" in lines[0] and "done" in lines[0] and f"worker of pool t pool ({pool_id})" in lines[0]
+    assert lines[1] == f"still active: {pool_id} (1 workers)"
+    assert rows(jobrun)["w1"]["status"] == "done"  # the ended worker stays listed
+    env = dict(os.environ, JOBRUN_HOME=str(jobrun.home))
+    with pytest.raises(subprocess.TimeoutExpired):  # an end seen before the wait started does not wake it again
+        subprocess.run([sys.executable, str(JOBRUN), "wait", "--any", "t pool", "--interval", "0.2"], env=env,
+                       capture_output=True, timeout=2)
+
+
+def test_wait_any_on_a_pool_reports_a_failed_worker_once_and_the_pool_end(jobrun):
+    jobrun("run", "--pool", "f pool", "--name", "bad", "--", "sleep 3; exit 3")
+    jobrun("run", "--pool", "f pool", "--name", "ok", "--", "sleep 6")
+    out = jobrun("wait", "--any", "f pool", "--interval", "0.2", check=False)
+    assert out.returncode == 1 and sum("bad" in line for line in out.stdout.splitlines()) == 1
+    assert "exit code 3" in out.stdout
+    out = jobrun("wait", "--any", "f pool", "--interval", "0.2", check=False)
+    lines = out.stdout.splitlines()
+    assert any("ok" in l and "worker of pool" in l for l in lines)
+    assert sum(l.split()[0] == rows(jobrun)["f pool"]["id"] for l in lines) == 1  # the pool's end, once
+    assert not any("still active" in l for l in lines)
+
+
+def test_removals_are_recorded_with_the_command_and_caller(jobrun):
+    jobrun("run", "--name", "gone", "--", "true")
+    jobrun("run", "--name", "swept", "--", "true")
+    wait_for(jobrun, "gone", "done")
+    wait_for(jobrun, "swept", "done")
+    jobrun("rm", "gone")
+    jobrun("clean", "--days", "0")
+    log = (jobrun.home / "removed.log").read_text().splitlines()
+    assert len(log) == 2
+    assert "'gone'" in log[0] and "done" in log[0] and "by `jobrun rm`" in log[0] and "parent: " in log[0]
+    assert "'swept'" in log[1] and "by `jobrun clean --days 0`" in log[1]

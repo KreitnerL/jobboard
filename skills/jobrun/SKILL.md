@@ -43,7 +43,8 @@ The user watches all long jobs on a dashboard fed by `jobrun`. A job that is not
      own. Progress comes from any member printing `JOBRUN_PROGRESS done/total` for the whole list, or else from
      workers printing `JOBRUN_ITEM <label>` per finished item, summed against `jobrun pool NAME --total N`. A process
      that only reports progress joins with `--role monitor`. To add a worker later, launch it with the same `--pool`; move a running
-     job in with `jobrun edit ID --pool P`. `--after P`, `wait --any P` and `stop P` act on the whole pool. A pool
+     job in with `jobrun edit ID --pool P`. `--after P`, `wait --any P` and `stop P` act on the whole pool;
+     `wait --any P` also wakes when any single worker or monitor ends (done or failed). A pool
      whose workers all succeeded with items left ends "done" with a warning: check the list (unprocessed items, or
      a stale count) before the next step.
    - If a program you will run repeatedly prints no usable progress, propose adding marker lines to its code once
@@ -61,8 +62,9 @@ The user watches all long jobs on a dashboard fed by `jobrun`. A job that is not
    being asked. For several jobs, arm one `jobrun wait --any ID` per job or a single
    `jobrun wait --any ID1 ID2 ...` (or `--any --group G`); never a plain `jobrun wait A B`, which returns only when
    the last job has ended and so hides an early crash. `--any` prints one line per trigger (the job's new status,
-   the event message, or "stalled") and the jobs still active; exit 0 means only successful ends. Report or act,
-   then arm a new `wait --any` for the jobs still active. A jobrun job is detached and never notifies the session
+   the event message, or "stalled"; for a pool, also each worker that ended) and the jobs still active; exit 0
+   means only successful ends. Report or act, then arm a new `wait --any` for the jobs still active (a pool stays
+   listed until its last worker ends; ends seen before the new wait started do not wake it again). A jobrun job is detached and never notifies the session
    by itself; it keeps running and stays on the dashboard even if the waiting shell dies. If the session cannot
    run background commands, tell the user that you will not notice the end on your own.
 7. Do not stop or remove jobs you did not start unless the user asks.

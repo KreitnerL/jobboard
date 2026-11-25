@@ -307,8 +307,13 @@ the jobs that are still active, and exits 0 only if every trigger is a job that 
 still active: 261123-6443 261123-4c40
 ```
 
-Events and stalls count from the moment `wait --any` starts, so waiting again on the same jobs does not return for
-the same event. Jobs that have ended do: wait again for the ones listed as still active.
+For a pool, `--any` also returns when any single worker or monitor of the pool ends: a successful end prints its
+own line (`261124-ef4d  done  slurm eris  worker of pool tune queue (261124-5ad8)  after 2h41m`), a failed one is
+the pool's event (`worker slurm eris on eris ended (error: exit code 1)`). The still-active line gives the pool's
+running workers, e.g. `still active: 261124-5ad8 (1 workers)`.
+
+Events, stalls and pool members that end count from the moment `wait --any` starts, so waiting again on the same jobs
+does not return for the same event. Jobs that have ended do: wait again for the ones listed as still active.
 
 Without `--any`, `wait` waits for all jobs, as before; that stays the default because scripts rely on
 `jobrun wait --group G && next-step`, which must not continue after the first job. Agents that watch several jobs
@@ -366,6 +371,8 @@ A node's reserved total is Slurm's allocations (all users) plus the budgets of y
 - `jobrun sbatch` writes the Slurm log there too, unless you or the script set `--output`.
 - Removing a job (`rm`, `clean`, or the trash icon) also deletes the logs jobrun **wrote**. Logs it only
   **read**, such as your experiment's own log files, are never deleted.
+- Every removal is recorded in `~/.jobs/removed.log` (time, job, status, the jobrun command and the process that
+  called it: a shell, an agent, or the VS Code extension), so a job missing from the list can be traced.
 - Logs jobrun writes are capped at 512 MB (setting `max_log_mb`, or `--max-log-mb` per job). Beyond that, jobrun cuts
   the **middle** of the log: it keeps the first 16 MB (`log_keep_head_mb`: configuration, early warnings) and the
   newest 256 MB, with a line saying what was dropped in between. The job is not affected: it keeps writing to the

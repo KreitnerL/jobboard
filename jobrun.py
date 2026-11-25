@@ -10,6 +10,7 @@ The registry is a directory of small files ($JOBRUN_HOME, default ~/.jobs):
     jobs/<id>.state.json  the last rate and the cached final row, written by readers
     hosts/<host>.json     the last resource sample of that host (`jobrun res`), the baseline for the next mean
     logs/<id>.log         default log of supervised commands
+    removed.log           one line per job removed by `rm`, `clean` or auto_clean_days, with the calling process
 
 Progress is parsed from the job's log, so commands need no changes. Recognised by default:
 tqdm bars ("412/1000 [01:23<..."), bracketed counters ("[412/1000] ...") and explicit
@@ -2525,8 +2526,31 @@ def cmd_stop(args) -> int:
     return rc
 
 
-def remove(meta: dict, keep_log: bool = False) -> None:
-    """Drop a job from the registry, with the log if jobrun wrote it; logs it only read are kept."""
+def _caller() -> str:
+    """The parent process's command line, e.g. the shell, agent or VS Code extension that called jobrun."""
+    try:
+        raw = Path(f"/proc/{os.getppid()}/cmdline").read_bytes()
+    except OSError:
+        return "?"
+    return " ".join(raw.decode(errors="replace").split("\0")).strip()[:200] or "?"
+
+
+def record_removal(meta: dict, status: str | None, why: str) -> None:
+    """Append to removed.log, so that a job missing from the list can be traced to the command that removed it."""
+    stamp = datetime.now().isoformat(timespec="seconds")
+    line = (f"{stamp}  {meta['id']}  {status or '?'}  {meta.get('name')!r}  by `jobrun {why}` "
+            f"(pid {os.getpid()} on {socket.gethostname()}, parent: {_caller()})\n")
+    try:
+        with open(HOME / "removed.log", "a") as handle:
+            handle.write(line)
+    except OSError:
+        pass
+
+
+def remove(meta: dict, keep_log: bool = False, status: str | None = None, why: str = "rm") -> None:
+    """Drop a job from the registry, with the log if jobrun wrote it; logs it only read are kept. Every removal is
+    recorded in removed.log with why (the jobrun command) and the calling process."""
+    record_removal(meta, status, why)
     for suffix in (".json", ".exit.json", ".hb", ".stopped", ".state.json", ".trim"):
         _file(meta["id"], suffix).unlink(missing_ok=True)
     for scan in JOBS.glob(f"{meta['id']}.scan*.json"):
@@ -2542,18 +2566,18 @@ def cmd_rm(args) -> int:
         if row["status"] in ACTIVE and not args.force and not empty_pool:  # an empty pool has nothing to stop
             print(f"{meta['id']} is {row['status']}; stop it first or pass --force", file=sys.stderr)
             continue
-        remove(meta, args.keep_log)
+        remove(meta, args.keep_log, row["status"], "rm" + (" --force" if args.force else ""))
         print(f"removed {meta['id']}  {meta.get('name')}")
     return 0
 
 
-def clean(days: float) -> int:
+def clean(days: float, why: str = "clean") -> int:
     """Remove finished jobs that ended more than days ago, with the logs jobrun wrote; returns how many."""
     metas = load_jobs()
     removed = 0
     for meta, row in zip(metas, snapshots(metas)):
         if row["status"] not in ACTIVE and not visible(row, days):
-            remove(meta)
+            remove(meta, status=row["status"], why=f"{why} --days {days:g}")
             removed += 1
     return removed
 
@@ -2569,7 +2593,7 @@ def auto_clean() -> None:
         return
     try:
         stamp.touch()  # first, so that dashboards refreshing at the same time do not all clean
-        clean(days)
+        clean(days, "auto-clean (auto_clean_days)")
     except OSError:
         pass
 
@@ -2622,12 +2646,18 @@ def _wait_line(row: dict, detail: str) -> str:
 
 def cmd_wait(args) -> int:
     """Block until the selected jobs finish; exit 0 only if all of them are done. With --any, return as soon as
-    one of them ends, reports a new JOBRUN_EVENT or starts to stall; exit 0 only if every trigger is a job that
-    finished successfully."""
-    ids = list(dict.fromkeys(m["id"] for m in select(args)))
+    one of them ends, reports a new JOBRUN_EVENT or starts to stall, or a worker or monitor of a selected pool
+    ends; exit 0 only if every trigger is a job that finished successfully."""
+    selected = select(args)
+    ids = list(dict.fromkeys(m["id"] for m in selected))
+    pools = {m["id"] for m in selected if m.get("kind") == "pool"}
 
     def load() -> dict[str, dict]:
-        return {r["id"]: r for r in snapshots([m for m in (read_json(_file(i, ".json")) for i in ids) if m])}
+        """Rows of the selected jobs and, with --any, of the selected pools' members (also those that joined since)."""
+        metas = [m for m in (read_json(_file(i, ".json")) for i in ids) if m]
+        if args.any and pools:
+            metas += [m for m in load_jobs() if m.get("pool") in pools and m["id"] not in ids]
+        return {r["id"]: r for r in snapshots(metas)}
 
     if not args.any:
         while True:
@@ -2642,6 +2672,9 @@ def cmd_wait(args) -> int:
     # events and stalls count from now on, so waiting again on the same jobs does not return for old ones
     rows = load()
     baseline = {i: (r.get("event_count", 0), bool(r.get("stalled"))) for i, r in rows.items()}
+    # pool members that had ended before the wait started; a worker that fails is also a pool event (pool_row),
+    # reported once through that event
+    members_ended = {i for i, r in rows.items() if r.get("pool") in pools and r["status"] not in ACTIVE}
     while True:
         lines, ok = [], True
         for job_id in ids:
@@ -2667,13 +2700,25 @@ def cmd_wait(args) -> int:
                                              f"(average step {fmt_duration(row['step_s'])})"))
                 ok = False
             baseline[job_id] = (baseline.get(job_id, (0, False))[0], bool(row.get("stalled")))
+        for member in rows.values():
+            if member.get("pool") not in pools or member["status"] in ACTIVE or member["id"] in members_ended:
+                continue
+            members_ended.add(member["id"])
+            if member["status"] in ("error", "lost"):
+                continue  # already a new event of its pool, printed above
+            pool = rows.get(member["pool"]) or {}
+            role = "monitor" if member.get("role") == "monitor" else "worker"
+            lines.append(_wait_line(member, f"{role} of pool {pool.get('name')} ({member['pool']})  "
+                                            f"after {fmt_duration(member['elapsed_s'])}"))
+            ok = ok and member["status"] == "done"
         if lines:
             break
         time.sleep(args.interval)
         rows = load()
     for line in lines:
         print(line)
-    active = [i for i in ids if i in rows and rows[i]["status"] in ACTIVE]
+    active = [i + (f" ({rows[i]['active_workers']} workers)" if i in pools else "")
+              for i in ids if i in rows and rows[i]["status"] in ACTIVE]
     if active:
         print(f"still active: {' '.join(active)}")
     return 0 if ok else 1
