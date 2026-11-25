@@ -297,7 +297,8 @@ def test_wait_any_returns_when_the_first_job_fails(jobrun):
     assert time.time() - started < 20 and out.returncode == 1
     lines = out.stdout.splitlines()
     assert "error" in lines[0] and "crash" in lines[0] and "exit code 3" in lines[0]
-    assert lines[-1] == f"still active: {rows(jobrun)['slow']['id']}"
+    slow = rows(jobrun)['slow']['id']
+    assert lines[-2] == f"still active: {slow}" and lines[-1].startswith(f"rearm: jobrun wait --any {slow} --since ")
     out = jobrun("wait", "--any", "crash", "--interval", "0.2", check=False)  # already ended: returns at once
     assert out.returncode == 1 and "crash" in out.stdout
 
@@ -1046,8 +1047,9 @@ def test_wait_any_on_a_pool_wakes_when_one_worker_succeeds(jobrun):
     out = jobrun("wait", "--any", "t pool", "--interval", "0.2", check=False)
     assert time.time() - started < 20 and out.returncode == 0
     lines = out.stdout.splitlines()
-    assert len(lines) == 2 and "w1" in lines[0] and "done" in lines[0] and f"worker of pool t pool ({pool_id})" in lines[0]
+    assert len(lines) == 3 and "w1" in lines[0] and "done" in lines[0] and f"worker of pool t pool ({pool_id})" in lines[0]
     assert lines[1] == f"still active: {pool_id} (1 workers)"
+    assert lines[2].startswith(f"rearm: jobrun wait --any {pool_id} --since ")
     assert rows(jobrun)["w1"]["status"] == "done"  # the ended worker stays listed
     env = dict(os.environ, JOBRUN_HOME=str(jobrun.home))
     with pytest.raises(subprocess.TimeoutExpired):  # an end seen before the wait started does not wake it again
@@ -1076,6 +1078,43 @@ def test_removals_are_recorded_with_the_command_and_caller(jobrun):
     jobrun("rm", "gone")
     jobrun("clean", "--days", "0")
     log = (jobrun.home / "removed.log").read_text().splitlines()
-    assert len(log) == 2
-    assert "'gone'" in log[0] and "done" in log[0] and "by `jobrun rm`" in log[0] and "parent: " in log[0]
-    assert "'swept'" in log[1] and "by `jobrun clean --days 0`" in log[1]
+    entries = [json.loads(line) for line in log]
+    assert [(e["name"], e["status"], e["by"]) for e in entries] == [
+        ("gone", "done", "jobrun rm"), ("swept", "done", "jobrun clean --days 0")]
+    assert entries[0]["ended"] and entries[0]["parent"]
+
+
+def test_rearm_with_since_reports_a_worker_that_ended_between_two_waits(jobrun):
+    jobrun("run", "--pool", "gap", "--name", "first", "--", "sleep 3")
+    jobrun("run", "--pool", "gap", "--name", "second", "--", "sleep 6")
+    jobrun("run", "--pool", "gap", "--name", "last", "--", "sleep 300")
+    out = jobrun("wait", "--any", "gap", "--interval", "0.2", check=False)
+    assert "first" in out.stdout.splitlines()[0]
+    rearm = out.stdout.splitlines()[-1].removeprefix("rearm: jobrun ").split()
+    wait_for(jobrun, "second", "done")  # ends while nobody waits
+    out = jobrun(*rearm, "--interval", "0.2", check=False)
+    lines = out.stdout.splitlines()
+    assert out.returncode == 0 and "second" in lines[0] and not any("first" in l for l in lines)
+
+
+def test_wait_any_reports_a_worker_removed_before_its_end_was_seen(jobrun):
+    jobrun("run", "--pool", "del", "--name", "short", "--", "sleep 3")
+    jobrun("run", "--pool", "del", "--name", "long", "--", "sleep 300")
+    env = dict(os.environ, JOBRUN_HOME=str(jobrun.home))
+    waiter = subprocess.Popen([sys.executable, str(JOBRUN), "wait", "--any", "del", "--interval", "30"], env=env,
+                              stdout=subprocess.PIPE, text=True)
+    time.sleep(2)  # the wait has taken its baseline and sleeps 30 s
+    wait_for(jobrun, "short", "done")
+    jobrun("rm", "short")
+    out, _ = waiter.communicate(timeout=60)
+    assert waiter.returncode == 0
+    assert "short" in out.splitlines()[0] and "done" in out and "removed from the registry" in out
+
+
+def test_a_dependency_removed_after_it_succeeded_still_counts_as_done(jobrun, monkeypatch):
+    monkeypatch.setenv("JOBRUN_WAIT_POLL_S", "3")
+    jobrun("run", "--name", "base", "--", "sleep 1")
+    jobrun("run", "--name", "follow", "--after", "base", "--", "true")
+    wait_for(jobrun, "base", "done")
+    jobrun("rm", "base")  # before "follow" polls again
+    assert wait_for(jobrun, "follow", "done")["exit_code"] == 0

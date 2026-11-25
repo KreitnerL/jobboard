@@ -63,8 +63,9 @@ The user watches all long jobs on a dashboard fed by `jobrun`. A job that is not
    `jobrun wait --any ID1 ID2 ...` (or `--any --group G`); never a plain `jobrun wait A B`, which returns only when
    the last job has ended and so hides an early crash. `--any` prints one line per trigger (the job's new status,
    the event message, or "stalled"; for a pool, also each worker that ended) and the jobs still active; exit 0
-   means only successful ends. Report or act, then arm a new `wait --any` for the jobs still active (a pool stays
-   listed until its last worker ends; ends seen before the new wait started do not wake it again). A jobrun job is detached and never notifies the session
+   means only successful ends. Report or act, then re-arm with the printed `rearm: jobrun wait --any ... --since T`
+   command, verbatim: `--since` makes the new wait also report whatever ended or was removed while you were acting,
+   which a fresh `wait --any` would treat as old. A pool stays listed until its last worker ends. A jobrun job is detached and never notifies the session
    by itself; it keeps running and stays on the dashboard even if the waiting shell dies. If the session cannot
    run background commands, tell the user that you will not notice the end on your own.
 7. Do not stop or remove jobs you did not start unless the user asks.

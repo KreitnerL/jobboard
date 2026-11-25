@@ -313,7 +313,20 @@ the pool's event (`worker slurm eris on eris ended (error: exit code 1)`). The s
 running workers, e.g. `still active: 261124-5ad8 (1 workers)`.
 
 Events, stalls and pool members that end count from the moment `wait --any` starts, so waiting again on the same jobs
-does not return for the same event. Jobs that have ended do: wait again for the ones listed as still active.
+does not return for the same event. Jobs that have ended do. When jobs are still active, the last line is the command
+to wait again:
+
+```
+rearm: jobrun wait --any 261124-5ad8 --since 1795600686.518
+```
+
+`--since T` counts events, pool members that ended and removals from time T (the check that found the triggers)
+instead of from the start of the new wait, so nothing that happens while you act on the first triggers is lost. An
+end in the few seconds that check took may be reported a second time.
+
+A job removed while someone waits for it is reported with the status it had when it was removed
+(`removed from the registry`), also a removed pool worker. A job that runs `--after` a removed job starts if that job
+had ended `done`.
 
 Without `--any`, `wait` waits for all jobs, as before; that stays the default because scripts rely on
 `jobrun wait --group G && next-step`, which must not continue after the first job. Agents that watch several jobs
@@ -371,8 +384,10 @@ A node's reserved total is Slurm's allocations (all users) plus the budgets of y
 - `jobrun sbatch` writes the Slurm log there too, unless you or the script set `--output`.
 - Removing a job (`rm`, `clean`, or the trash icon) also deletes the logs jobrun **wrote**. Logs it only
   **read**, such as your experiment's own log files, are never deleted.
-- Every removal is recorded in `~/.jobs/removed.log` (time, job, status, the jobrun command and the process that
-  called it: a shell, an agent, or the VS Code extension), so a job missing from the list can be traced.
+- Every removal is recorded in `~/.jobs/removed.log`, one JSON line per job: its status and end time (so `wait` and
+  `--after` still know how it ended), the jobrun command and the process that called it (a shell, an agent, or the
+  VS Code extension), so a job missing from the list can be traced. Removing a finished worker of a pool that still
+  runs also drops its items and its success from the pool's row.
 - Logs jobrun writes are capped at 512 MB (setting `max_log_mb`, or `--max-log-mb` per job). Beyond that, jobrun cuts
   the **middle** of the log: it keeps the first 16 MB (`log_keep_head_mb`: configuration, early warnings) and the
   newest 256 MB, with a line saying what was dropped in between. The job is not affected: it keeps writing to the

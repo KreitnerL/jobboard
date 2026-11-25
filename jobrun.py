@@ -10,7 +10,8 @@ The registry is a directory of small files ($JOBRUN_HOME, default ~/.jobs):
     jobs/<id>.state.json  the last rate and the cached final row, written by readers
     hosts/<host>.json     the last resource sample of that host (`jobrun res`), the baseline for the next mean
     logs/<id>.log         default log of supervised commands
-    removed.log           one line per job removed by `rm`, `clean` or auto_clean_days, with the calling process
+    removed.log           one JSON line per job removed by `rm`, `clean` or auto_clean_days: its status and end
+                          time (so waits and dependencies still see how it ended) and the process that removed it
 
 Progress is parsed from the job's log, so commands need no changes. Recognised by default:
 tqdm bars ("412/1000 [01:23<..."), bracketed counters ("[412/1000] ...") and explicit
@@ -449,10 +450,16 @@ def wait_for_dependencies(job_id: str) -> str | None:
         _beat(job_id)
         if stop:
             return "stopped while waiting"
-        deps = [read_json(_file(dep, ".json")) for dep in (read_json(_file(job_id, ".json")) or {}).get("after") or []]
-        if not all(deps):
-            return "a dependency was removed"
-        rows = snapshots(deps)
+        after = (read_json(_file(job_id, ".json")) or {}).get("after") or []
+        deps = [read_json(_file(dep, ".json")) for dep in after]
+        gone = [dep for dep, meta in zip(after, deps) if not meta]
+        if gone:  # removed from the list: what matters is how it had ended
+            removed = removed_jobs()
+            failed = next((dep for dep in gone if (removed.get(dep) or {}).get("status") != "done"), None)
+            if failed:
+                status = (removed.get(failed) or {}).get("status")
+                return f"dependency {failed} was removed" + (f" ({status})" if status else "")
+        rows = snapshots([m for m in deps if m])
         bad = next((r for r in rows if r["status"] not in ACTIVE and r["status"] != "done"), None)
         if bad:
             return f"dependency {bad['name']}: {bad['status']}"
@@ -2547,22 +2554,41 @@ def _caller() -> str:
     return " ".join(raw.decode(errors="replace").split("\0")).strip()[:200] or "?"
 
 
-def record_removal(meta: dict, status: str | None, why: str) -> None:
-    """Append to removed.log, so that a job missing from the list can be traced to the command that removed it."""
-    stamp = datetime.now().isoformat(timespec="seconds")
-    line = (f"{stamp}  {meta['id']}  {status or '?'}  {meta.get('name')!r}  by `jobrun {why}` "
-            f"(pid {os.getpid()} on {socket.gethostname()}, parent: {_caller()})\n")
+def record_removal(meta: dict, row: dict | None, why: str) -> None:
+    """Append to removed.log: how the job ended, for waits and dependencies that look for it later, and who removed
+    it, so that a job missing from the list can be traced."""
+    row = row or {}
+    entry = {"removed": time.time(), "id": meta["id"], "name": meta.get("name"), "status": row.get("status"),
+             "ended": row.get("ended"), "pool": meta.get("pool"), "role": meta.get("role"),
+             "by": f"jobrun {why}", "host": socket.gethostname(), "pid": os.getpid(), "parent": _caller()}
     try:
         with open(HOME / "removed.log", "a") as handle:
-            handle.write(line)
+            handle.write(json.dumps(entry) + "\n")
     except OSError:
         pass
 
 
-def remove(meta: dict, keep_log: bool = False, status: str | None = None, why: str = "rm") -> None:
+def removed_jobs() -> dict[str, dict]:
+    """The removed.log entries by job id (the newest per id); lines that are not JSON are skipped."""
+    found = {}
+    try:
+        with open(HOME / "removed.log") as handle:
+            for line in handle:
+                try:
+                    entry = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(entry, dict) and entry.get("id"):
+                    found[entry["id"]] = entry
+    except OSError:
+        pass
+    return found
+
+
+def remove(meta: dict, keep_log: bool = False, row: dict | None = None, why: str = "rm") -> None:
     """Drop a job from the registry, with the log if jobrun wrote it; logs it only read are kept. Every removal is
-    recorded in removed.log with why (the jobrun command) and the calling process."""
-    record_removal(meta, status, why)
+    recorded in removed.log with the job's row (status, end), why (the jobrun command) and the calling process."""
+    record_removal(meta, row, why)
     for suffix in (".json", ".exit.json", ".hb", ".stopped", ".state.json", ".trim"):
         _file(meta["id"], suffix).unlink(missing_ok=True)
     for scan in JOBS.glob(f"{meta['id']}.scan*.json"):
@@ -2578,7 +2604,7 @@ def cmd_rm(args) -> int:
         if row["status"] in ACTIVE and not args.force and not empty_pool:  # an empty pool has nothing to stop
             print(f"{meta['id']} is {row['status']}; stop it first or pass --force", file=sys.stderr)
             continue
-        remove(meta, args.keep_log, row["status"], "rm" + (" --force" if args.force else ""))
+        remove(meta, args.keep_log, row, "rm" + (" --force" if args.force else ""))
         print(f"removed {meta['id']}  {meta.get('name')}")
     return 0
 
@@ -2589,7 +2615,7 @@ def clean(days: float, why: str = "clean") -> int:
     removed = 0
     for meta, row in zip(metas, snapshots(metas)):
         if row["status"] not in ACTIVE and not visible(row, days):
-            remove(meta, status=row["status"], why=f"{why} --days {days:g}")
+            remove(meta, row=row, why=f"{why} --days {days:g}")
             removed += 1
     return removed
 
@@ -2681,19 +2707,39 @@ def cmd_wait(args) -> int:
             print(_wait_line(r, f"{fmt_progress(r)}  {fmt_duration(r['elapsed_s'])}"))
         # a pool whose workers all succeeded with items left (incomplete) needs a look before the next step
         return 0 if rows and all(r["status"] == "done" and not r.get("incomplete") for r in rows) else 1
-    # events and stalls count from now on, so waiting again on the same jobs does not return for old ones
+    # what counts as new: events, stalls and pool members that end from now on, or, with --since, from that time on
+    # (the rearm line of the previous wait), so nothing that happened between two waits is lost
+    since = args.since
+    checked = time.time()
     rows = load()
-    baseline = {i: (r.get("event_count", 0), bool(r.get("stalled"))) for i, r in rows.items()}
-    # pool members that had ended before the wait started; a worker that fails is also a pool event (pool_row),
-    # reported once through that event
-    members_ended = {i for i, r in rows.items() if r.get("pool") in pools and r["status"] not in ACTIVE}
+
+    def ended_by(row: dict) -> float:
+        return row.get("ended") or row.get("started") or 0
+
+    def old_events(row: dict) -> int:
+        if since is None:
+            return row.get("event_count", 0)
+        return row.get("event_count", 0) - sum(1 for e in row.get("events") or [] if (e.get("at") or 0) > since)
+
+    baseline = {i: (old_events(r), bool(r.get("stalled"))) for i, r in rows.items()}
+    # pool members whose end is not news; a worker that fails is also a pool event (pool_row), reported through it
+    members_ended = {i for i, r in rows.items() if r.get("pool") in pools and r["status"] not in ACTIVE
+                     and (since is None or ended_by(r) <= since)}
+    removed_seen = set()
+    if since is None:  # removals before the wait started are not news either
+        removed_seen = {i for i, e in removed_jobs().items() if e.get("pool") in pools or i in ids}
+    previous = dict(rows)
     while True:
         lines, ok = [], True
+        removed = None
         for job_id in ids:
             row = rows.get(job_id)
             if row is None:
-                lines.append(f"{job_id}  removed from the registry")
-                ok = False
+                removed = removed if removed is not None else removed_jobs()
+                entry = removed.get(job_id) or {}
+                status = entry.get("status") or "?"
+                lines.append(f"{job_id}  {status:<9} {entry.get('name') or ''}  removed from the registry")
+                ok = ok and status == "done"
                 continue
             seen_events, was_stalled = baseline.get(job_id, (0, False))
             if row["status"] not in ACTIVE:
@@ -2712,27 +2758,47 @@ def cmd_wait(args) -> int:
                                              f"(average step {fmt_duration(row['step_s'])})"))
                 ok = False
             baseline[job_id] = (baseline.get(job_id, (0, False))[0], bool(row.get("stalled")))
+
+        def member_line(member: dict, status: str, detail: str) -> str:
+            pool = rows.get(member["pool"]) or previous.get(member["pool"]) or {}
+            role = "monitor" if member.get("role") == "monitor" else "worker"
+            return (f"{member['id']}  {status:<9} {member.get('name') or ''}  "
+                    f"{role} of pool {pool.get('name')} ({member['pool']})  {detail}").rstrip()
+
         for member in rows.values():
             if member.get("pool") not in pools or member["status"] in ACTIVE or member["id"] in members_ended:
                 continue
             members_ended.add(member["id"])
             if member["status"] in ("error", "lost"):
                 continue  # already a new event of its pool, printed above
-            pool = rows.get(member["pool"]) or {}
-            role = "monitor" if member.get("role") == "monitor" else "worker"
-            lines.append(_wait_line(member, f"{role} of pool {pool.get('name')} ({member['pool']})  "
-                                            f"after {fmt_duration(member['elapsed_s'])}"))
+            lines.append(member_line(member, member["status"], f"after {fmt_duration(member['elapsed_s'])}"))
             ok = ok and member["status"] == "done"
+        # members removed before their end was reported: their pool no longer shows it, removed.log does
+        removed = removed if removed is not None else removed_jobs()
+        for job_id, entry in removed.items():
+            if (entry.get("pool") not in pools or job_id in rows or job_id in members_ended or job_id in removed_seen
+                    or (since is not None and job_id not in previous and (entry.get("ended") or 0) <= since)):
+                continue
+            removed_seen.add(job_id)
+            members_ended.add(job_id)
+            status = entry.get("status") or "?"
+            lines.append(member_line(entry, status, "removed from the registry"))
+            ok = ok and status == "done"
         if lines:
             break
         time.sleep(args.interval)
+        previous = rows
+        checked = time.time()
         rows = load()
     for line in lines:
         print(line)
-    active = [i + (f" ({rows[i]['active_workers']} workers)" if i in pools else "")
-              for i in ids if i in rows and rows[i]["status"] in ACTIVE]
+    active = [i for i in ids if i in rows and rows[i]["status"] in ACTIVE]
     if active:
-        print(f"still active: {' '.join(active)}")
+        shown = [i + (f" ({rows[i]['active_workers']} workers)" if i in pools else "") for i in active]
+        print(f"still active: {' '.join(shown)}")
+        # the time of the check that found these triggers: a new wait from there misses nothing that happens before
+        # it starts (an end in the few seconds the check took may be reported twice)
+        print(f"rearm: jobrun wait --any {' '.join(active)} --since {checked:.3f}")
     return 0 if ok else 1
 
 
@@ -2916,6 +2982,9 @@ def main(argv: list[str] | None = None) -> int:
                    help="return as soon as one job ends, reports a new JOBRUN_EVENT or starts to stall (one line per "
                         "trigger; exit 0 only if every trigger is a job that finished successfully)")
     p.add_argument("--interval", type=float, default=30, help="seconds between checks (default 30)")
+    p.add_argument("--since", type=float, metavar="TIME",
+                   help="with --any: also count events, pool members that ended and removals since this Unix time "
+                        "(the `rearm:` line of the previous wait prints it), not only those after the wait starts")
     p.set_defaults(func=cmd_wait)
 
     p = sub.add_parser("log", help="tail a job's log")
