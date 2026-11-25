@@ -744,7 +744,8 @@ class ResourcesProvider {
     item.tooltip = `${node.host} (${where})\nFree = total minus the larger of what is used and what is reserved ` +
       `(Slurm allocations plus the budgets of your other jobs).\nExpand CPU, RAM or GPU to see each job's share: used / reserved.\n` +
       `Means over the last ${duration(this.data.interval_s)}; RAM and VRAM are current.` +
-      (node.coarse ? '\nCPU and RAM use come from slurmd (load average, free memory) and lag by minutes.' : '');
+      (node.coarse ? '\nCPU and RAM use come from slurmd (load average, free memory) and lag by minutes; ' +
+        'when your jobs on the node measurably use more, their sum is shown instead.' : '');
     item.iconPath = new vscode.ThemeIcon(node.local ? 'vm' : 'server');
     return item;
   }
@@ -780,10 +781,10 @@ class ResourcesProvider {
     };
     const items = [
       resourceItem(`${id}:cpu`, 'CPU', node.cpus && node.cpu != null ? node.cpu / node.cpus : null,
-        `${cores(node.cpu)} / ${node.cpus || '?'} cores${node.coarse ? ' (load)' : ''} · ${cores(reserved.cpus)} reserved`,
+        `${cores(node.cpu)} / ${node.cpus || '?'} cores${node.cpu_from_jobs ? ' (your jobs)' : node.coarse ? ' (load)' : ''} · ${cores(reserved.cpus)} reserved`,
         null, 'pulse', cpuItems),
       resourceItem(`${id}:ram`, 'RAM', node.mem_total && node.mem != null ? node.mem / node.mem_total : null,
-        `${bytes(node.mem)} / ${bytes(node.mem_total)} · ${bytes(reserved.mem)} reserved`, null, 'database', ramItems),
+        `${bytes(node.mem)} / ${bytes(node.mem_total)}${node.mem_from_jobs ? ' (your jobs)' : ''} · ${bytes(reserved.mem)} reserved`, null, 'database', ramItems),
     ];
     for (const gpu of node.gpus || []) {
       items.push(resourceItem(`${id}:gpu${gpu.index}`, `GPU ${gpu.index}`, gpu.util / 100,

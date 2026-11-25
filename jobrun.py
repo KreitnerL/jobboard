@@ -1500,6 +1500,14 @@ def resources(rows: list[dict]) -> dict:
                             "measured": r["id"] in jobs_usage, **usage,
                             "reserved": job_reservation(r, reservations.get(str(r.get("slurm_id"))), limits.get(r["id"]))})
         node["jobs"] = members
+        if node.get("coarse"):
+            # slurmd's load average and free memory lag by minutes and can read near zero on a busy node; the node
+            # uses at least what our jobs on it measurably use (sstat)
+            for key, flag in (("cpu", "cpu_from_jobs"), ("mem", "mem_from_jobs")):
+                measured = sum(m.get(key) or 0 for m in members)
+                node[flag] = bool(measured) and (node.get(key) is None or measured > node[key])
+                if node[flag]:
+                    node[key] = measured
         # reserved on the node: Slurm's allocations (all users) plus the budgets of our jobs Slurm does not manage
         slurm_reserved = (node.get("slurm") or {}).get("reserved") or {"cpus": 0, "mem": 0, "gpus": 0}
         own = [m["reserved"] for m in members if m["reserved"] and m["reserved"]["source"] != "slurm"]
@@ -2410,11 +2418,15 @@ def cmd_res(args) -> int:
     print(f"means over the last {fmt_duration(result['interval_s'])}; RAM and VRAM now. used / reserved per job")
     for node in result["nodes"]:
         reserved = node["reserved"]
-        coarse = " (CPU, RAM: Slurm's load average and free memory, minutes old)" if node.get("coarse") else ""
+        coarse = (" (CPU, RAM: Slurm's load average and free memory, minutes old, or at least what your jobs use)"
+                  if node.get("coarse") else "")
         print(f"\n{node['host']}{' (this machine)' if node.get('local') else ''}{coarse}")
         cpu = f"{node['cpu']:.1f}" if node.get("cpu") is not None else "?"
-        print(f"  CPU    {cpu:>6} / {node.get('cpus') or '?'} cores   reserved {reserved['cpus']:g}")
-        print(f"  RAM    {fmt_bytes(node.get('mem')):>6} / {fmt_bytes(node.get('mem_total'))}   reserved {fmt_bytes(reserved['mem'])}")
+        jobs_note = lambda flag: "   (your jobs; Slurm reports less)" if node.get(flag) else ""
+        print(f"  CPU    {cpu:>6} / {node.get('cpus') or '?'} cores   reserved {reserved['cpus']:g}"
+              f"{jobs_note('cpu_from_jobs')}")
+        print(f"  RAM    {fmt_bytes(node.get('mem')):>6} / {fmt_bytes(node.get('mem_total'))}   reserved "
+              f"{fmt_bytes(reserved['mem'])}{jobs_note('mem_from_jobs')}")
         for gpu in node.get("gpus") or []:
             print(f"  GPU{gpu['index']}   {gpu['util']:5.0f}%   vram {fmt_bytes(gpu['vram'])} / {fmt_bytes(gpu['vram_total'])}"
                   f"   {gpu['name']}")

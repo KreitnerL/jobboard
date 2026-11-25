@@ -728,6 +728,29 @@ def test_res_attributes_cpu_and_memory_to_the_job(jobrun, monkeypatch):
     assert "busy" in jobrun("res").stdout
 
 
+def test_res_slurm_node_uses_at_least_what_our_jobs_use(tmp_path, monkeypatch):
+    """slurmd's load and free memory can read near zero on a busy node; the node shows our jobs' measured sum."""
+    monkeypatch.setattr(jobrun_module, "HOME", tmp_path)
+    monkeypatch.setattr(jobrun_module, "RES_FIRST_S", 0)
+    gib = 2 ** 30
+    node = {"cpus": 36, "load": 0.0, "mem": 117 * gib, "mem_free": 115 * gib, "gpus": 1, "state": "mixed",
+            "reserved": {"cpus": 16, "mem": 96 * gib, "gpus": 1},
+            "slurm_jobs": [{"slurm_id": "7", "user": "me", "mine": True, "cpus": 12, "mem": 48 * gib, "gpus": 1}]}
+    busy_node = dict(node, load=20.0, mem_free=50 * gib)
+    row = {"id": "j1", "name": "w", "status": "running", "kind": "slurm", "slurm_id": "7", "host": "eris",
+           "elapsed_s": 100.0}
+    monkeypatch.setattr(jobrun_module, "_sstat", lambda ids: {"7": {"cpu_s": 1200.0, "mem": 40 * gib, "vram": 0,
+                                                                     "gpu_util": None}})
+    monkeypatch.setattr(jobrun_module.shutil, "which", lambda name: "/usr/bin/" + name)
+    for info, cpu, mem, from_jobs in ((node, 12.0, 40 * gib, True), (busy_node, 20.0, 67 * gib, False)):
+        monkeypatch.setattr(jobrun_module, "_slurm_nodes", lambda hosts, info=info: {"eris": info})
+        (tmp_path / "hosts").mkdir(exist_ok=True)
+        for f in (tmp_path / "hosts").iterdir():
+            f.unlink()
+        eris = next(n for n in jobrun_module.resources([row])["nodes"] if n["host"] == "eris")
+        assert (eris["cpu"], eris["mem"], eris["cpu_from_jobs"], eris["mem_from_jobs"]) == (cpu, mem, from_jobs, from_jobs)
+
+
 def test_reservation_prefers_slurm_then_budget_then_cgroup():
     reserve = jobrun_module.job_reservation
     slurm = {"cpus": 8, "mem": 48 * 2 ** 30, "gpus": 1}
