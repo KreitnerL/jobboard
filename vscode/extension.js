@@ -1269,7 +1269,8 @@ class ClusterProvider {
       cells.push(`${node.available ? light(f[key])[0] : '⚪'} ${label}`, right(fmt(held(node, key))),
         `/${node[key] != null ? fmt(node[key]) : '?'}`, key === 'gpus' ? node.gpu_types.join('+') : '');
     }
-    return [...cells, counts, notes];
+    // the state first in the last column: in a narrow sidebar the end of a row is cut off
+    return [...cells, [notes, counts].filter(Boolean).join(' · ')];
   }
 
   nodeItem(node) {
