@@ -70,7 +70,9 @@ The user watches all long jobs on a dashboard fed by `jobrun`. A job that is not
    run background commands, tell the user that you will not notice the end on your own.
 7. Do not stop or remove jobs you did not start unless the user asks.
 8. Before starting jobs that need many cores, much RAM or a GPU, check `jobrun res`: per node it shows what is
-   used and reserved, and each job's used / reserved, so you can size new jobs to what is free.
+   used and reserved, and each job's used / reserved, so you can size new jobs to what is free. To pick a Slurm
+   node or partition, `jobrun cluster` lists every node with its CPUs, RAM and GPUs allocated of total
+   (`-j`: the jobs on each node with owner, time limit and end; queued jobs with their expected start).
 9. Give every job a CPU reservation when its worker count is known (Slurm jobs have one already). Best: the
    program prints `JOBRUN_BUDGET cpus=N` (also `mem=96G`, `gpus=1`; again when a stage uses a different number).
    Otherwise pass it at launch: `jobrun run --cpus 10 --mem 96G -- …`, or `jobrun edit ID --cpus 10` later.

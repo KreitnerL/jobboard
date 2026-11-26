@@ -1119,3 +1119,111 @@ def test_a_dependency_removed_after_it_succeeded_still_counts_as_done(jobrun, mo
     wait_for(jobrun, "base", "done")
     jobrun("rm", "base")  # before "follow" polls again
     assert wait_for(jobrun, "follow", "done")["exit_code"] == 0
+
+
+def fake_slurm(monkeypatch, outputs: dict[str, str]):
+    """subprocess.run stand-in: each Slurm command prints outputs[name]."""
+    def run(cmd, **kwargs):
+        return subprocess.CompletedProcess(cmd, 0, stdout=outputs.get(cmd[0], ""), stderr="")
+    monkeypatch.setattr(jobrun_module.subprocess, "run", run)
+    monkeypatch.setattr(jobrun_module.shutil, "which", lambda name: "/usr/bin/" + name)
+
+
+SINFO = "\n".join([
+    "gpu1|main*|mixed|8/24/0/32|3.5|128000|65536|60000|gpu:a100:4(S:0),gpumem:a100:no_consume:80G|"
+    "gpu:a100:2(IDX:0-1),gpumem:a100:0|14-00:00:00",
+    "gpu1|long|mixed|8/24/0/32|3.5|128000|65536|60000|gpu:a100:4(S:0)|gpu:a100:2(IDX:0-1)|infinite",
+    "gpu2|main*|drained*|0/0/32/32|0.00|128000|0|N/A|gpu:a100:4(S:0)|gpu:a100:0(IDX:N/A)|14-00:00:00",
+    "ws|ws|idle|0/16/0/16|0.10|64000|0|50000|(null)|gpu:0|infinite",
+])
+SQUEUE = "\n".join([
+    "11|alice|main|RUNNING|1-00:00:00|2026-11-26T10:00:00|2026-11-27T10:00:00|gpu1|(null)|"
+    "cpu=8,mem=64G,node=1,billing=8,gres/gpu=2|None|train | big",
+    "12|me|main,long|RUNNING|4:00:00|2026-11-26T11:00:00|2026-11-26T15:00:00|gpu[1-2]|(null)|"
+    "cpu=16,mem=32G,node=2,gres/gpu=2|None|spread",
+    "13|bob|main|PENDING|40:00|2026-11-27T12:00:00|2026-11-27T12:40:00||gpu1|cpu=4,mem=24G,gres/gpu=1|Priority|next",
+    "14|bob|main|PENDING|40:00|N/A|N/A||(null)|cpu=4,mem=24G|Dependency|later",
+])
+
+
+def test_cluster_lists_nodes_partitions_and_their_jobs(tmp_path, monkeypatch):
+    monkeypatch.setattr(jobrun_module, "HOME", tmp_path)
+    monkeypatch.setattr(jobrun_module, "HOST", "ws")
+    monkeypatch.setattr(jobrun_module.getpass, "getuser", lambda: "me")
+    monkeypatch.setattr(jobrun_module, "_local_usage", lambda: {"cpus": 3.0, "mem": 2 ** 30, "gpus": 0, "cpus_total": 16,
+                                                                "mem_total": 2 ** 36, "gpu_count": 0})
+    fake_slurm(monkeypatch, {"sinfo": SINFO, "squeue": SQUEUE})
+    result = jobrun_module.cluster()
+    parts = {p["name"]: p for p in result["partitions"]}
+    assert parts["main"]["default"] and parts["main"]["nodes"] == ["gpu1", "gpu2"]
+    assert parts["long"]["time_limit_s"] is None and parts["main"]["time_limit_s"] == 14 * 86400
+    nodes = {n["name"]: n for n in result["nodes"]}
+    gpu1, gpu2, ws = nodes["gpu1"], nodes["gpu2"], nodes["ws"]
+    assert gpu1["partitions"] == ["main", "long"]  # listed once per partition by sinfo, one node here
+    assert (gpu1["cpus"], gpu1["cpus_alloc"], gpu1["gpus"], gpu1["gpus_alloc"]) == (32, 8, 4, 2)
+    assert gpu1["mem_alloc"] == 65536 * 2 ** 20 and gpu1["gpu_types"] == ["a100"] and gpu1["available"]
+    assert not gpu2["available"] and ws["available"] and ws["local"] and ws["used"]["cpus"] == 3.0
+    big, spread = gpu1["jobs"]
+    assert (big["name"], big["user"], big["mine"], big["time_limit_s"]) == ("train | big", "alice", False, 86400)
+    assert (spread["mine"], spread["cpus"], spread["gpus"], spread["nodes"]) == (True, 8, 1, 2)  # half on each node
+    assert [j["name"] for j in gpu2["jobs"]] == ["spread"]
+    queued = gpu1["pending"]  # a queued job appears only on the node the scheduler planned for it
+    assert [j["name"] for j in queued] == ["next"] and queued[0]["expected_start"] and queued[0]["reason"] == "Priority"
+    # a second reader within CLUSTER_TTL_S gets the shared answer without asking Slurm again
+    fake_slurm(monkeypatch, {"sinfo": "", "squeue": ""})
+    assert {n["name"] for n in jobrun_module.cluster()["nodes"]} == {"gpu1", "gpu2", "ws"}
+
+
+def test_cluster_adds_this_machine_when_it_is_no_slurm_node(tmp_path, monkeypatch):
+    monkeypatch.setattr(jobrun_module, "HOME", tmp_path)
+    monkeypatch.setattr(jobrun_module, "HOST", "laptop")
+    monkeypatch.setattr(jobrun_module.shutil, "which", lambda name: None)
+    result = jobrun_module.cluster()
+    assert not result["slurm"] and [n["name"] for n in result["nodes"]] == ["laptop"]
+    assert result["slurm_status"] == "missing" and "sinfo and squeue not found" in result["slurm_message"]
+    assert set(result["slurm_needed"]) == {"sinfo", "squeue"}
+    here = result["nodes"][0]
+    assert here["local"] and here["partitions"] == [] and here["cpus"] == os.cpu_count() and here["used"]["mem"] > 0
+
+
+def test_node_availability_from_sinfo_state():
+    available = jobrun_module._node_available
+    assert available("idle") and available("mixed-") and available("allocated") and available("completing")
+    assert not available("drained*") and not available("draining") and not available("down*")
+    assert not available("completing*")  # '*': not responding
+
+
+def test_queued_slurm_job_shows_expected_start(tmp_path, monkeypatch):
+    monkeypatch.setattr(jobrun_module, "HOME", tmp_path)
+    monkeypatch.setattr(jobrun_module.getpass, "getuser", lambda: "me")
+    soon = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(time.time() + 3600))
+    fake_slurm(monkeypatch, {"sacct": "42|PENDING|0:0|Unknown|Unknown|None assigned\n",
+                             "squeue": f"42|{soon}|eris|Priority\n41|N/A|(null)|Dependency\n"})
+    info = jobrun_module.query_slurm(["42"])["42"]
+    assert info["status"] == "waiting" and abs(info["expected_start"] - (time.time() + 3600)) < 2
+    assert (info["sched_nodes"], info["pending_reason"]) == ("eris", "Priority")
+    row = {"status": "waiting", "waiting_for": ["Slurm queue"], **info}
+    assert jobrun_module._fmt_progress(row).startswith("waiting for Slurm queue, start ~")
+    assert jobrun_module._fmt_progress(row).endswith(" on eris (Priority)")
+
+
+def test_cluster_reports_a_slurm_controller_that_does_not_answer(tmp_path, monkeypatch):
+    monkeypatch.setattr(jobrun_module, "HOME", tmp_path)
+    monkeypatch.setattr(jobrun_module, "HOST", "ws")
+    monkeypatch.setattr(jobrun_module.shutil, "which", lambda name: "/usr/bin/" + name)
+
+    def run(cmd, **kwargs):
+        if cmd[0] == "sinfo" and fail_sinfo:
+            return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="sinfo: error: Unable to contact slurm controller\n")
+        if cmd[0] == "squeue":
+            return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="squeue: error: Invalid user\n")
+        return subprocess.CompletedProcess(cmd, 0, stdout=SINFO, stderr="")
+    monkeypatch.setattr(jobrun_module.subprocess, "run", run)
+    fail_sinfo = True
+    result = jobrun_module.cluster()
+    assert result["slurm_status"] == "error" and "Unable to contact slurm controller" in result["slurm_message"]
+    assert [n["name"] for n in result["nodes"]] == ["ws"] and not (tmp_path / "cluster-cache.json").exists()
+    fail_sinfo = False  # sinfo answers, squeue does not: nodes without their jobs, not shared with other readers
+    result = jobrun_module.cluster()
+    assert result["slurm_status"] == "partial" and "squeue failed: squeue: error: Invalid user" in result["slurm_message"]
+    assert {n["name"] for n in result["nodes"]} == {"gpu1", "gpu2", "ws"} and not (tmp_path / "cluster-cache.json").exists()

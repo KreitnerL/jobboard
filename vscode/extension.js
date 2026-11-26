@@ -175,6 +175,20 @@ function eventText(job) {
   return `⚠ ${newest.level}: ${newest.message}${more}`;
 }
 
+// A job in the Slurm queue: when and where the scheduler expects to start it, and why it still waits.
+function queueText(job) {
+  const parts = [];
+  if (job.expected_start && job.expected_start > Date.now() / 1000) {
+    parts.push(`start ~${clock(job.expected_start)}${job.sched_nodes ? ` on ${job.sched_nodes}` : ''}`);
+  }
+  if (job.pending_reason) parts.push(`(${job.pending_reason})`);
+  return parts.join(' ');
+}
+
+function waitingText(job) {
+  return [`waiting for ${(job.waiting_for || []).join(', ') || 'dependencies'}`, queueText(job)].filter(Boolean).join(' · ');
+}
+
 // A pool's workers: how many run, on how many hosts, and how many failed.
 // A pool's members: running workers (all while none runs), monitors, the machines the workers run on, failures.
 function workersText(pool, jobs) {
@@ -192,7 +206,7 @@ function workersText(pool, jobs) {
 function describeWorker(job) {
   const parts = [];
   if (job.degraded) parts.push(eventText(job));
-  if (job.status === 'waiting') return `waiting for ${(job.waiting_for || []).join(', ') || 'dependencies'}`;
+  if (job.status === 'waiting') return waitingText(job);
   parts.push(job.reason ? `${job.status}: ${job.reason}` : job.status);
   if (job.role === 'monitor') parts.push('monitor');
   parts.push([job.host, job.slurm_id && `slurm ${job.slurm_id}`].filter(Boolean).join(' '));
@@ -212,7 +226,7 @@ function describe(job, jobs = [], part = 'all') {
     parts.push(`${job.finished}/${job.jobs} jobs${other.length ? ` (${other.join(', ')})` : ''}`);
   }
   if (job.kind === 'pool') parts.push(workersText(job, jobs));
-  if (!job.jobs && job.status === 'waiting') return part === 'tail' ? '' : `waiting for ${(job.waiting_for || []).join(', ') || 'dependencies'}`;
+  if (!job.jobs && job.status === 'waiting') return part === 'tail' ? '' : waitingText(job);
   if (!job.jobs && job.status === 'cancelled') return part === 'tail' ? '' : `cancelled: ${job.reason || 'never started'}`;
   if (job.stage) parts.push(`${job.stage_no}/${job.stage_of || '?'} ${job.stage}`);
   let cut = null;
@@ -271,6 +285,8 @@ function tooltip(job) {
     ['average step', job.step_s && duration(job.step_s)],
     ['cwd', job.cwd], ['log', job.log], ['log size', logNote(job)],
     ['after', (job.after_names || []).join(', ')], ['waiting for', (job.waiting_for || []).join(', ')], ['reason', job.reason],
+    ['expected start', job.expected_start && `${new Date(job.expected_start * 1000).toLocaleString()} (Slurm's estimate; it moves as other jobs end or arrive)`],
+    ['planned nodes', job.sched_nodes], ['why queued', job.pending_reason],
     ['workers', job.kind === 'pool' && `${job.active_workers} running of ${(job.workers || []).length}${(job.monitors || []).length ? `, ${job.monitors.length} monitor` : ''}`],
     ['last item', job.item_label],
   ];
@@ -489,7 +505,7 @@ class JobsProvider {
         const sections = hosts.map(host => {
           const list = entries(top.filter(job => hostOf(job) === host), `${host}/`);
           return { host, list: [...active(list), ...finished(list)], busy: active(list).length };
-        }).sort((a, b) => (b.busy > 0) - (a.busy > 0) || a.host.localeCompare(b.host));
+        }).sort((a, b) => (b.busy > 0) - (a.busy > 0) || a.host.localeCompare(b.host, undefined, { numeric: true }));
         return [...warnings, ...sections.map(sec => section(sec.host, sec.list, sec.busy > 0, true))];
       }
       const all = entries(top);
@@ -622,6 +638,136 @@ function detailItems(job) {
   });
 }
 
+// ---------------------------------------------------------------- columns
+// Tree rows use the proportional UI font, so rows that should read as a grid pad each cell to the widest cell of its
+// column. Widths are estimates in em, averaged over the humanist UI fonts VS Code uses (Segoe UI, San Francisco,
+// Ubuntu / Noto Sans), and the padding consists of figure spaces (the width of a digit) and punctuation spaces (the
+// width of a period), which HTML does not collapse. Digits, spaces and the fixed words of a column cost no error;
+// only cells with letters (names) are estimated, to within a few pixels. Emoji count the same in every row of a
+// column, so their width cancels.
+
+const CHAR_EM = {};
+for (const [chars, em] of [
+  ['0123456789#$?', 0.556], ['bdghnpqu', 0.59], ['a', 0.54], ['c', 0.47], ['e', 0.55], ['o', 0.58], ['s', 0.45],
+  ['ijl\'', 0.25], ['f', 0.31], ['t', 0.34], ['r', 0.37], ['k', 0.51], ['vxy', 0.5], ['z', 0.46], ['m', 0.89],
+  ['w', 0.77], [' ', 0.26], ['.,:;!|', 0.26], ['/', 0.33], ['-', 0.32], ['_', 0.45], ['()[]', 0.31],
+  ['A', 0.65], ['B', 0.62], ['C', 0.63], ['D', 0.7], ['E', 0.53], ['F', 0.5], ['G', 0.7], ['H', 0.72], ['I', 0.28],
+  ['J', 0.27], ['K', 0.6], ['L', 0.5], ['M', 0.87], ['N', 0.74], ['OQ', 0.74], ['P', 0.58], ['R', 0.61], ['S', 0.53],
+  ['T', 0.55], ['U', 0.71], ['V', 0.62], ['W', 0.93], ['X', 0.6], ['Y', 0.57], ['Z', 0.56],
+  ['+=<>~', 0.58], ['%', 0.82], ['*', 0.45], ['·', 0.3], ['…', 0.85], ['█░', 0.64],
+]) for (const ch of chars) CHAR_EM[ch] = em;
+CHAR_EM['\u2007'] = CHAR_EM['0'];
+CHAR_EM['\u2008'] = CHAR_EM['.'];
+const FIGURE_SPACE = ' ';  // as wide as a digit
+const PUNCT_SPACE = ' ';  // as wide as a period
+
+function textWidth(text) {
+  let width = 0;
+  for (const ch of String(text)) width += CHAR_EM[ch] ?? (ch.codePointAt(0) >= 0x2600 ? 1.25 : 0.556);
+  return width;
+}
+
+function withoutPadding(text) {
+  return String(text).replace(/[\u2007\u2008]+$/, '');
+}
+
+function spaces(em) {
+  const figures = Math.max(0, Math.floor((em + 0.14) / CHAR_EM['0']));
+  return FIGURE_SPACE.repeat(figures) + (em - figures * CHAR_EM['0'] >= 0.14 ? PUNCT_SPACE : '');
+}
+
+// rows: arrays of cells; a cell is a string or { text, right: true } (right-aligned, e.g. numbers). seps[i] goes
+// before column i (default two spaces). Returns one string per row; the last column is not padded.
+function grid(rows, seps = []) {
+  const n = Math.max(0, ...rows.map(r => r.length));
+  const text = cell => (cell == null ? '' : typeof cell === 'string' ? cell : cell.text);
+  const widths = [...Array(n).keys()].map(i => Math.max(0, ...rows.map(r => textWidth(text(r[i])))));
+  return rows.map(r => [...Array(n).keys()].map(i => {
+    const value = text(r[i]);
+    const gap = i === n - 1 && !(r[i] && r[i].right) ? '' : spaces(widths[i] - textWidth(value));
+    return (i ? seps[i] ?? '  ' : '') + (r[i] && r[i].right ? gap + value : value + gap);
+  }).join('').replace(/[  ]+$/, ''));
+}
+
+// Pad the labels of sibling rows to the same width, so their descriptions start in one column.
+// Idempotent: rows that are drawn again (e.g. re-expanded) are not padded twice.
+function alignLabels(items) {
+  for (const item of items) item.label = withoutPadding(item.label);
+  const width = Math.max(0, ...items.map(item => textWidth(item.label)));
+  for (const item of items) item.label += spaces(width - textWidth(item.label));
+  return items;
+}
+
+// ---------------------------------------------------------------- filter
+// The filter of the Resources and Cluster views (button in the title bar): only rows whose text (label, description
+// and tooltip: node, job, user, GPU model, partition, ...) contains the query, with the rows above them, expanded. A row
+// that matches itself keeps all its rows below (collapsed). The ids carry the query, so VS Code expands the rows anew
+// for each query instead of restoring what was expanded before.
+
+function rowText(item) {
+  const tooltip = item.tooltip && typeof item.tooltip === 'object' ? item.tooltip.value : item.tooltip || '';
+  return `${item.label} ${item.description || ''} ${tooltip}`.replace(/[\u2007\u2008\s]+/g, ' ').toLowerCase();
+}
+
+function expandable(item) {
+  return item.collapsibleState && item.collapsibleState !== vscode.TreeItemCollapsibleState.None;
+}
+
+function anyMatch(provider, item, query) {
+  return rowText(item).includes(query) || (expandable(item) && provider.rows(item).some(child => anyMatch(provider, child, query)));
+}
+
+// provider: rows(element) gives the unfiltered rows, filter the lowercase query, data / error its state
+function filteredRows(provider, element) {
+  const rows = provider.rows(element);
+  const query = provider.filter;
+  if (!query || !provider.data || provider.error || (element && element.unfiltered)) return rows;
+  const kept = [];
+  for (const item of rows) {
+    const own = rowText(item).includes(query);
+    if (!own && !(expandable(item) && provider.rows(item).some(child => anyMatch(provider, child, query)))) continue;
+    item.unfiltered = own;
+    item.baseId = item.baseId || item.id;
+    if (item.baseId) item.id = `${item.baseId}~filter:${query}`;
+    if (!own) item.collapsibleState = vscode.TreeItemCollapsibleState.Expanded;
+    kept.push(item);
+  }
+  if (!element && provider.view) provider.view.message = kept.length ? `Filter: "${query}"` : `Nothing matches "${query}"`;
+  return kept;
+}
+
+// The filter's input box: filters while typing; the query stays when the box closes.
+function editFilter(provider, contextKey, title) {
+  const box = vscode.window.createInputBox();
+  box.title = title;
+  box.placeholder = 'node, job, user, GPU model, partition, …';
+  box.value = provider.filter || '';
+  box.onDidChangeValue(value => setFilter(provider, contextKey, value));
+  box.onDidAccept(() => box.hide());
+  box.onDidHide(() => box.dispose());
+  box.show();
+}
+
+function setFilter(provider, contextKey, text) {
+  provider.filter = text.trim().replace(/\s+/g, ' ').toLowerCase();
+  vscode.commands.executeCommand('setContext', contextKey, Boolean(provider.filter));
+  if (!provider.filter && provider.view) provider.view.message = undefined;
+  provider.emitter.fire();
+}
+
+// Long job names would push every row's columns far right: keep the start and the end, which tell runs apart.
+function shortName(name, max = 26) {
+  return name.length <= max ? name : `${name.slice(0, Math.ceil(max / 2) - 1)}…${name.slice(-Math.floor(max / 2))}`;
+}
+
+const right = text => ({ text, right: true });
+
+// What a node's children are in a view (jobboard.resourcesNodeDetails, jobboard.clusterNodeDetails): one row per
+// resource with the jobs below, or the jobs directly.
+function nodeDetails(view) {
+  return config().get(`${view}NodeDetails`) === 'jobs' ? 'jobs' : 'resources';
+}
+
 // ---------------------------------------------------------------- resources view
 // `jobrun res --json`: per node CPU, RAM, GPU, VRAM (means over the time since the last call), Slurm reservations
 // and per-job usage. Polled only while the view is visible, every jobboard.resourceSeconds.
@@ -634,12 +780,6 @@ function bytes(n) {
 
 function cores(n) {
   return n == null ? '?' : `${+n.toFixed(n >= 10 ? 0 : 1)}`;
-}
-
-// what is left for new jobs: the total minus whichever is larger, what is used or what Slurm has reserved
-function free(total, used, reserved) {
-  if (total == null) return null;
-  return Math.max(0, total - Math.max(used || 0, reserved || 0));
 }
 
 const SOURCES = { slurm: 'Slurm allocation', budget: 'declared (JOBRUN_BUDGET line or --cpus/--mem/--gpus)', cgroup: 'cgroup limit (e.g. systemd-run MemoryMax)' };
@@ -655,31 +795,46 @@ function resourceItem(id, label, fraction, text, tooltip, icon, children) {
   return item;
 }
 
-// One job's share of a resource: used / reserved, with a bar of used against reserved when it has a reservation.
-function shareItem(id, job, used, reserved, fmt, extra) {
-  const item = new vscode.TreeItem(job.name);
-  item.id = id;
+function jobTooltip(job) {
   const r = job.reserved;
-  const usedText = !job.measured ? 'no data' : used == null ? '?' : fmt(used);
-  const fraction = job.measured && used != null && reserved ? used / reserved : null;
-  item.description = [fraction != null ? bar(fraction, 6) : '', reserved != null ? `${usedText} / ${fmt(reserved)}` : `${usedText} · no budget`,
-    extra].filter(Boolean).join(' ');
-  item.tooltip = `${job.name} (${job.id})${job.group ? `\ngroup: ${job.group}` : ''}\n` +
+  return `${job.name} (${job.id})${job.group ? `\ngroup: ${job.group}` : ''}\n` +
     (r ? `reserved: ${cores(r.cpus)} CPUs · ${bytes(r.mem)} RAM · ${cores(r.gpus)} GPU\nfrom: ${r.source.split('+').map(k => SOURCES[k] || k).join(', ')}`
       : 'No budget: not a Slurm job, no JOBRUN_BUDGET line or --cpus/--mem/--gpus, no cgroup limit.') +
     (job.kind === 'slurm' ? '\nUsage from sstat.' : '\nRAM is the resident memory of its processes (shared pages count once per process).');
+}
+
+function runningIcon(job) {
   const running = job.pool ? (job.role === 'monitor' ? 'eye' : 'gear~spin') : 'sync~spin';  // as in the Jobs view
-  item.iconPath = new vscode.ThemeIcon(running, new vscode.ThemeColor('charts.blue'));
+  return new vscode.ThemeIcon(running, new vscode.ThemeColor('charts.blue'));
+}
+
+// One job's share of a resource: used / reserved, with a bar of used against reserved when it has a reservation.
+function shareItem(id, job, used, reserved, fmt, extra) {
+  const item = new vscode.TreeItem(shortName(job.name));
+  item.id = id;
+  const usedText = !job.measured ? 'no data' : used == null ? '?' : fmt(used);
+  const fraction = job.measured && used != null && reserved ? used / reserved : null;
+  // grid cells, aligned with the job's siblings in getChildren
+  item.cells = [fraction != null ? bar(fraction, 6) : '', reserved != null ? `${usedText} / ${fmt(reserved)}` : `${usedText} · no budget`, extra || ''];
+  item.tooltip = jobTooltip(job);
+  item.iconPath = runningIcon(job);
   return item;
 }
 
-function plainItem(id, label, description, tooltip, icon) {
+function plainItem(id, label, description, tooltip, icon, cells) {
   const item = new vscode.TreeItem(label);
   item.id = id;
   item.description = description;
+  if (cells) item.cells = cells;
   item.tooltip = tooltip;
   item.iconPath = new vscode.ThemeIcon(icon);
   return item;
+}
+
+// used / reserved as two grid cells, e.g. "0.7" "/2"; "no data" for a job that could not be measured
+function usedOf(job, used, reserved, fmt) {
+  const text = !job.measured ? 'no data' : used == null ? '?' : fmt(used);
+  return [right(text), reserved != null ? `/${fmt(reserved)}` : ''];
 }
 
 class ResourcesProvider {
@@ -715,6 +870,10 @@ class ResourcesProvider {
   }
 
   getChildren(element) {
+    return filteredRows(this, element);
+  }
+
+  rows(element) {
     if (!element) {
       if (this.error) {
         const item = new vscode.TreeItem(`jobrun res failed: ${this.error}`);
@@ -723,31 +882,82 @@ class ResourcesProvider {
         return [item];
       }
       if (!this.data) return [new vscode.TreeItem('Measuring…')];
-      return (this.data.nodes || []).map(node => this.nodeItem(node));
+      const nodes = this.data.nodes || [];
+      const items = nodes.map(node => this.nodeItem(node));
+      if (nodeDetails('resources') === 'jobs') {
+        grid(nodes.map(node => this.nodeCells(node))).forEach((text, i) => { items[i].description = text; });
+      }
+      return alignLabels(items);
     }
-    if (element.node) return this.nodeChildren(element.node);
-    return element.children || [];
+    if (element.node) return nodeDetails('resources') === 'jobs' ? this.jobRows(element.node) : alignLabels(this.nodeChildren(element.node));
+    const children = element.children || [];
+    const cells = children.filter(item => item.cells);
+    grid(cells.map(item => item.cells), ['', ' ', '  ']).forEach((text, i) => { cells[i].description = text; });
+    return alignLabels(children);
   }
 
   nodeItem(node) {
     const item = new vscode.TreeItem(node.host, vscode.TreeItemCollapsibleState.Expanded);
     item.id = `node:${node.host}`;
     item.node = node;
-    const reserved = node.reserved || {};
-    const left = [
-      free(node.cpus, node.cpu, reserved.cpus) != null && `${cores(free(node.cpus, node.cpu, reserved.cpus))} cores`,
-      free(node.mem_total, node.mem, reserved.mem) != null && `${bytes(free(node.mem_total, node.mem, reserved.mem))} RAM`,
-      node.gpu_count ? `${free(node.gpu_count, null, reserved.gpus)} GPU` : '',
-    ].filter(Boolean);
     const where = node.local ? 'this machine' : 'via Slurm';
-    item.description = `${where} · ${node.jobs.length} job${node.jobs.length === 1 ? '' : 's'} · free ${left.join(', ')}`;
-    item.tooltip = `${node.host} (${where})\nFree = total minus the larger of what is used and what is reserved ` +
-      `(Slurm allocations plus the budgets of your other jobs).\nExpand CPU, RAM or GPU to see each job's share: used / reserved.\n` +
+    item.description = `${where} · ${node.jobs.length} job${node.jobs.length === 1 ? '' : 's'}`;
+    item.tooltip = `${node.host} (${where})\nUsed: measured. Reserved: Slurm allocations plus the budgets of your other jobs.\n` +
+      (nodeDetails('resources') === 'jobs' ? 'Each row: a job\'s used / reserved.\n' : 'Expand CPU, RAM or GPU to see each job\'s share: used / reserved.\n') +
       `Means over the last ${duration(this.data.interval_s)}; RAM and VRAM are current.` +
       (node.coarse ? '\nCPU and RAM use come from slurmd (load average, free memory) and lag by minutes; ' +
         'when your jobs on the node measurably use more, their sum is shown instead.' : '');
     item.iconPath = new vscode.ThemeIcon(node.local ? 'vm' : 'server');
     return item;
+  }
+
+  // jobboard.resourcesNodeDetails = jobs: the node's row carries the resources, one column each: used / total, reserved.
+  nodeCells(node) {
+    const reserved = node.reserved || {};
+    const gpus = node.gpus || [];
+    const util = gpus.length ? gpus.reduce((sum, g) => sum + g.util, 0) / gpus.length : null;
+    const vram = gpus.length ? [gpus.reduce((s, g) => s + g.vram, 0), gpus.reduce((s, g) => s + g.vram_total, 0)] : null;
+    return [
+      node.local ? 'this machine' : 'via Slurm',
+      'CPU', right(cores(node.cpu)), `/${node.cpus || '?'}`, `res. ${cores(reserved.cpus)}`,
+      'RAM', right(bytes(node.mem)), `/${bytes(node.mem_total)}`, `res. ${bytes(reserved.mem)}`,
+      node.gpu_count ? 'GPU' : '', util != null ? right(`${Math.round(util)}%`) : '',
+      vram ? `VRAM ${bytes(vram[0])}/${bytes(vram[1])}` : '', node.gpu_count ? `res. ${cores(reserved.gpus)}/${node.gpu_count}` : '',
+      `${node.jobs.length} job${node.jobs.length === 1 ? '' : 's'}`,
+    ];
+  }
+
+  // jobboard.resourcesNodeDetails = jobs: one row per job with its used / reserved CPU, RAM and GPU, then everything else.
+  jobRows(node) {
+    const id = `node:${node.host}`;
+    const items = [], rows = [];
+    for (const job of node.jobs) {
+      const item = new vscode.TreeItem(shortName(job.name));
+      item.id = `${id}:job:${job.id}`;
+      item.tooltip = jobTooltip(job);
+      item.iconPath = runningIcon(job);
+      const r = job.reserved || {};
+      items.push(item);
+      rows.push(['CPU', ...usedOf(job, job.cpu, r.cpus, cores), 'RAM', ...usedOf(job, job.mem, r.mem, bytes),
+        job.gpu_util != null || job.vram || r.gpus ? 'GPU' : '',
+        job.gpu_util != null ? right(`${Math.round(job.gpu_util)}%`) : '', job.vram ? `VRAM ${bytes(job.vram)}` : '',
+        r.gpus ? `res. ${cores(r.gpus)}` : '', job.reserved ? '' : 'no budget']);
+    }
+    if (node.other) {
+      items.push(plainItem(`${id}:other`, 'other', '', 'Everything not started through jobrun: other users, Slurm jobs of others, the system.', 'person'));
+      rows.push(['CPU', right(cores(node.other.cpu)), '', 'RAM', right(bytes(node.other.mem)), '',
+        node.other.vram != null ? 'GPU' : '', '', node.other.vram != null ? `VRAM ${bytes(node.other.vram)}` : '', '', '']);
+    }
+    const others = ((node.slurm || {}).jobs || []).filter(job => !job.mine);
+    if (others.length) {
+      const sum = key => others.reduce((total, job) => total + job[key], 0);
+      items.push(plainItem(`${id}:slurm-others`, `Slurm jobs of others (${others.length})`, '',
+        [...new Set(others.map(job => job.user))].join(', '), 'organization'));
+      rows.push(['CPU', right(''), `res. ${cores(sum('cpus'))}`, 'RAM', right(''), `res. ${bytes(sum('mem'))}`,
+        sum('gpus') ? 'GPU' : '', '', '', sum('gpus') ? `res. ${cores(sum('gpus'))}` : '', '']);
+    }
+    grid(rows).forEach((text, i) => { items[i].description = text; });
+    return alignLabels(items);
   }
 
   nodeChildren(node) {
@@ -759,10 +969,11 @@ class ResourcesProvider {
     const rest = (key, used, fmt) => {
       const items = [];
       if (node.other && used != null) items.push(plainItem(`${id}:${key}:other`, 'other', fmt(used),
-        'Everything not started through jobrun: other users, Slurm jobs of others, the system.', 'person'));
+        'Everything not started through jobrun: other users, Slurm jobs of others, the system.', 'person', ['', fmt(used), '']));
       if (others.length && othersReserved(key === 'vram' ? 'gpus' : key)) {
-        items.push(plainItem(`${id}:${key}:slurm-others`, `Slurm jobs of others (${others.length})`,
-          `${fmt(othersReserved(key === 'vram' ? 'gpus' : key))} reserved`, [...new Set(others.map(job => job.user))].join(', '), 'organization'));
+        const amount = fmt(othersReserved(key === 'vram' ? 'gpus' : key));
+        items.push(plainItem(`${id}:${key}:slurm-others`, `Slurm jobs of others (${others.length})`, `${amount} reserved`,
+          [...new Set(others.map(job => job.user))].join(', '), 'organization', ['', `${amount} reserved`, '']));
       }
       return items;
     };
@@ -775,8 +986,9 @@ class ResourcesProvider {
     const gpuShare = job => {
       const item = shareItem(`${id}:gpu:${job.id}`, job, null, null, cores);
       const r = job.reserved && job.reserved.gpus;
-      item.description = [job.gpu_util != null ? `${bar(job.gpu_util / 100, 6)} ${Math.round(job.gpu_util)}%` : job.measured ? '' : 'no data',
-        job.vram ? `VRAM ${bytes(job.vram)}` : '', r ? `${cores(r)} GPU reserved` : 'no GPU reserved'].filter(Boolean).join(' · ');
+      item.cells = [job.gpu_util != null ? bar(job.gpu_util / 100, 6) : '',
+        [job.gpu_util != null ? `${Math.round(job.gpu_util)}%` : job.measured ? '' : 'no data', job.vram ? `VRAM ${bytes(job.vram)}` : '']
+          .filter(Boolean).join(' · '), r ? `${cores(r)} GPU reserved` : 'no GPU reserved'];
       return item;
     };
     // A Slurm node: what is reserved comes first and fills the bar when it exceeds the use, since a reserved core is
@@ -812,6 +1024,376 @@ class ResourcesProvider {
     }
     return items;
   }
+}
+
+// ---------------------------------------------------------------- cluster view
+// `jobrun cluster --json`: every Slurm node and this machine, what is allocated of its CPUs, RAM and GPUs, and the jobs
+// on it. Collapsed by default; polled only while expanded and visible, every jobboard.clusterSeconds (0: by hand).
+
+const LIGHTS = [[0.2, '🟢', 'green'], [0.8, '🟠', 'orange'], [Infinity, '🔴', 'red']];
+
+// [emoji, color name] of a fraction allocated
+function light(fraction) {
+  return fraction == null ? ['⚪', 'grey'] : LIGHTS.find(([limit]) => fraction <= limit + 1e-9).slice(1);
+}
+
+// A traffic light as an SVG with a fixed color: a colored ThemeIcon turns white in a selected row.
+function lightIcon(color, size) {
+  const file = theme => vscode.Uri.file(path.join(extensionPath, 'media', 'lights', `${color}-${size}-${theme}.svg`));
+  return { light: file('light'), dark: file('dark') };
+}
+
+// What a node holds of a resource: Slurm's allocation; on this machine the larger of that and what it uses, since
+// work started there outside Slurm reserves nothing.
+function held(node, key) {
+  return Math.max(node[`${key}_alloc`] || 0, (node.used || {})[key] || 0);
+}
+
+function fractions(node) {
+  const of = key => node[key] ? held(node, key) / node[key] : null;
+  return { cpus: of('cpus'), mem: of('mem'), gpus: node.gpus ? of('gpus') : undefined };
+}
+
+// The fraction the node's icon shows (jobboard.clusterIcon); GPUs count only on nodes that have them.
+function iconFraction(node, mode) {
+  const f = fractions(node);
+  const all = [f.cpus, f.mem, f.gpus].filter(v => v != null);
+  if (!all.length) return null;
+  if (mode === 'best') return Math.min(...all);
+  if (mode === 'cpu') return f.cpus;
+  if (mode === 'ram') return f.mem;
+  if (mode === 'gpu' && f.gpus != null) return f.gpus;
+  return Math.max(...(mode === 'gpu' ? [f.cpus, f.mem].filter(v => v != null) : all));
+}
+
+function limitText(seconds) {
+  return seconds == null ? 'no limit' : duration(seconds);
+}
+
+function allocText(job) {
+  return [`${cores(job.cpus)} CPU`, bytes(job.mem), job.gpus ? `${cores(job.gpus)} GPU` : ''].filter(Boolean).join(' · ');
+}
+
+const CLUSTER_GROUPINGS = {
+  sharedPartitions: 'Partitions with several nodes; the other nodes together',
+  partitions: 'Every partition',
+  gpuType: 'GPU model',
+  none: 'No groups',
+};
+const CLUSTER_ICONS = {
+  worst: 'Fullest of CPU, RAM and GPU', best: 'Emptiest of CPU, RAM and GPU',
+  gpu: 'GPU (nodes without GPUs: fuller of CPU and RAM)', cpu: 'CPU only', ram: 'RAM only',
+};
+const NODE_DETAILS = {
+  resources: 'CPU, RAM and GPU rows, each with the jobs that hold it',
+  jobs: 'The jobs directly; the node\'s row shows CPU, RAM and GPU',
+};
+// a node's resources: key in `jobrun cluster`, label, format, unit after the total
+const CLUSTER_RESOURCES = [['cpus', 'CPU', cores, ' cores'], ['mem', 'RAM', bytes, ''], ['gpus', 'GPU', cores, '']];
+
+class ClusterProvider {
+  constructor() {
+    this.emitter = new vscode.EventEmitter();
+    this.onDidChangeTreeData = this.emitter.event;
+    this.data = null;
+    this.error = null;
+    this.busy = false;
+    this.view = null;
+  }
+
+  visible() {
+    return this.view && this.view.visible && (vscode.window.state.focused || config().get('updateWhileUnfocused'));
+  }
+
+  auto() {
+    return config().get('clusterSeconds') > 0;
+  }
+
+  async refresh(force = false) {
+    if (this.busy || !(force || this.visible())) return;
+    this.busy = true;
+    try {
+      this.data = JSON.parse(await jobrun(['cluster', '--json']));
+      this.error = null;
+    } catch (err) {
+      this.error = err.message;
+    } finally {
+      this.busy = false;
+    }
+    if (this.view && this.data) {
+      this.view.description = `${this.auto() ? '' : 'manual refresh · '}as of ${clock(this.data.time)}`;
+    }
+    this.emitter.fire();
+  }
+
+  getTreeItem(element) {
+    return element;
+  }
+
+  getChildren(element) {
+    return filteredRows(this, element);
+  }
+
+  rows(element) {
+    if (!element) {
+      if (this.error) {
+        const item = new vscode.TreeItem(`jobrun cluster failed: ${this.error}`);
+        item.iconPath = new vscode.ThemeIcon('error');
+        item.tooltip = this.error;
+        return [item];
+      }
+      if (!this.data) return [new vscode.TreeItem('Loading…')];
+      const groups = this.groups();
+      const notes = this.slurmNote();
+      if (groups.length === 1 && config().get('clusterGroupBy') === 'none') return [...notes, ...this.nodeItems(groups[0].nodes)];
+      return [...notes, ...groups.map(g => this.groupItem(g))];
+    }
+    if (element.slurmNote) return element.children;
+    if (element.clusterGroup) return this.nodeItems(element.clusterGroup.nodes);
+    if (element.clusterNode) {
+      return nodeDetails('cluster') === 'jobs' ? this.jobItems(element.clusterNode) : this.resourceItems(element.clusterNode);
+    }
+    if (element.clusterJobs) return this.jobItems(element.owner, element.clusterJobs, element.resource);
+    return [];
+  }
+
+  // Why Slurm shows nothing (no sinfo / squeue here, or they failed) or only part (nodes without jobs), and which
+  // commands the view needs; the view then shows this machine only.
+  slurmNote() {
+    const status = this.data.slurm_status || (this.data.slurm ? 'ok' : 'missing');
+    if (status === 'ok') return [];
+    const message = this.data.slurm_message || '';
+    const needed = this.data.slurm_needed || { sinfo: 'nodes, partitions and their allocations', squeue: 'the jobs on each node' };
+    const partial = status === 'partial';
+    const item = new vscode.TreeItem(
+      { missing: 'No Slurm cluster found', error: 'Slurm controller not reachable', partial: 'Slurm answered in part' }[status] || 'Slurm unavailable',
+      vscode.TreeItemCollapsibleState.Expanded);
+    item.id = 'cluster:slurm-status';
+    item.slurmNote = true;
+    item.description = partial ? '' : 'showing this machine only';
+    item.iconPath = new vscode.ThemeIcon(partial ? 'warning' : 'info', new vscode.ThemeColor(partial ? 'charts.yellow' : 'charts.blue'));
+    item.tooltip = `${message}\n\nThe Cluster view runs these Slurm commands on this machine (any Slurm client that reaches the controller):\n` +
+      Object.entries(needed).map(([command, what]) => `${command}: ${what}`).join('\n');
+    item.children = [
+      plainItem('cluster:slurm-status:why', message || 'no answer', '', message, partial ? 'warning' : 'error'),
+      ...(partial ? [] : Object.entries(needed).map(([command, what]) => plainItem(`cluster:slurm-status:${command}`, command,
+        `needed for ${what}`, `\`${command}\` must be on PATH and reach the Slurm controller.`, 'terminal'))),
+    ];
+    return [item];
+  }
+
+  // Non-empty sections in display order: this machine's first, then the default partition, then the larger ones.
+  groups() {
+    const nodes = this.data.nodes || [];
+    const byName = new Map(nodes.map(n => [n.name, n]));
+    const partitions = (this.data.partitions || []).map(p => ({
+      key: `p:${p.name}`, label: p.name, partition: p, nodes: p.nodes.map(name => byName.get(name)).filter(Boolean)}));
+    const mode = config().get('clusterGroupBy');
+    let groups;
+    if (mode === 'none') {
+      groups = [{ key: 'all', label: 'All nodes', nodes }];
+    } else if (mode === 'gpuType') {
+      const model = n => n.gpus ? (n.gpu_types.length ? n.gpu_types.join(' + ') : 'GPU (model unknown)') : 'no GPU';
+      groups = [...new Set(nodes.map(model))].sort((a, b) => (a === 'no GPU') - (b === 'no GPU') || a.localeCompare(b, undefined, { numeric: true }))
+        .map(label => ({ key: `gpu:${label}`, label, nodes: nodes.filter(n => model(n) === label) }));
+    } else if (mode === 'partitions') {
+      groups = partitions;
+      const alone = nodes.filter(n => !n.partitions.length);
+      if (alone.length) groups = [{ key: 'local', label: 'This machine', nodes: alone }, ...groups];
+    } else {  // sharedPartitions
+      const shared = partitions.filter(p => p.nodes.length > 1);
+      const inShared = new Set(shared.flatMap(p => p.nodes.map(n => n.name)));
+      const local = nodes.filter(n => n.local && !inShared.has(n.name));
+      const other = nodes.filter(n => !n.local && !inShared.has(n.name));
+      groups = [{ key: 'local', label: 'This machine', nodes: local }, ...shared,
+        { key: 'other', label: 'Other nodes', nodes: other, last: true }];
+    }
+    const rank = g => [g.nodes.some(n => n.local) ? 0 : 1, g.last ? 1 : 0, g.partition && g.partition.default ? 0 : 1,
+      -g.nodes.length];
+    const compare = (a, b) => {
+      const [ra, rb] = [rank(a), rank(b)];
+      for (let i = 0; i < ra.length; i++) if (ra[i] !== rb[i]) return ra[i] - rb[i];
+      return 0;
+    };
+    const local = n => (n.local ? 0 : 1);
+    return groups.filter(g => g.nodes.length).sort(compare)
+      .map(g => ({ ...g, nodes: [...g.nodes].sort((a, b) => local(a) - local(b) || a.name.localeCompare(b.name, undefined, { numeric: true })) }));  // node2 before node10
+  }
+
+  groupItem(group) {
+    const item = new vscode.TreeItem(group.label, vscode.TreeItemCollapsibleState.Expanded);
+    item.id = `cluster:${group.key}`;
+    item.clusterGroup = group;
+    const up = group.nodes.filter(n => n.available);
+    const free = key => up.reduce((sum, n) => sum + Math.max(0, (n[key] || 0) - held(n, key)), 0);
+    const p = group.partition;
+    item.description = [`${up.length}/${group.nodes.length} nodes up`,
+      `free ${cores(free('cpus'))} cores · ${bytes(free('mem'))} · ${cores(free('gpus'))} GPU`,
+      p && p.default ? 'default' : '', p ? (p.time_limit_s == null ? 'no time limit' : `limit ${duration(p.time_limit_s)}`) : '',
+    ].filter(Boolean).join(' · ');
+    item.tooltip = `${group.label}: ${group.nodes.length} node${group.nodes.length === 1 ? '' : 's'}, ${up.length} taking jobs.\n` +
+      'Free: what is not allocated on the nodes that take jobs (this machine: not used either).' +
+      (p ? `\nPartition time limit: ${p.time_limit}` : '');
+    item.iconPath = new vscode.ThemeIcon(group.key === 'local' ? 'vm' : 'server-environment');
+    return item;
+  }
+
+  // Columns line up across every node of the view, not only within a section, since all sections share the indent.
+  nodeItems(nodes) {
+    const all = this.data.nodes || [];
+    const texts = new Map(grid(all.map(n => this.nodeCells(n))).map((text, i) => [all[i].name, text]));
+    // the resource columns start in one column; a short summary simply follows the name
+    const width = nodeDetails('cluster') === 'jobs' ? Math.max(0, ...all.map(n => textWidth(n.name))) : 0;
+    return nodes.map(node => {
+      const item = this.nodeItem(node);
+      item.label = node.name + spaces(width - textWidth(node.name));
+      item.description = texts.get(node.name);
+      return item;
+    });
+  }
+
+  // The node row: with resource rows below it (jobboard.clusterNodeDetails = resources), only the jobs and the state;
+  // otherwise also each resource, allocated / total with its traffic light.
+  nodeCells(node) {
+    const counts = [(node.jobs || []).length ? `${node.jobs.length} job${node.jobs.length === 1 ? '' : 's'}` : '',
+      (node.pending || []).length ? `${node.pending.length} queued` : ''].filter(Boolean).join(' · ');
+    const notes = [node.local ? 'this machine' : '', node.available ? '' : `⛔ ${node.state}`].filter(Boolean).join(' · ');
+    if (nodeDetails('cluster') !== 'jobs') return [[counts, notes].filter(Boolean).join(' · ')];
+    const f = fractions(node);
+    const cells = [];
+    for (const [key, label, fmt] of CLUSTER_RESOURCES) {
+      if (key === 'gpus' && !node.gpus) {
+        cells.push('', '', '', '');
+        continue;
+      }
+      cells.push(`${node.available ? light(f[key])[0] : '⚪'} ${label}`, right(fmt(held(node, key))),
+        `/${node[key] != null ? fmt(node[key]) : '?'}`, key === 'gpus' ? node.gpu_types.join('+') : '');
+    }
+    return [...cells, counts, notes];
+  }
+
+  nodeItem(node) {
+    const jobs = (node.jobs || []).length + (node.pending || []).length;
+    const expandable = jobs || nodeDetails('cluster') !== 'jobs';
+    const item = new vscode.TreeItem(node.name, expandable ? vscode.TreeItemCollapsibleState.Collapsed : vscode.TreeItemCollapsibleState.None);
+    item.id = `cluster-node:${node.name}`;
+    item.clusterNode = node;
+    // large: the node's light stands above its resources' small ones
+    item.iconPath = node.available ? lightIcon(light(iconFraction(node, config().get('clusterIcon')))[1], 'large')
+      : new vscode.ThemeIcon('circle-slash', new vscode.ThemeColor('disabledForeground'));
+    const f = fractions(node);
+    const md = new vscode.MarkdownString();
+    md.appendMarkdown(`**${node.name}**${node.local ? ' (this machine)' : ''} — ${node.state}${node.available ? '' : ', takes no new jobs'}\n\n`);
+    if (node.partitions.length) md.appendMarkdown(`partitions: \`${node.partitions.join(', ')}\`  \n`);
+    for (const [key, label, fmt] of CLUSTER_RESOURCES) {
+      if (key === 'gpus' && !node.gpus) continue;
+      const used = node.used && node.used[key] != null ? ` · used ${fmt(node.used[key])}` : '';
+      const name = key === 'gpus' ? `GPUs (${node.gpu_types.join(', ') || 'model unknown'})` : label;
+      md.appendMarkdown(`${node.available ? light(f[key])[0] : ''} ${name}: allocated \`${fmt(node[`${key}_alloc`] || 0)}\` of \`${node[key] != null ? fmt(node[key]) : '?'}\`${used}  \n`);
+    }
+    if (node.load != null) md.appendMarkdown(`load average (slurmd, minutes old): \`${node.load}\`  \n`);
+    md.appendMarkdown('\n🟢 up to 20% allocated, 🟠 up to 80%, 🔴 above.' +
+      (node.local ? ' On this machine the larger of allocated and used counts (work outside Slurm reserves nothing).' : ''));
+    item.tooltip = md;
+    return item;
+  }
+
+  // jobboard.clusterNodeDetails = resources: CPU, RAM, GPU (allocated / total, with the jobs that hold it), then the queue.
+  resourceItems(node) {
+    const id = `cluster-node:${node.name}`;
+    const f = fractions(node);
+    const items = [];
+    for (const [key, label, fmt, unit] of CLUSTER_RESOURCES) {
+      if (key === 'gpus' && !node.gpus) continue;
+      const jobs = (node.jobs || []).filter(job => job[key] > 0);
+      const item = new vscode.TreeItem(label, jobs.length || node.used ? vscode.TreeItemCollapsibleState.Collapsed
+        : vscode.TreeItemCollapsibleState.None);
+      item.id = `${id}:${key}`;
+      item.clusterJobs = jobs;
+      item.owner = node;
+      item.resource = key;
+      item.iconPath = lightIcon(node.available ? light(f[key])[1] : 'grey', 'small');
+      const alloc = fmt(node[`${key}_alloc`] || 0);
+      const used = node.used && node.used[key] != null ? `used ${fmt(node.used[key])}` : '';
+      item.tooltip = `${label}: ${alloc} of ${node[key] != null ? fmt(node[key]) : '?'}${unit} allocated by Slurm` +
+        (used ? `, ${used} on this machine (the larger counts)` : '');
+      // every bar is ten characters long, so the text after it starts in one column
+      item.description = `${f[key] != null ? `${bar(f[key])} ` : ''}` + [`${fmt(held(node, key))}/${node[key] != null ? fmt(node[key]) : '?'}${unit}`,
+        key === 'gpus' ? node.gpu_types.join('+') : '', used ? `allocated ${alloc}, ${used}` : ''].filter(Boolean).join(' · ');
+      items.push(item);
+    }
+    if ((node.pending || []).length) {
+      const item = new vscode.TreeItem('Queued', vscode.TreeItemCollapsibleState.Collapsed);
+      item.id = `${id}:queued`;
+      item.clusterJobs = node.pending;
+      item.owner = node;
+      item.resource = 'queued';
+      item.tooltip = 'Queued jobs the scheduler plans to start on this node, with its estimated start.';
+      item.iconPath = new vscode.ThemeIcon('clock', new vscode.ThemeColor('charts.yellow'));
+      item.description = `${node.pending.length} job${node.pending.length === 1 ? '' : 's'}`;
+      return [...alignLabels(items), item];  // the bars of CPU, RAM and GPU start in one column
+    }
+    return alignLabels(items);
+  }
+
+  // Jobs on a node, aligned in columns: running ones ending first, then queued ones starting first. resource: only
+  // that resource's amount (a row of jobboard.clusterNodeDetails = resources), or 'queued'; none: all of it.
+  jobItems(node, only = null, resource = null) {
+    const id = `cluster-node:${node.name}`;
+    const running = resource === 'queued' ? [] : [...(only || node.jobs || [])].sort((a, b) => (a.ends || Infinity) - (b.ends || Infinity));
+    const queued = resource && resource !== 'queued' ? [] : [...(resource ? only : node.pending || [])]
+      .sort((a, b) => (a.expected_start || Infinity) - (b.expected_start || Infinity));
+    const share = job => job.nodes > 1 ? ` (its share on this node; ${job.nodes} nodes in total)` : '';
+    // below a resource row (jobboard.clusterNodeDetails = resources) every cell is left-aligned text; the job list
+    // of jobboard.clusterNodeDetails = jobs right-aligns the numbers
+    const amount = job => {
+      if (resource === 'cpus') return [`${cores(job.cpus)} cores`];
+      if (resource === 'mem') return [bytes(job.mem)];
+      if (resource === 'gpus') return [`${cores(job.gpus)} GPU`];
+      if (resource === 'queued') return [allocText(job)];
+      return [right(cores(job.cpus)), 'CPU', right(bytes(job.mem)), job.gpus ? `${cores(job.gpus)} GPU` : ''];
+    };
+    const items = [], rows = [];
+    for (const job of running) {
+      const item = new vscode.TreeItem(shortName(job.name || job.slurm_id));
+      item.id = `${id}:${resource || 'all'}:${job.slurm_id}`;
+      item.tooltip = `${job.name} (slurm ${job.slurm_id}) — ${job.state.toLowerCase()}\nuser: ${job.user}\npartition: ${job.partition}\n` +
+        `allocated: ${allocText(job)}${share(job)}\ntime limit: ${job.time_limit}` +
+        (job.started ? `\nstarted: ${new Date(job.started * 1000).toLocaleString()}` : '') +
+        (job.ends ? `\nends at the latest: ${new Date(job.ends * 1000).toLocaleString()}` : '');
+      item.iconPath = new vscode.ThemeIcon(job.mine ? 'account' : 'person', job.mine ? new vscode.ThemeColor('charts.blue') : undefined);
+      items.push(item);
+      rows.push([job.user, ...amount(job), `limit ${limitText(job.time_limit_s)}`, job.ends ? `ends ${clock(job.ends)}` : '']);
+    }
+    for (const job of queued) {
+      const item = new vscode.TreeItem(shortName(job.name || job.slurm_id));
+      item.id = `${id}:${resource || 'all'}:queued:${job.slurm_id}`;
+      item.tooltip = `${job.name} (slurm ${job.slurm_id}) — queued, planned for this node\nuser: ${job.user}\npartition: ${job.partition}\n` +
+        `requested: ${allocText(job)}${share(job)}\ntime limit: ${job.time_limit}` +
+        (job.expected_start ? `\nexpected start: ${new Date(job.expected_start * 1000).toLocaleString()} (Slurm's estimate)` : '') +
+        (job.reason ? `\nwhy queued: ${job.reason}` : '');
+      item.iconPath = new vscode.ThemeIcon('clock', new vscode.ThemeColor(job.mine ? 'charts.blue' : 'charts.yellow'));
+      items.push(item);
+      rows.push([job.user, ...amount(job),
+        `limit ${limitText(job.time_limit_s)}`, job.expected_start ? `start ~${clock(job.expected_start)}` : 'queued',
+        job.reason ? `(${job.reason})` : '']);
+    }
+    if (node.used && resource && ['cpus', 'mem', 'gpus'].includes(resource)) {
+      const fmt = resource === 'mem' ? bytes : cores;
+      items.push(plainItem(`${id}:${resource}:used`, 'in use now', '',
+        'Measured on this machine: all processes, also those outside Slurm.', 'pulse'));
+      rows.push(['', `${fmt(node.used[resource])}${resource === 'cpus' ? ' cores' : resource === 'gpus' ? ' GPU' : ''}`, '', '']);
+    }
+    grid(rows, resource ? [] : ['', '  ', ' ', '  ']).forEach((text, i) => { items[i].description = text; });
+    return alignLabels(items);
+  }
+}
+
+async function pickSetting(key, options, title) {
+  const current = config().get(key);
+  const picked = await vscode.window.showQuickPick(Object.entries(options).map(([value, label]) => ({
+    label, value, description: value === current ? '(current)' : ''})), { title });
+  if (picked) await config().update(key, picked.value, vscode.ConfigurationTarget.Global);
 }
 
 async function openLog(job) {
@@ -866,15 +1448,23 @@ function activate(context) {
     .finally(() => provider.refresh(true));
 
   const resources = new ResourcesProvider();
-  const resourceView = vscode.window.createTreeView('jobboard.resources', { treeDataProvider: resources });
+  const resourceView = vscode.window.createTreeView('jobboard.resources', { treeDataProvider: resources, showCollapseAll: true });
   resources.view = resourceView;
 
-  let timer, resourceTimer;
+  const cluster = new ClusterProvider();
+  const clusterView = vscode.window.createTreeView('jobboard.cluster', { treeDataProvider: cluster, showCollapseAll: true });
+  cluster.view = clusterView;
+  // expanded with jobboard.clusterSeconds 0: load once, then only with the refresh button
+  const showCluster = () => { if (cluster.auto() || !cluster.data) cluster.refresh(true); };
+
+  let timer, resourceTimer, clusterTimer;
   const schedule = () => {
     clearInterval(timer);
     clearInterval(resourceTimer);
+    clearInterval(clusterTimer);
     timer = setInterval(() => provider.refresh(), Math.max(2, config().get('refreshSeconds')) * 1000);
     resourceTimer = setInterval(() => resources.refresh(), Math.max(5, config().get('resourceSeconds')) * 1000);
+    if (cluster.auto()) clusterTimer = setInterval(() => cluster.refresh(), Math.max(10, config().get('clusterSeconds')) * 1000);
   };
   schedule();
   syncSharedSettings().finally(() => provider.refresh());
@@ -882,20 +1472,38 @@ function activate(context) {
   offerSetup(context);
 
   context.subscriptions.push(
-    view, resourceView, provider.statusBar, { dispose: () => { clearInterval(timer); clearInterval(resourceTimer); } },
+    view, resourceView, clusterView, provider.statusBar,
+    { dispose: () => { clearInterval(timer); clearInterval(resourceTimer); clearInterval(clusterTimer); } },
     resourceView.onDidChangeVisibility(event => { if (event.visible) resources.refresh(true); }),
     vscode.commands.registerCommand('jobboard.refreshResources', () => resources.refresh(true)),
+    clusterView.onDidChangeVisibility(event => { if (event.visible) showCluster(); }),
+    vscode.commands.registerCommand('jobboard.refreshCluster', () => cluster.refresh(true)),
+    ...['filterResources', 'refilterResources'].map(name => vscode.commands.registerCommand(`jobboard.${name}`,
+      () => editFilter(resources, 'jobboard.resourcesFiltered', 'Filter Resources'))),
+    ...['filterCluster', 'refilterCluster'].map(name => vscode.commands.registerCommand(`jobboard.${name}`,
+      () => editFilter(cluster, 'jobboard.clusterFiltered', 'Filter Cluster'))),
+    vscode.commands.registerCommand('jobboard.clearResourcesFilter', () => setFilter(resources, 'jobboard.resourcesFiltered', '')),
+    vscode.commands.registerCommand('jobboard.clearClusterFilter', () => setFilter(cluster, 'jobboard.clusterFiltered', '')),
+    vscode.commands.registerCommand('jobboard.clusterGroupBy', () => pickSetting('clusterGroupBy', CLUSTER_GROUPINGS, 'Group nodes by')),
+    vscode.commands.registerCommand('jobboard.resourcesNodeDetails', () => pickSetting('resourcesNodeDetails', NODE_DETAILS, 'Resources: expanding a node shows')),
+    vscode.commands.registerCommand('jobboard.clusterNodeDetails', () => pickSetting('clusterNodeDetails', NODE_DETAILS, 'Cluster: expanding a node shows')),
+    vscode.commands.registerCommand('jobboard.clusterIcon', () => pickSetting('clusterIcon', CLUSTER_ICONS, "A node's icon color shows")),
     vscode.workspace.onDidChangeConfiguration(async event => {
       if (!event.affectsConfiguration('jobboard')) return;
       schedule();
       if (Object.keys(SHARED_SETTINGS).some(key => event.affectsConfiguration(`jobboard.${key}`))) await syncSharedSettings(event);
       provider.refresh(true);
-      resources.refresh();
+      if (event.affectsConfiguration('jobboard.resourcesNodeDetails')) resources.emitter.fire();  // redraw, no new measurement
+      else resources.refresh();
+      if (['clusterGroupBy', 'clusterIcon', 'clusterNodeDetails'].some(key => event.affectsConfiguration(`jobboard.${key}`))) {
+        cluster.emitter.fire();  // regroup and recolor what is shown, no new Slurm query
+      } else if (cluster.visible() && cluster.auto()) cluster.refresh();
     }),
     view.onDidChangeVisibility(event => { if (event.visible) provider.refresh(true); }),
     vscode.window.onDidChangeWindowState(state => {
       if (state.focused && provider.stale) provider.refresh(true);
       if (state.focused) resources.refresh();
+      if (state.focused && cluster.auto()) cluster.refresh();
     }),
     vscode.commands.registerCommand('jobboard.refresh', () => provider.refresh(true)),
     vscode.commands.registerCommand('jobboard.demo', () => run(['demo'], 'Started the demo jobs')),

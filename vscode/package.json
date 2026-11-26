@@ -37,6 +37,11 @@
         {
           "id": "jobboard.resources",
           "name": "Resources"
+        },
+        {
+          "id": "jobboard.cluster",
+          "name": "Cluster",
+          "visibility": "collapsed"
         }
       ]
     },
@@ -102,10 +107,95 @@
       {
         "command": "jobboard.setup",
         "title": "Job Board: Set Up jobrun for Terminal and Agents"
+      },
+      {
+        "command": "jobboard.refreshCluster",
+        "title": "Refresh Cluster",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "jobboard.clusterGroupBy",
+        "title": "Group Nodes By…",
+        "icon": "$(list-tree)"
+      },
+      {
+        "command": "jobboard.clusterIcon",
+        "title": "Node Icon Shows…",
+        "icon": "$(symbol-color)"
+      },
+      {
+        "command": "jobboard.resourcesNodeDetails",
+        "title": "Node Details: Resources or Jobs…",
+        "icon": "$(list-selection)"
+      },
+      {
+        "command": "jobboard.clusterNodeDetails",
+        "title": "Node Details: Resources or Jobs…",
+        "icon": "$(list-selection)"
+      },
+      {
+        "command": "jobboard.filterResources",
+        "title": "Filter Resources…",
+        "icon": "$(filter)"
+      },
+      {
+        "command": "jobboard.refilterResources",
+        "title": "Change Resources Filter…",
+        "icon": "$(filter-filled)"
+      },
+      {
+        "command": "jobboard.clearResourcesFilter",
+        "title": "Clear Resources Filter",
+        "icon": "$(close)"
+      },
+      {
+        "command": "jobboard.filterCluster",
+        "title": "Filter Cluster…",
+        "icon": "$(filter)"
+      },
+      {
+        "command": "jobboard.refilterCluster",
+        "title": "Change Cluster Filter…",
+        "icon": "$(filter-filled)"
+      },
+      {
+        "command": "jobboard.clearClusterFilter",
+        "title": "Clear Cluster Filter",
+        "icon": "$(close)"
       }
     ],
     "menus": {
       "view/title": [
+        {
+          "command": "jobboard.filterCluster",
+          "when": "view == jobboard.cluster && !jobboard.clusterFiltered",
+          "group": "navigation@-2"
+        },
+        {
+          "command": "jobboard.refilterCluster",
+          "when": "view == jobboard.cluster && jobboard.clusterFiltered",
+          "group": "navigation@-2"
+        },
+        {
+          "command": "jobboard.clearClusterFilter",
+          "when": "view == jobboard.cluster && jobboard.clusterFiltered",
+          "group": "navigation@-1"
+        },
+        {
+          "command": "jobboard.filterResources",
+          "when": "view == jobboard.resources && !jobboard.resourcesFiltered",
+          "group": "navigation@-2"
+        },
+        {
+          "command": "jobboard.refilterResources",
+          "when": "view == jobboard.resources && jobboard.resourcesFiltered",
+          "group": "navigation@-2"
+        },
+        {
+          "command": "jobboard.clearResourcesFilter",
+          "when": "view == jobboard.resources && jobboard.resourcesFiltered",
+          "group": "navigation@-1"
+        },
         {
           "command": "jobboard.refresh",
           "when": "view == jobboard.jobs",
@@ -117,9 +207,34 @@
           "group": "navigation"
         },
         {
+          "command": "jobboard.resourcesNodeDetails",
+          "when": "view == jobboard.resources",
+          "group": "navigation@0"
+        },
+        {
           "command": "jobboard.refreshResources",
           "when": "view == jobboard.resources",
           "group": "navigation"
+        },
+        {
+          "command": "jobboard.clusterNodeDetails",
+          "when": "view == jobboard.cluster",
+          "group": "navigation@0"
+        },
+        {
+          "command": "jobboard.clusterGroupBy",
+          "when": "view == jobboard.cluster",
+          "group": "navigation@1"
+        },
+        {
+          "command": "jobboard.clusterIcon",
+          "when": "view == jobboard.cluster",
+          "group": "navigation@2"
+        },
+        {
+          "command": "jobboard.refreshCluster",
+          "when": "view == jobboard.cluster",
+          "group": "navigation@3"
         }
       ],
       "view/item/context": [
@@ -462,6 +577,79 @@
           "minimum": 5,
           "description": "Measure CPU, RAM, GPU and VRAM every N seconds while the Resources view is visible; values are means over this interval.",
           "order": 20
+        },
+        "jobboard.resourcesNodeDetails": {
+          "type": "string",
+          "enum": [
+            "resources",
+            "jobs"
+          ],
+          "default": "resources",
+          "order": 21,
+          "enumDescriptions": [
+            "A CPU, a RAM and a GPU row, each with its use and reservation; expanding one lists each job's share. The node's row shows only its jobs.",
+            "The jobs directly, each with its used / reserved CPU, RAM and GPU; the node's row shows each resource in a column."
+          ],
+          "description": "What a node shows when expanded in the Resources view (also with the list button in its title bar)."
+        },
+        "jobboard.clusterNodeDetails": {
+          "type": "string",
+          "enum": [
+            "resources",
+            "jobs"
+          ],
+          "default": "resources",
+          "order": 21,
+          "enumDescriptions": [
+            "A CPU, a RAM and a GPU row, each with its allocation and traffic light; expanding one lists the jobs that hold it. The node's row shows only its jobs.",
+            "The jobs directly, each with its allocation, time limit and end; the node's row shows each resource in a column with its traffic light."
+          ],
+          "description": "What a node shows when expanded in the Cluster view (also with the list button in its title bar)."
+        },
+        "jobboard.clusterSeconds": {
+          "type": "number",
+          "default": 30,
+          "minimum": 0,
+          "order": 21,
+          "markdownDescription": "Refresh the Cluster view every N seconds while it is expanded and visible; 0: only with its refresh button. Each refresh asks the Slurm controller twice (`sinfo`, `squeue`, a few ms each); all Job Board windows that share the registry share one answer for 10 s."
+        },
+        "jobboard.clusterGroupBy": {
+          "type": "string",
+          "enum": [
+            "sharedPartitions",
+            "partitions",
+            "gpuType",
+            "none"
+          ],
+          "default": "sharedPartitions",
+          "order": 22,
+          "enumDescriptions": [
+            "One section per partition with several nodes; nodes alone in their partitions together under Other nodes, this machine in a section of its own.",
+            "One section per partition, also single-node ones; a node in several partitions appears in each.",
+            "One section per GPU model, plus nodes without GPUs.",
+            "One list of all nodes."
+          ],
+          "description": "How the Cluster view groups the nodes (also with the button in the view's title bar). Empty sections are never shown."
+        },
+        "jobboard.clusterIcon": {
+          "type": "string",
+          "enum": [
+            "worst",
+            "best",
+            "gpu",
+            "cpu",
+            "ram"
+          ],
+          "default": "worst",
+          "order": 23,
+          "enumDescriptions": [
+            "The fullest of CPU, RAM and GPU.",
+            "The emptiest of CPU, RAM and GPU.",
+            "GPU; nodes without GPUs: the fuller of CPU and RAM.",
+            "CPU cores only.",
+            "RAM only."
+          ],
+          "markdownDescription": "What the color of a node's icon in the Cluster view shows (also with the button in the view's title bar): green up to 20% allocated, orange up to 80%, red above. Each resource also has its own dot in the row. On this machine, the larger of allocated and used counts."
         }
       }
     },

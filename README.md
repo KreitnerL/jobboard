@@ -290,6 +290,11 @@ jobrun sbatch --log 'logs/%x-%j.err' -- train.sbatch                   # read pr
 States come from `sacct`, so this also works where `scontrol` is disabled. Results are cached for 30 s, so open
 dashboards don't keep querying Slurm. Stop uses `scancel`.
 
+A job still in the queue shows when the scheduler expects to start it, on which node, and why it waits:
+`waiting for Slurm queue · start ~Fri 15:15 on node2 (Priority)`. The estimate is Slurm's backfill estimate (from
+`squeue`; `sacct` has none), and it moves as other jobs end early or higher-priority jobs arrive. Jobs waiting for a
+dependency usually have no estimate.
+
 ## Wait for jobs
 
 ```bash
@@ -381,6 +386,58 @@ A node's reserved total is Slurm's allocations (all users) plus the budgets of y
   free for a new job whatever the load says. Used is at least the sum of your jobs on the node, marked
   "(your jobs)" when that is higher than slurmd's figure. Their GPU utilization is not available.
 
+## Cluster
+
+The **Cluster** panel (collapsed by default; and `jobrun cluster`) shows every Slurm node and this machine, grouped
+by partition, with how much of its CPU cores, RAM and GPUs Slurm has **allocated** of the total. Each resource has a
+traffic light: 🟢 up to 20% allocated, 🟠 up to 80%, 🔴 above. The node's icon has the color of the fullest of the
+three; the palette button in the panel's title bar picks another rule (emptiest, GPU first, CPU only, RAM only).
+Nodes that take no new jobs (down, drained, not responding) are greyed out. Expanding a node shows a CPU, a RAM
+and a GPU row, each with its allocation, a bar and a small traffic light, and below each the jobs that hold it,
+ending first: name, owner, amount, time limit and when it ends at the latest. A **Queued** row lists jobs the
+scheduler has planned for this node, with their expected start. Your own jobs are blue.
+
+**Node details** (`jobboard.clusterNodeDetails`, or the list button in the panel's title bar; Resources has its own,
+`jobboard.resourcesNodeDetails`): `resources` (default) as above, or `jobs`: expanding a node lists its jobs directly,
+and the node's row shows CPU, RAM and GPU in columns instead, each with its traffic light. The traffic lights keep
+their color when a row is selected. Rows are padded into columns; since the tree uses a
+proportional font, columns after a name (node, job, user) line up to within a few pixels, digits exactly.
+
+<img src="docs/cluster.png" width="600" alt="The Cluster panel: two partitions with their nodes and traffic lights, node2 expanded to its CPU, RAM and GPU rows, the jobs holding its GPUs with owner, time limit and end, and a queued job with its expected start">
+
+With `jobboard.clusterNodeDetails = jobs`, a node's row reads:
+
+```
+▸ ⬤ node2   🟠 CPU  96 /256   🟠 RAM 384G /1T     🟠 GPU 6 /8 a100   5 jobs · 1 queued
+▸ ⬤ node4   🔴 CPU  96 /128   🟠 RAM 600G /768G   🔴 GPU 4 /4 h100   1 job · 1 queued
+```
+
+**Grouping** (`jobboard.clusterGroupBy`, or the tree button in the title bar): by default, partitions with several
+nodes get a section each, and nodes that are alone in their partitions (typically workstations) share an **Other
+nodes** section; this machine has a section of its own. Other choices: every partition, GPU model, or one list.
+Empty sections are never shown.
+
+**Filter** (the funnel button in the title bar of Cluster and of Resources): type part of a node, job or user name, a
+GPU model or a partition, and the view shows only the rows that contain it, with the rows above them expanded. A row
+that matches itself (e.g. a node by its GPU model) keeps everything below it. The filter stays until you clear it
+(the × next to the funnel).
+
+**Without Slurm**, or when the controller does not answer, the panel shows this machine only, with a note on what
+went wrong (`sinfo and squeue not found on this machine`, or the error `sinfo` printed) and on what it needs: the
+Slurm client commands `sinfo` (nodes, partitions, allocations) and `squeue` (the jobs on each node, start estimates)
+on PATH, able to reach the controller. When only `squeue` fails, the nodes are shown without their jobs.
+`jobrun cluster` prints the same note.
+
+**This machine** counts the larger of what Slurm allocated and what it **uses** (measured from `/proc`; a GPU counts
+as used while one of your processes has it open), since work started there outside Slurm reserves nothing.
+
+**Load on the cluster.** A refresh asks the Slurm controller twice, `sinfo` for all nodes and `squeue` for all jobs,
+which take a few milliseconds each. All dashboards that share the registry share one answer for 10 s
+(`JOBRUN_CLUSTER_TTL_S`), so several windows or machines still query once per interval. The panel refreshes every
+30 s (`jobboard.clusterSeconds`) only while it is expanded and visible; set it to 0 to refresh only with its button.
+As a reference, on a 30-node cluster the default adds about 2 job-list queries per minute, while the controller
+answered about 1,000 per minute from other clients.
+
 ## Logs
 
 - `jobrun run` writes the command's output to `~/.jobs/logs/<id>.log`, or to `--log FILE`.
@@ -413,6 +470,10 @@ The **VS Code settings** (search for "Job Board") cover the dashboard:
 | `statusBar` | running | Count `running` or `active` (also waiting) jobs, or `hidden` |
 | `diskWarnGB` | 5 | Warn when the disk with the registry or a running job's log has less free space |
 | `refreshSeconds` · `resourceSeconds` | 10 · 15 | How often the job list and the Resources view refresh |
+| `resourcesNodeDetails` · `clusterNodeDetails` | resources · resources | Expanding a node in that view shows `resources` (CPU, RAM, GPU rows with the jobs below) or `jobs` (the jobs directly; the node's row shows the resources) |
+| `clusterSeconds` | 30 | How often the Cluster view refreshes while it is expanded; 0: only with its refresh button |
+| `clusterGroupBy` | sharedPartitions | `sharedPartitions`, `partitions`, `gpuType` or `none` (see [Cluster](#cluster)) |
+| `clusterIcon` | worst | What a node's icon color shows: `worst`, `best`, `gpu`, `cpu` or `ram` |
 | `updateWhileUnfocused` | off | Keep redrawing while VS Code is not focused (e.g. on a second monitor) |
 | `command` · `registry` | | Path to `jobrun`; registry folder (`JOBRUN_HOME`) |
 
@@ -451,6 +512,7 @@ a sensible progress unit, declares the job's CPU budget, checks `jobrun res` bef
 | `track --pid PID` / `--slurm ID` | Adopt a running process or Slurm job; a process's log is detected from its stdout |
 | `ls [--all] [--json]` | List jobs (finished ones from the last 3 days unless `--all`) |
 | `res [--json]` | CPU, RAM, GPU, VRAM per node: used and reserved, per job |
+| `cluster [-j] [-p PART] [--json]` | All Slurm nodes and this machine: CPUs, RAM, GPUs allocated of total; `-j`: the jobs on each node |
 | `show ID` · `log ID [-f]` | Details as JSON · tail the log |
 | `wait [--any] ID` / `--group G` | Block until all have ended; `--any`: until one ends, reports a `JOBRUN_EVENT` or stalls |
 | `stop ID` / `--group G` | SIGTERM to the whole process tree, then SIGKILL after 10 s; `scancel` for Slurm |

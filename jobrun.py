@@ -308,11 +308,37 @@ def query_slurm(ids: list[str]) -> dict[str, dict]:
             "ended": None if status in ACTIVE else _slurm_time(end),
             "host": None if nodes in ("", "None assigned") else nodes,
         }
+    pending = [slurm_id for slurm_id, job in info.items() if job["status"] == "waiting"]
+    for slurm_id, start in _pending_starts(pending).items():
+        info[slurm_id].update(start)
     try:
         write_json(cache_path, {"time": time.time(), "info": info})
     except OSError:
         pass
     return info
+
+
+def _pending_starts(ids: list[str]) -> dict[str, dict]:
+    """When the scheduler expects pending jobs to start, on which nodes, and why they wait. sacct has no estimate
+    (its Start is Unknown until the job runs); squeue reports the backfill scheduler's, a single user-filtered query."""
+    if not ids or not shutil.which("squeue"):
+        return {}
+    try:
+        out = subprocess.run(["squeue", "-h", "-t", "PD", "-u", getpass.getuser(),
+                              "-O", "JobID:|,StartTime:|,SchedNodes:|,Reason:"],
+                             capture_output=True, text=True, timeout=15).stdout
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    wanted, starts = set(ids), {}
+    for line in out.splitlines():
+        parts = line.split("|", 3)
+        if len(parts) < 4 or parts[0] not in wanted:
+            continue
+        slurm_id, start, nodes, reason = (part.strip() for part in parts)
+        starts[slurm_id] = {"expected_start": _slurm_time(start),
+                            "sched_nodes": None if nodes in ("", "(null)") else nodes,
+                            "pending_reason": None if reason in ("", "None") else reason}
+    return starts
 
 
 def _slurm_log(pattern: str, info: dict) -> str:
@@ -926,6 +952,10 @@ def snapshot(meta: dict, slurm: dict) -> dict:
                item_idle_s=item_idle,
                item_stalled=bool(items) and status == "running" and is_stalled(items, item_idle, step_seconds(items)))
     row["host"] = slurm_info.get("host") or row["host"]
+    # a job in the Slurm queue: when and where the scheduler expects to start it, and why it still waits
+    queued = status == "waiting" and meta.get("kind") == "slurm"
+    row.update({key: slurm_info.get(key) if queued else None
+                for key in ("expected_start", "sched_nodes", "pending_reason")})
     try:  # the log's size, and what jobrun cut out of a log it writes (see trim_log)
         row["log_bytes"] = os.path.getsize(meta["log"]) if meta.get("log") else None
     except OSError:
@@ -1567,6 +1597,210 @@ def _tree_usage(table: dict, children: dict, root: int) -> tuple[int, int, list[
     return sum(table[p][1] for p in pids), sum(table[p][2] for p in pids), pids
 
 
+# ---------------------------------------------------------------- cluster
+# `jobrun cluster`: every Slurm node and this machine, with its totals, what Slurm has allocated there, and the jobs
+# that hold it (owner, allocation, time limit, expected end), plus queued jobs the scheduler has planned for it.
+# Slurm costs two controller queries per call (sinfo and squeue, each a few ms), and their answer is shared through the
+# registry for CLUSTER_TTL_S, so several dashboards on several machines still query once per interval. This machine
+# also reports what it uses, measured locally, since work started there outside Slurm reserves nothing.
+
+CLUSTER_TTL_S = float(os.environ.get("JOBRUN_CLUSTER_TTL_S", 10))
+NODE_UP_STATES = ("idle", "mixed", "allocated", "completing", "planned")  # sinfo base states that take new jobs
+HOLDS_RESOURCES = "R,CG,CF,S"  # squeue states whose jobs occupy their nodes
+
+
+def _slurm_limit(value: str) -> float | None:
+    """Seconds from Slurm time limits like 1-00:00:00, 4:00:00, 40:00; None for UNLIMITED, INVALID, N/A."""
+    try:
+        return _slurm_seconds(value)
+    except ValueError:
+        return None
+
+
+def _node_available(state: str) -> bool:
+    """Whether a node takes new jobs: a working base state, and not '*' (not responding)."""
+    return "*" not in state and state.rstrip("*~#!%$@^-+").split("+")[0] in NODE_UP_STATES
+
+
+def _gpus_held() -> set[int]:
+    """Indices of the NVIDIA devices that this user's processes have open. NVML would also see other users, but it
+    wakes an idle GPU's driver when persistence mode is off; reading /proc/*/fd does not."""
+    held, uid = set(), os.getuid()
+    for entry in os.scandir("/proc"):
+        if not entry.name.isdigit():
+            continue
+        try:
+            if entry.stat().st_uid != uid:
+                continue
+            fds = os.scandir(f"/proc/{entry.name}/fd")
+        except OSError:
+            continue
+        with fds:
+            for fd in fds:
+                try:
+                    match = re.fullmatch(r"/dev/nvidia(\d+)", os.readlink(fd.path))
+                except OSError:
+                    continue
+                if match:
+                    held.add(int(match.group(1)))
+    return held
+
+
+def _local_usage() -> dict:
+    """What this machine uses now: CPU cores (mean since the previous call, at least RES_FIRST_S), RAM, GPUs held."""
+    path = HOME / "hosts" / f"{HOST}.cluster.json"
+    previous = read_json(path, {}) or {}
+    now = time.time()
+    if now - previous.get("time", 0) < 5 and previous.get("result"):  # several dashboards at once
+        return previous["result"]
+    busy, total = _cpu_ticks()
+    if not previous.get("cpu") or now - previous.get("time", 0) > 600:
+        time.sleep(RES_FIRST_S)
+        (prev_busy, prev_total), (busy, total) = (busy, total), _cpu_ticks()
+        now = time.time()
+    else:
+        prev_busy, prev_total = previous["cpu"]
+    cpus = os.cpu_count() or 1
+    memory = _meminfo()
+    result = {"cpus": (busy - prev_busy) / max(total - prev_total, 1) * cpus,
+              "mem": memory.get("MemTotal", 0) - memory.get("MemAvailable", 0), "gpus": len(_gpus_held()),
+              "cpus_total": cpus, "mem_total": memory.get("MemTotal"), "gpu_count": _local_gpu_count()}
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        write_json(path, {"time": now, "cpu": [busy, total], "result": result})
+    except OSError:
+        pass
+    return result
+
+
+SLURM_NEEDED = {"sinfo": "nodes, partitions and what is allocated on them",
+                "squeue": "the jobs on each node and the queue's start estimates"}
+
+
+def _slurm_call(args: list[str]) -> tuple[str | None, str | None]:
+    """(stdout, None), or (None, why it failed): e.g. the controller does not answer."""
+    try:
+        out = subprocess.run(args, capture_output=True, text=True, timeout=15)
+    except subprocess.TimeoutExpired:
+        return None, f"{args[0]} did not answer within 15 s"
+    except OSError as err:
+        return None, f"{args[0]}: {err.strerror or err}"
+    if out.returncode:
+        lines = (out.stderr or out.stdout).strip().splitlines()
+        return None, f"{args[0]} failed: {lines[-1] if lines else f'exit code {out.returncode}'}"
+    return out.stdout, None
+
+
+def _cluster_slurm() -> dict:
+    """Partitions and nodes from sinfo, the jobs on them from squeue. A failed call is reported in "error" (sinfo:
+    nothing to show) or "warning" (squeue: nodes without their jobs)."""
+    nodes_text, error = _slurm_call(
+        ["sinfo", "-N", "-h", "-O", "NodeList:|,Partition:|,StateLong:|,CPUsState:|,CPUsLoad:|,Memory:|,"
+                                    "AllocMem:|,FreeMem:|,Gres:|,GresUsed:|,Time:"])
+    if error:
+        return {"error": error}
+    jobs_text, warning = _slurm_call(
+        ["squeue", "-h", "-t", HOLDS_RESOURCES + ",PD", "-O",
+         "JobID:|,UserName:|,Partition:|,State:|,TimeLimit:|,StartTime:|,EndTime:|,NodeList:|,SchedNodes:|,"
+         "tres-alloc:|,Reason:|,Name:"])
+    partitions: dict[str, dict] = {}
+    nodes: dict[str, dict] = {}
+    for line in nodes_text.splitlines():
+        parts = [p.strip() for p in line.split("|")]
+        if len(parts) < 11:
+            continue
+        name, partition, state, cpus, load, memory, alloc_mem, free_mem, gres, gres_used, limit = parts[:11]
+        default = partition.endswith("*")
+        partition = partition.rstrip("*")
+        part = partitions.setdefault(partition, {"name": partition, "default": default, "time_limit": limit,
+                                                 "time_limit_s": _slurm_limit(limit), "nodes": []})
+        part["nodes"].append(name)
+        if name in nodes:  # a node in several partitions is listed once per partition
+            nodes[name]["partitions"].append(partition)
+            continue
+        counts = cpus.split("/")
+        nodes[name] = {
+            "name": name, "partitions": [partition], "state": state, "available": _node_available(state),
+            "cpus": int(counts[3]) if len(counts) == 4 else None,
+            "cpus_alloc": int(counts[0]) if len(counts) == 4 else None,
+            "load": float(load) if load[:1].isdigit() else None,
+            "mem": _size(memory, "M"), "mem_alloc": _size(alloc_mem, "M"), "mem_free": _size(free_mem, "M"),
+            "gpus": _gpu_count(gres), "gpus_alloc": _gpu_count(gres_used),
+            "gpu_types": sorted(set(re.findall(r"(?:^|,)gpu:([^:,(]+):\d+", gres))),
+            "jobs": [], "pending": [],
+        }
+    for line in (jobs_text or "").splitlines():
+        parts = line.split("|", 11)
+        if len(parts) < 12:
+            continue
+        job_id, user, partition, state, limit, start, end, nodelist, sched, tres, reason, name = \
+            [p.strip() for p in parts]
+        pending = state == "PENDING"
+        hosts = expand_hosts(sched if pending else nodelist) if (sched if pending else nodelist) not in ("", "(null)") \
+            else []
+        if not hosts:
+            continue
+        alloc = _tres(tres)
+        job = {"slurm_id": job_id, "name": name, "user": user, "partition": partition, "state": state,
+               "nodes": len(hosts), "cpus": int(alloc.get("cpu", 0)) / len(hosts),
+               "mem": (_size(alloc.get("mem"), "M") or 0) / len(hosts),
+               "gpus": int(alloc.get("gres/gpu", 0)) / len(hosts),
+               "time_limit": limit, "time_limit_s": _slurm_limit(limit),
+               "started": None if pending else _slurm_time(start),
+               "ends": None if pending else _slurm_time(end),
+               "expected_start": _slurm_time(start) if pending else None,
+               "reason": None if reason in ("", "None") else reason}
+        for host in hosts:
+            if host in nodes:
+                nodes[host]["pending" if pending else "jobs"].append(job)
+    result = {"partitions": list(partitions.values()), "nodes": list(nodes.values())}
+    if warning:
+        result["warning"] = f"{warning}; the jobs on the nodes are not shown"
+    elif not nodes:
+        result["warning"] = "sinfo answered but lists no nodes (none visible to this user?)"
+    return result
+
+
+def cluster() -> dict:
+    """See the section comment."""
+    cache_path = HOME / "cluster-cache.json"
+    cache = read_json(cache_path, {}) or {}
+    queried = time.time()
+    missing = [command for command in SLURM_NEEDED if not shutil.which(command)]
+    if missing:  # no Slurm client here; a shared cache from a machine with Slurm is not this machine's cluster
+        slurm = {"error": f"{' and '.join(missing)} not found on this machine"}
+    elif queried - cache.get("time", 0) < CLUSTER_TTL_S and (cache.get("slurm") or {}).get("nodes"):
+        slurm, queried = cache["slurm"], cache["time"]
+    else:
+        slurm = _cluster_slurm()
+        if slurm.get("nodes") and not slurm.get("warning"):  # only full answers are shared
+            try:
+                write_json(cache_path, {"time": queried, "slurm": slurm})
+            except OSError:
+                pass
+    # Slurm's state: "ok", "missing" (no sinfo / squeue here), "error" (they failed) or "partial" (nodes, no jobs)
+    status = "missing" if missing else "error" if slurm.get("error") else "partial" if slurm.get("warning") else "ok"
+    message = slurm.get("error") or slurm.get("warning")
+    slurm = {"partitions": slurm.get("partitions") or [], "nodes": slurm.get("nodes") or []}
+    user = getpass.getuser()
+    nodes = slurm["nodes"]
+    for node in nodes:
+        for job in node["jobs"] + node["pending"]:
+            job["mine"] = job["user"] == user
+    usage = _local_usage()
+    here = next((n for n in nodes if n["name"] == HOST), None)
+    if here is None:  # this machine is no Slurm node: its own totals, nothing allocated
+        here = {"name": HOST, "partitions": [], "state": "local", "available": True, "cpus": usage["cpus_total"],
+                "cpus_alloc": 0, "load": os.getloadavg()[0], "mem": usage["mem_total"], "mem_alloc": 0,
+                "mem_free": None, "gpus": usage["gpu_count"], "gpus_alloc": 0, "gpu_types": [], "jobs": [],
+                "pending": []}
+        nodes = [here] + nodes
+    here["local"] = True
+    here["used"] = {key: usage[key] for key in ("cpus", "mem", "gpus")}
+    return {"time": queried, "user": user, "host": HOST, "slurm": bool(slurm["nodes"]), "slurm_status": status,
+            "slurm_message": message, "slurm_needed": SLURM_NEEDED, "partitions": slurm["partitions"], "nodes": nodes}
+
+
 # ---------------------------------------------------------------- setup, uninstall, demo
 # `jobrun setup` installs the pieces around the CLI: the CLI itself on PATH, the VS Code extension, and the agent skill
 # (plus an optional one-line instruction) for the agents the user picks. Every file, link, text block and extension
@@ -2098,6 +2332,23 @@ def pool_where(row: dict) -> str:
     return text
 
 
+def fmt_clock(epoch: float) -> str:
+    when = datetime.fromtimestamp(epoch)
+    return when.strftime("%H:%M" if when.date() == datetime.now().date() else "%a %H:%M")
+
+
+def fmt_queue(row: dict) -> str:
+    """A queued Slurm job: the scheduler's expected start and its reason to wait, e.g. ", start ~Thu 13:07 on node2
+    (Priority)". The estimate moves as other jobs end early or higher-priority jobs arrive."""
+    parts = []
+    if row.get("expected_start") and row["expected_start"] > time.time():
+        parts.append(f"start ~{fmt_clock(row['expected_start'])}"
+                     + (f" on {row['sched_nodes']}" if row.get("sched_nodes") else ""))
+    if row.get("pending_reason"):
+        parts.append(f"({row['pending_reason']})")
+    return (", " + " ".join(parts)) if parts else ""
+
+
 def fmt_progress(row: dict) -> str:
     text = _fmt_progress(row)
     return f"{text}  {fmt_event(row)}".strip() if row.get("degraded") else text
@@ -2105,7 +2356,7 @@ def fmt_progress(row: dict) -> str:
 
 def _fmt_progress(row: dict) -> str:
     if row.get("status") == "waiting":
-        return "waiting for " + ", ".join(row.get("waiting_for") or ["dependencies"])
+        return "waiting for " + ", ".join(row.get("waiting_for") or ["dependencies"]) + fmt_queue(row)
     if row.get("status") == "cancelled":
         return row.get("reason") or "never started"
     if row.get("pool"):  # a pool's worker: the list's progress is on the pool's row only
@@ -2465,6 +2716,58 @@ def cmd_res(args) -> int:
         others = [j for j in (node.get("slurm") or {}).get("jobs", []) if not j["mine"]]
         if others:
             print(f"    Slurm jobs of others: {len(others)} ({', '.join(sorted({j['user'] for j in others}))})")
+    return 0
+
+
+def cmd_cluster(args) -> int:
+    result = cluster()
+    if args.json:
+        print(json.dumps({"schema": JSON_SCHEMA, **result}))
+        return 0
+    by_name = {n["name"]: n for n in result["nodes"]}
+    # this machine's partitions first, then the default one, then the larger ones
+    order = sorted(result["partitions"], key=lambda p: (HOST not in p["nodes"], not p["default"], -len(p["nodes"])))
+    sections = [(f"{p['name']} ({'default, ' if p['default'] else ''}time limit {p['time_limit']})",
+                 [by_name[name] for name in p["nodes"] if name in by_name])
+                for p in order if p["nodes"]]
+    alone = [n for n in result["nodes"] if not n["partitions"]]
+    if alone:
+        sections.insert(0, ("this machine", alone))
+    if args.partition:
+        sections = [s for s in sections if s[0].split(" ")[0] in args.partition]
+    if result["slurm_status"] != "ok":
+        print(f"Slurm: {result['slurm_message']}")
+        if result["slurm_status"] in ("missing", "error"):
+            print("The cluster view needs, on a machine that reaches the Slurm controller:")
+            for command, what in SLURM_NEEDED.items():
+                print(f"  {command:<7} {what}")
+            print("Showing this machine only.")
+    print(f"{'Slurm' if result['slurm'] else 'This machine'} as of {fmt_clock(result['time'])}: allocated / total; "
+          "this machine: the larger of allocated and used")
+
+    def pair(node, key, fmt):
+        held = max(node.get(f"{key}_alloc") or 0, (node.get("used") or {}).get(key) or 0)
+        return f"{fmt(held)}/{fmt(node[key]) if node.get(key) is not None else '?'}"
+
+    for title, nodes in sections:
+        print(f"\n{title}")
+        for node in nodes:
+            gpus = (f"GPU {pair(node, 'gpus', lambda v: f'{v:g}')} {','.join(node['gpu_types'])}".rstrip()
+                    if node.get("gpus") else "")
+            jobs = len(node["jobs"])
+            print(f"  {node['name'] + (' *' if node.get('local') else ''):<16} {node['state']:<12} "
+                  f"CPU {pair(node, 'cpus', lambda v: f'{v:.0f}'):>8}  RAM {pair(node, 'mem', fmt_bytes):>12}  "
+                  f"{gpus:<18} {jobs} job{'' if jobs == 1 else 's'}")
+            if not args.jobs:
+                continue
+            for job in sorted(node["jobs"], key=lambda j: j["ends"] or float("inf")):
+                ends = f"ends {fmt_clock(job['ends'])}" if job.get("ends") else ""
+                print(f"      {job['slurm_id']:<10} {job['user']:<12} {job['name'][:28]:<28} {job['cpus']:>4g} CPU "
+                      f"{fmt_bytes(job['mem']):>5}  {job['gpus']:g} GPU  limit {job['time_limit']:<11} {ends}")
+            for job in sorted(node["pending"], key=lambda j: j["expected_start"] or float("inf")):
+                start = f"start ~{fmt_clock(job['expected_start'])}" if job.get("expected_start") else ""
+                print(f"      {job['slurm_id']:<10} {job['user']:<12} {job['name'][:28]:<28} {job['cpus']:>4g} CPU "
+                      f"{fmt_bytes(job['mem']):>5}  {job['gpus']:g} GPU  queued, {start}")
     return 0
 
 
@@ -2924,6 +3227,14 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("res", help="CPU, RAM, GPU and VRAM of the nodes running jobs: use, Slurm reservations, per job")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_res)
+
+    p = sub.add_parser("cluster", help="all Slurm nodes and this machine: CPUs, RAM and GPUs allocated of total, "
+                                       "and the jobs on each node")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--jobs", "-j", action="store_true", help="list the jobs on each node: owner, allocation, time "
+                                                             "limit, end; and queued jobs planned for it")
+    p.add_argument("--partition", "-p", action="append", help="only these partitions (repeatable)")
+    p.set_defaults(func=cmd_cluster)
 
     p = sub.add_parser("setup", help="install the command, the VS Code extension and the agent skill (wizard)")
     p.add_argument("--yes", "-y", action="store_true", help="no questions: take the defaults")
