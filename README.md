@@ -340,109 +340,44 @@ Waiting is separate from running: if the waiting shell dies, the job keeps runni
 
 ## Resources
 
-The **Resources** panel below the job list (and `jobrun res`) shows this machine and every node that runs an active
-job. Each resource (CPU, RAM, each GPU) is a row with what is used, the total, and what is reserved; expand it to
-see each job's share as **used / reserved**. The node row shows what is still **free** for new jobs: the total minus
-the larger of what is used and what is reserved.
+The **Resources** panel (and `jobrun res`) shows what your jobs use: this machine and every node that runs one of
+them, with CPU, RAM, GPU and VRAM as **used / reserved**, per node and per job. Use it to size new jobs to what is
+still free.
 
 ```
-▾ workstation  this machine · 4 jobs · free 40 cores, 0 RAM, 0 GPU
+▾ workstation  this machine · 4 jobs
   ▾ CPU     ████░░░░░░ 24 / 64 cores · 2 reserved
       tuning s4103         7.8 · no budget
       train unet           ██░░░░ 0.7 / 2
       other                0.4
-  ▾ RAM     ███░░░░░░░ 83.7G / 252G · 296G reserved
-      tuning s4103         █░░░░░ 21.2G / 96G
-      train unet           ░░░░░░ 672M / 8G
-      other                21.3G
-  ▾ GPU 0   ███████░░░ 69% · VRAM 2.97G / 48G
-      train unet           ████░░ 69% · VRAM 2.38G · 1 GPU reserved
-      other                605M
+  ▸ RAM     ███░░░░░░░ 83.7G / 252G · 296G reserved
+  ▸ GPU 0   ███████░░░ 69% · VRAM 2.97G / 48G
 ```
 
-**What a job has reserved**, per resource, from the first of:
-
-1. its **Slurm allocation** (`squeue`), for Slurm jobs;
-2. a declared **budget** (bookkeeping only, not enforced), preferably from the program itself, which knows its
-   worker count: a log line `JOBRUN_BUDGET cpus=12 mem=96G gpus=1` (any subset of the keys; the newest line replaces
-   the previous one, so a program can declare a budget per stage). Or given from outside:
-   `jobrun run --cpus 8 --mem 20G --gpus 1 -- …`, `jobrun edit ID --cpus 12`; these take precedence per key;
-3. the limits of the job's own **cgroup**, e.g. `systemd-run --user --scope -p MemoryMax=96G …` or `CPUQuota=`.
-   Only the job's own scope counts, never a user-wide slice.
-
-A node's reserved total is Slurm's allocations (all users) plus the budgets of your jobs that Slurm does not manage.
-
-**How it is measured** (`jobboard.resourceSeconds`, default 15 s, only while the panel is visible):
-
-- CPU and GPU utilization are **means since the last refresh**, from cumulative counters: `/proc` CPU ticks (exited
-  workers included) and the driver's utilization samples since a timestamp (NVML). RAM and VRAM are current values;
-  a job's RAM is the resident memory of its processes, so pages shared between forked workers count once per process.
-- Nothing samples in the background. A refresh costs about 0.1 s of CPU: one pass over `/proc`, two short Slurm
-  calls, and NVML only **while one of your jobs has the GPU open**. Querying an idle GPU would wake its driver (~2 s),
-  so without a GPU job the GPU row shows only reservations.
-- **Other nodes** are seen through Slurm only: reservations of all users, slurmd's load average and free memory (which
-  lag by minutes and can read near zero on a busy node), and the usage of your own Slurm jobs (`sstat`). Such a node
-  shows what is **reserved** first, and its bar fills with the larger of reserved and used: a reserved core is not
-  free for a new job whatever the load says. Used is at least the sum of your jobs on the node, marked
-  "(your jobs)" when that is higher than slurmd's figure. Their GPU utilization is not available.
+- **Give each job a budget**, so the panel knows what it has reserved. Slurm jobs have their allocation; for others,
+  print `JOBRUN_BUDGET cpus=12 mem=96G gpus=1` from the program, or pass `jobrun run --cpus 8 --mem 20G --gpus 1`.
+  A `systemd-run --scope -p MemoryMax=…` limit counts too.
+- It measures only while the panel is visible (every 15 s, `jobboard.resourceSeconds`) and never wakes an idle GPU.
+  Other nodes are seen through Slurm: their CPU and RAM use is coarse, their GPU use unknown.
+- The title bar filters the rows, and switches between CPU/RAM/GPU rows and a plain job list per node
+  (`jobboard.resourcesNodeDetails`).
 
 ## Cluster
 
+<img src="docs/cluster.png" width="700" alt="The Cluster panel: partitions with their nodes, each node's CPU, RAM and GPU allocation in columns with traffic lights, and node2 expanded to its jobs with owner, allocation, time limit and end, and a queued job with its expected start">
+
 The **Cluster** panel (collapsed by default; and `jobrun cluster`) shows every Slurm node and this machine, grouped
-by partition, with how much of its CPU cores, RAM and GPUs Slurm has **allocated** of the total. Each resource has a
-traffic light: 🟢 up to 20% allocated, 🟠 up to 80%, 🔴 above. The node's icon has the color of the fullest of the
-three; the palette button in the panel's title bar picks another rule (emptiest, GPU first, CPU only, RAM only).
-Nodes that take no new jobs (down, drained, not responding) are greyed out. Expanding a node shows a CPU, a RAM
-and a GPU row, each with its allocation, a bar and a small traffic light, and below each the jobs that hold it,
-ending first: name, owner, amount, time limit and when it ends at the latest. A **Queued** row lists jobs the
-scheduler has planned for this node, with their expected start. Your own jobs are blue.
+by partition, with the CPU cores, RAM and GPUs allocated of the total and a traffic light for each: 🟢 up to 20%,
+🟠 up to 80%, 🔴 above. Use it to see where a new job fits, and when resources free up.
 
-**Node details** (`jobboard.clusterNodeDetails`, or the list button in the panel's title bar; Resources has its own,
-`jobboard.resourcesNodeDetails`): `resources` (default) as above, or `jobs`: expanding a node lists its jobs directly,
-and the node's row shows CPU, RAM and GPU in columns instead, each with its traffic light. The traffic lights keep
-their color when a row is selected. Rows are padded into columns; since the tree uses a
-proportional font, columns after a name (node, job, user) line up to within a few pixels, digits exactly.
-
-<img src="docs/cluster.png" width="700" alt="The Cluster panel with jobboard.clusterNodeDetails = jobs: partitions with their nodes, each node's CPU, RAM and GPU allocation in columns with traffic lights, and node2 expanded to its jobs with owner, allocation, time limit and end, and a queued job with its expected start">
-
-The screenshot shows `jobboard.clusterNodeDetails = jobs`. With the default, `resources`, a node expands to:
-
-```
-▾ ⬤ node2      5 jobs · 1 queued
-  ▸ • CPU      ████░░░░░░ 96/256 cores
-  ▸ • RAM      ████░░░░░░ 384G/1T
-  ▾ • GPU      ████████░░ 6/8 · a100
-        diffusion-sample   chen   2 GPU   limit 12h00m   ends 02:13
-        nnunet-fold0       bob    1 GPU   limit 1d00h    ends 10:13
-  ▾ ◷ Queued   1 job
-        train fold1        you    16 CPU · 96G · 2 GPU   limit 1d00h   start ~20:13   (Resources)
-```
-
-**Grouping** (`jobboard.clusterGroupBy`, or the tree button in the title bar): by default, partitions with several
-nodes get a section each, and nodes that are alone in their partitions (typically workstations) share an **Other
-nodes** section; this machine has a section of its own. Other choices: every partition, GPU model, or one list.
-Empty sections are never shown.
-
-**Filter** (the funnel button in the title bar of Cluster and of Resources): type part of a node, job or user name, a
-GPU model or a partition, and the view shows only the rows that contain it, with the rows above them expanded. A row
-that matches itself (e.g. a node by its GPU model) keeps everything below it. The filter stays until you clear it
-(the × next to the funnel).
-
-**Without Slurm**, or when the controller does not answer, the panel shows this machine only, with a note on what
-went wrong (`sinfo and squeue not found on this machine`, or the error `sinfo` printed) and on what it needs: the
-Slurm client commands `sinfo` (nodes, partitions, allocations) and `squeue` (the jobs on each node, start estimates)
-on PATH, able to reach the controller. When only `squeue` fails, the nodes are shown without their jobs.
-`jobrun cluster` prints the same note.
-
-**This machine** counts the larger of what Slurm allocated and what it **uses** (measured from `/proc`; a GPU counts
-as used while one of your processes has it open), since work started there outside Slurm reserves nothing.
-
-**Load on the cluster.** A refresh asks the Slurm controller twice, `sinfo` for all nodes and `squeue` for all jobs,
-which take a few milliseconds each. All dashboards that share the registry share one answer for 10 s
-(`JOBRUN_CLUSTER_TTL_S`), so several windows or machines still query once per interval. The panel refreshes every
-30 s (`jobboard.clusterSeconds`) only while it is expanded and visible; set it to 0 to refresh only with its button.
-As a reference, on a 30-node cluster the default adds about 2 job-list queries per minute, while the controller
-answered about 1,000 per minute from other clients.
+- Expand a node to see its jobs (owner, allocation, time limit, end) and the queued jobs Slurm plans for it, with
+  their expected start. Your own jobs are blue.
+- The title bar has a filter (node, job or user name, GPU model, partition), the choice between CPU/RAM/GPU rows and
+  the job list of the screenshot (`jobboard.clusterNodeDetails`), the grouping and the rule for a node's light.
+- It is light on the Slurm controller: one `sinfo` and one `squeue` per refresh, shared by all windows for 10 s, every
+  30 s while the panel is open (`jobboard.clusterSeconds`; 0: only by hand).
+- It needs the Slurm commands `sinfo` and `squeue`. Without them, or when the controller does not answer, it shows
+  this machine and says what is missing.
 
 ## Logs
 
