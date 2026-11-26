@@ -403,13 +403,19 @@ and the node's row shows CPU, RAM and GPU in columns instead, each with its traf
 their color when a row is selected. Rows are padded into columns; since the tree uses a
 proportional font, columns after a name (node, job, user) line up to within a few pixels, digits exactly.
 
-<img src="docs/cluster.png" width="600" alt="The Cluster panel: two partitions with their nodes and traffic lights, node2 expanded to its CPU, RAM and GPU rows, the jobs holding its GPUs with owner, time limit and end, and a queued job with its expected start">
+<img src="docs/cluster.png" width="700" alt="The Cluster panel with jobboard.clusterNodeDetails = jobs: partitions with their nodes, each node's CPU, RAM and GPU allocation in columns with traffic lights, and node2 expanded to its jobs with owner, allocation, time limit and end, and a queued job with its expected start">
 
-With `jobboard.clusterNodeDetails = jobs`, a node's row reads:
+The screenshot shows `jobboard.clusterNodeDetails = jobs`. With the default, `resources`, a node expands to:
 
 ```
-▸ ⬤ node2   🟠 CPU  96 /256   🟠 RAM 384G /1T     🟠 GPU 6 /8 a100   5 jobs · 1 queued
-▸ ⬤ node4   🔴 CPU  96 /128   🟠 RAM 600G /768G   🔴 GPU 4 /4 h100   1 job · 1 queued
+▾ ⬤ node2      5 jobs · 1 queued
+  ▸ • CPU      ████░░░░░░ 96/256 cores
+  ▸ • RAM      ████░░░░░░ 384G/1T
+  ▾ • GPU      ████████░░ 6/8 · a100
+        diffusion-sample   chen   2 GPU   limit 12h00m   ends 02:13
+        nnunet-fold0       bob    1 GPU   limit 1d00h    ends 10:13
+  ▾ ◷ Queued   1 job
+        train fold1        you    16 CPU · 96G · 2 GPU   limit 1d00h   start ~20:13   (Resources)
 ```
 
 **Grouping** (`jobboard.clusterGroupBy`, or the tree button in the title bar): by default, partitions with several
