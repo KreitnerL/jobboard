@@ -55,6 +55,7 @@ WAIT_POLL_S = float(os.environ.get("JOBRUN_WAIT_POLL_S", 15))  # dependency chec
 COUNT_CHUNK_BYTES = 8 << 20  # count mode reads in chunks ...
 COUNT_BUDGET_BYTES = 256 << 20  # ... and at most this much per refresh
 SACCT_TTL_S = 30
+WAIT_SKEW_S = 60  # an end or event stamped further ahead of this clock is clock skew between hosts, reported at once
 # Rate and ETA use the last RATE_STEPS completed steps of the current stage. Backtested on 173 finished tuning and
 # rollout runs (2026-11-06): lower median ETA error than the run average or a 15-minute window, and nearly unbiased
 # when early steps are fast (parallel workers finish their short items first).
@@ -3018,8 +3019,23 @@ def cmd_wait(args) -> int:
     # what counts as new: events, stalls and pool members that end from now on, or, with --since, from that time on
     # (the rearm line of the previous wait), so nothing that happened between two waits is lost
     since = args.since
-    checked = time.time()
-    rows = load()
+
+    def observe() -> tuple[float, dict[str, dict]]:
+        """(the time the rows show the registry as of, the rows). Slurm states can be up to SACCT_TTL_S old (the
+        shared sacct cache): then the rows show the time of that cache."""
+        at = time.time()
+        loaded = load()
+        cache_time = (read_json(HOME / "sacct-cache.json", {}) or {}).get("time")
+        if cache_time and any(r.get("kind") == "slurm" for r in loaded.values()):
+            at = min(at, cache_time)
+        return at, loaded
+
+    checked, rows = observe()
+
+    def later(stamp: float | None) -> bool:
+        """An end or event stamped after the check began: its file appeared while the check read the registry. It is
+        left to the next check, so everything reported is older than the rearm time and nothing is reported twice."""
+        return bool(stamp) and checked < stamp <= checked + WAIT_SKEW_S
 
     def ended_by(row: dict) -> float:
         return row.get("ended") or row.get("started") or 0
@@ -3054,8 +3070,8 @@ def cmd_wait(args) -> int:
                 lines.append(_wait_line(row, f"{fmt_progress(row)}  after {fmt_duration(row['elapsed_s'])}"))
                 ok = ok and row["status"] == "done" and not row.get("incomplete")
             new = row.get("event_count", 0) - seen_events
-            if new > 0:
-                shown = [e for e in row.get("events") or [] if e.get("n", 0) > seen_events]
+            shown = [e for e in row.get("events") or [] if e.get("n", 0) > seen_events]
+            if new > 0 and not any(later(e.get("at")) for e in shown):
                 for event in shown:
                     lines.append(_wait_line(row, f"JOBRUN_EVENT {event['level']}: {event['message']}"))
                 if new > len(shown):
@@ -3074,7 +3090,8 @@ def cmd_wait(args) -> int:
                     f"{role} of pool {pool.get('name')} ({member['pool']})  {detail}").rstrip()
 
         for member in rows.values():
-            if member.get("pool") not in pools or member["status"] in ACTIVE or member["id"] in members_ended:
+            if (member.get("pool") not in pools or member["status"] in ACTIVE or member["id"] in members_ended
+                    or later(ended_by(member))):
                 continue
             members_ended.add(member["id"])
             if member["status"] in ("error", "lost"):
@@ -3085,7 +3102,8 @@ def cmd_wait(args) -> int:
         removed = removed if removed is not None else removed_jobs()
         for job_id, entry in removed.items():
             if (entry.get("pool") not in pools or job_id in rows or job_id in members_ended or job_id in removed_seen
-                    or (since is not None and job_id not in previous and (entry.get("ended") or 0) <= since)):
+                    or (since is not None and job_id not in previous and (entry.get("ended") or 0) <= since)
+                    or later(entry.get("ended"))):
                 continue
             removed_seen.add(job_id)
             members_ended.add(job_id)
@@ -3096,16 +3114,15 @@ def cmd_wait(args) -> int:
             break
         time.sleep(args.interval)
         previous = rows
-        checked = time.time()
-        rows = load()
+        checked, rows = observe()
     for line in lines:
         print(line)
     active = [i for i in ids if i in rows and rows[i]["status"] in ACTIVE]
     if active:
         shown = [i + (f" ({rows[i]['active_workers']} workers)" if i in pools else "") for i in active]
         print(f"still active: {' '.join(shown)}")
-        # the time of the check that found these triggers: a new wait from there misses nothing that happens before
-        # it starts (an end in the few seconds the check took may be reported twice)
+        # the time the check that found these triggers shows the registry as of: a new wait from there misses nothing
+        # and repeats nothing (what is stamped later was left to a later check)
         print(f"rearm: jobrun wait --any {' '.join(active)} --since {checked:.3f}")
     return 0 if ok else 1
 

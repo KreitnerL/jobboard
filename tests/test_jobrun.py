@@ -1098,6 +1098,27 @@ def test_rearm_with_since_reports_a_worker_that_ended_between_two_waits(jobrun):
     assert out.returncode == 0 and "second" in lines[0] and not any("first" in l for l in lines)
 
 
+def test_rearm_does_not_repeat_an_end_stamped_after_the_check(jobrun):
+    """An exit file can appear while a wait reads the registry, stamped later than the check began. The wait leaves
+    it to its next check, so the rearm time covers it and the next wait does not report it again."""
+    jobrun("run", "--pool", "late", "--name", "first", "--", "true")
+    jobrun("run", "--pool", "late", "--name", "second", "--", "sleep 6")
+    jobrun("run", "--pool", "late", "--name", "last", "--", "sleep 300")
+    first = wait_for(jobrun, "first", "done")
+    exit_file = jobrun.home / "jobs" / f"{first['id']}.exit.json"
+    since = time.time()
+    stamped = since + 2  # as if written while a check that began now was still reading
+    exit_file.write_text(json.dumps({**json.loads(exit_file.read_text()), "ended": stamped}))
+    (jobrun.home / "jobs" / f"{first['id']}.state.json").unlink()  # the cached final row has the old stamp
+    out = jobrun("wait", "--any", "late", "--since", str(since), "--interval", "0.2", check=False)
+    assert "first" in out.stdout.splitlines()[0] and time.time() >= stamped
+    rearm = out.stdout.splitlines()[-1].removeprefix("rearm: jobrun ").split()
+    assert float(rearm[-1]) >= stamped
+    out = jobrun(*rearm, "--interval", "0.2", check=False)
+    lines = out.stdout.splitlines()
+    assert "second" in lines[0] and not any("first" in line for line in lines)
+
+
 def test_wait_any_reports_a_worker_removed_before_its_end_was_seen(jobrun):
     jobrun("run", "--pool", "del", "--name", "short", "--", "sleep 3")
     jobrun("run", "--pool", "del", "--name", "long", "--", "sleep 300")
