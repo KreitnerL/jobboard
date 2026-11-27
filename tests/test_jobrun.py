@@ -1304,14 +1304,16 @@ def test_partition_access_follows_jobs_seen_in_the_queue(tmp_path, monkeypatch):
     monkeypatch.setattr(jobrun_module, "HOME", tmp_path)
     monkeypatch.setattr(jobrun_module.getpass, "getuser", lambda: "me")
     access_slurm(monkeypatch, mine="default\nproj\n")
-    job = lambda partition, account, state, reason="None": {"slurm_id": "1", "partition": partition,
-                                                             "account": account, "state": state, "reason": reason}
-    queue = [job("ws-other", "proj", "RUNNING"),  # someone's job under an account you hold: open with -A proj
-             job("main", "default", "PENDING", "PartitionConfig"),  # refused: closed for your default account
+    job = lambda partition, account, state, reason="None", user="me": {
+        "slurm_id": "1", "user": user, "partition": partition, "account": account, "state": state, "reason": reason}
+    queue = [job("ws-other", "proj", "RUNNING", user="bob"),  # anyone's job under an account you hold: open with -A proj
+             job("main", "default", "PENDING", "PartitionConfig"),  # your job refused: closed for your default account
              job("main", "proj", "PENDING", "PartitionConfig"),
+             job("open", "default", "PENDING", "PartitionConfig", user="bob"),  # another user's refusal (e.g. --qos)
              job("x,main", "default", "RUNNING"),  # several partitions: not evidence
              job("proj", "lab", "RUNNING")]  # an account you do not hold: not evidence
-    access = jobrun_module.partition_access(parts("main", "ws-other"), queue)["partitions"]
+    access = jobrun_module.partition_access(parts("main", "ws-other", "open"), queue)["partitions"]
+    assert access["open"]["access"] and access["open"]["source"] == "default"
     assert (access["ws-other"]["access"], access["ws-other"]["account"], access["ws-other"]["source"]) == (True, "proj", "seen")
     assert (access["main"]["access"], access["main"]["source"]) == (False, "seen")
     # the refusal is remembered without the job, then expires
@@ -1334,3 +1336,16 @@ def test_cluster_marks_nodes_without_access(tmp_path, monkeypatch):
     nodes = {n["name"]: n for n in jobrun_module.cluster()["nodes"]}
     assert nodes["gpu1"]["access"]  # main is open, though long is not
     assert nodes["ws"]["access"] and nodes["ws"]["accounts"] == ["ws"]
+
+
+def test_partition_access_respects_partition_bound_associations(tmp_path, monkeypatch):
+    """An account whose associations name partitions is valid on those only; one without a partition, everywhere."""
+    monkeypatch.setattr(jobrun_module, "HOME", tmp_path)
+    monkeypatch.setattr(jobrun_module.getpass, "getuser", lambda: "me")
+    access_slurm(monkeypatch, scontrol="PartitionName=main AllowAccounts=ALL\nPartitionName=gpu AllowAccounts=ALL\n",
+                 mine="default|main\ngpuproj|gpu\n")
+    access = jobrun_module.partition_access(parts("main", "gpu", "other"), [])["partitions"]
+    assert (access["main"]["access"], access["main"]["account"]) == (True, None)
+    assert (access["gpu"]["access"], access["gpu"]["account"]) == (True, "gpuproj")
+    assert (access["other"]["access"], access["other"]["source"]) == (False, "assoc")
+    assert "limited to" in access["other"]["why"]

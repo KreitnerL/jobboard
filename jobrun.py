@@ -1740,7 +1740,7 @@ def _cluster_slurm() -> dict:
         job_id, user, partition, state, limit, start, end, nodelist, sched, tres, reason, account, name = \
             [p.strip() for p in parts]
         pending = state == "PENDING"
-        queue.append({"slurm_id": job_id, "partition": partition, "account": account, "state": state,
+        queue.append({"slurm_id": job_id, "user": user, "partition": partition, "account": account, "state": state,
                       "reason": reason})
         hosts = expand_hosts(sched if pending else nodelist) if (sched if pending else nodelist) not in ("", "(null)") \
             else []
@@ -1808,16 +1808,24 @@ def _access_facts() -> dict:
     user = getpass.getuser()
     path = HOME / f"slurm-access-{user}.json"
     cached = read_json(path, {}) or {}
-    if time.time() - cached.get("time", 0) < ACCESS_TTL_S and "accounts" in cached:
+    if time.time() - cached.get("time", 0) < ACCESS_TTL_S and "bound" in cached:
         return cached
     if not shutil.which("sacctmgr"):
         return {"accounts": None}
-    mine = _slurm_lines(["sacctmgr", "-nP", "show", "assoc", f"user={user}", "format=account"])
+    mine = _slurm_lines(["sacctmgr", "-nP", "show", "assoc", f"user={user}", "format=account,partition"])
     if mine is None:
         return {"accounts": None}
+    # an association with a partition makes its account valid on that partition only; one without, everywhere
+    pairs = [(line.split("|") + [""])[:2] for line in mine if line.strip()]
+    anywhere = {account.strip() for account, partition in pairs if not partition.strip()}
+    bound: dict[str, list[str]] = {}
+    for account, partition in pairs:
+        if partition.strip() and account.strip() not in anywhere:
+            bound.setdefault(account.strip(), []).append(partition.strip())
     default = _slurm_lines(["sacctmgr", "-nP", "show", "user", user, "format=defaultaccount"]) or []
     every = _slurm_lines(["sacctmgr", "-nP", "show", "account", "format=account"]) or []
-    facts = {"time": time.time(), "accounts": sorted({a.strip() for a in mine if a.strip()}),
+    facts = {"time": time.time(), "accounts": sorted({account.strip() for account, _ in pairs if account.strip()}),
+             "bound": bound,
              "default": next((a.strip() for a in default if a.strip()), None),
              "all_accounts": sorted({a.strip() for a in every if a.strip()}), "rules": _partition_rules()}
     try:
@@ -1828,11 +1836,14 @@ def _access_facts() -> dict:
 
 
 def _seen_access(queue: list[dict], accounts: list[str]) -> dict[str, dict]:
-    """What jobs showed about partitions and your accounts, newest first, from SEEN_TTL_S: a job running under one of
-    your accounts in a partition (anyone's job) shows that the partition admits that account; a job pending with
-    reason PartitionConfig shows that it does not. Newer evidence replaces older, and evidence expires, so a changed
-    rule is noticed. Only jobs that are in the queue anyway are read: nothing is submitted to find out."""
-    path = HOME / f"slurm-access-seen-{getpass.getuser()}.json"
+    """What jobs showed about partitions and your accounts within SEEN_TTL_S: a job running under one of your accounts
+    in a partition (anyone's job) shows that the partition admits that account; one of your own jobs pending with
+    reason PartitionConfig shows that it does not. Only your own refusals count: PartitionConfig also follows from a
+    QOS or a submit host the partition does not admit, so another user's mistake under a shared account must not lock
+    the partition for you. Newer evidence replaces older, and evidence expires, so a changed rule is noticed. Only
+    jobs that are in the queue anyway are read: nothing is submitted to find out."""
+    user = getpass.getuser()
+    path = HOME / f"slurm-access-seen-{user}.json"
     seen = read_json(path, {}) or {}
     now = time.time()
     changed = False
@@ -1841,7 +1852,7 @@ def _seen_access(queue: list[dict], accounts: list[str]) -> dict[str, dict]:
             continue
         if job["state"] in ("RUNNING", "COMPLETING"):
             ok = True
-        elif job["state"] == "PENDING" and job["reason"] == "PartitionConfig":
+        elif job["state"] == "PENDING" and job["reason"] == "PartitionConfig" and job.get("user") == user:
             ok = False
         else:
             continue
@@ -1863,6 +1874,7 @@ def partition_access(partitions: list[dict], queue: list[dict]) -> dict:
     for your default account), "why", "source"}. Per partition and each of your accounts, the first that applies:
 
     - "groups": the partition admits only certain Unix groups (sinfo), none of them yours: closed, exact;
+    - "assoc": the account's associations are bound to other partitions (sacctmgr): closed for it, exact;
     - "seen": a job under that account ran in the partition, or stayed pending with PartitionConfig, within
       SEEN_TTL_S: exact as of then;
     - "scontrol": the partition's AllowAccounts / DenyAccounts, where users may run scontrol: exact;
@@ -1888,10 +1900,15 @@ def partition_access(partitions: list[dict], queue: list[dict]) -> dict:
         rule = (facts.get("rules") or {}).get(name)
         for account in accounts:
             evidence = seen.get(f"{name}|{account}")
-            if evidence:
+            only = (facts.get("bound") or {}).get(account)
+            if only and name not in only:  # Slurm refuses this pair at submission
+                verdicts[account] = (False, "assoc", f"account {account} is limited to {', '.join(only)}")
+            elif evidence:
                 when = datetime.fromtimestamp(evidence["at"]).strftime("%d %b %H:%M")
-                verdicts[account] = (evidence["ok"], "seen", f"job {evidence['job']} with account {account} "
-                                     f"{'ran here' if evidence['ok'] else 'was refused (PartitionConfig)'} ({when})")
+                verdicts[account] = (evidence["ok"], "seen", (
+                    f"job {evidence['job']} with account {account} ran here ({when})" if evidence["ok"] else
+                    f"your job {evidence['job']} with account {account} was refused ({when}, PartitionConfig; also "
+                    "the reason for a --qos or submit host the partition does not admit)"))
             elif rule is not None:
                 allow, deny = rule["AllowAccounts"] or ["ALL"], rule["DenyAccounts"]
                 ok = ("ALL" in allow or account in allow) and account not in deny
@@ -1910,7 +1927,7 @@ def partition_access(partitions: list[dict], queue: list[dict]) -> dict:
                             "why": f"with -A {account}: {why}" if account else why}
         else:
             # the weakest reason decides, so the dashboard can ignore a closed verdict that rests on an assumption
-            order = ("names", "scontrol", "seen", "groups")
+            order = ("names", "seen", "scontrol", "assoc", "groups")
             source = min((verdicts[a][1] for a in accounts), key=lambda s: order.index(s) if s in order else 0)
             why = next(verdicts[a][2] for a in accounts if verdicts[a][1] == source)
             result[name] = {"access": False, "account": None, "source": source, "why": why}
