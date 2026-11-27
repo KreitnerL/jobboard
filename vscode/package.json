@@ -650,6 +650,21 @@
             "RAM only."
           ],
           "markdownDescription": "What the color of a node's icon in the Cluster view shows (also with the button in the view's title bar): green up to 20% allocated, orange up to 80%, red above. Each resource also has its own dot in the row. On this machine, the larger of allocated and used counts."
+        },
+        "jobboard.clusterShowNoAccess": {
+          "type": "boolean",
+          "default": true,
+          "order": 24,
+          "description": "Show the Slurm nodes your jobs cannot use (their partitions do not admit your accounts or groups), dimmed with a lock. Off: hide them."
+        },
+        "jobboard.clusterPartitionAccess": {
+          "type": "object",
+          "default": {},
+          "order": 25,
+          "additionalProperties": {
+            "type": "boolean"
+          },
+          "markdownDescription": "Correct which partitions take your jobs, e.g. `{\"gpu\": true, \"private01\": false}`. Without an entry, jobrun decides: from `scontrol show partition` where that works, else a partition named after a Slurm account counts as that account's own."
         }
       }
     },

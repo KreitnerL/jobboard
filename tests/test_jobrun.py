@@ -1248,3 +1248,59 @@ def test_cluster_reports_a_slurm_controller_that_does_not_answer(tmp_path, monke
     result = jobrun_module.cluster()
     assert result["slurm_status"] == "partial" and "squeue failed: squeue: error: Invalid user" in result["slurm_message"]
     assert {n["name"] for n in result["nodes"]} == {"gpu1", "gpu2", "ws"} and not (tmp_path / "cluster-cache.json").exists()
+
+
+def test_partition_access_from_scontrol_rules(tmp_path, monkeypatch):
+    monkeypatch.setattr(jobrun_module, "HOME", tmp_path)
+    monkeypatch.setattr(jobrun_module.getpass, "getuser", lambda: "me")
+    monkeypatch.setattr(jobrun_module, "_unix_groups", lambda: {"lab"})
+    fake_slurm(monkeypatch, {
+        "sacctmgr": "default\nproj\n",
+        "scontrol": "PartitionName=main AllowGroups=ALL AllowAccounts=ALL DenyAccounts=\n"
+                    "PartitionName=proj AllowGroups=ALL AllowAccounts=proj,other\n"
+                    "PartitionName=theirs AllowGroups=ALL AllowAccounts=theirs\n"
+                    "PartitionName=labonly AllowGroups=otherlab AllowAccounts=ALL\n"
+                    "PartitionName=denied AllowGroups=ALL AllowAccounts=ALL DenyAccounts=default,proj\n"})
+    access = jobrun_module.partition_access(["main", "proj", "theirs", "labonly", "denied"])["partitions"]
+    assert access["main"] == {"access": True, "account": None, "why": "open"}
+    assert access["proj"]["access"] and access["proj"]["account"] == "proj"
+    assert [access[p]["access"] for p in ("theirs", "labonly", "denied")] == [False, False, False]
+    assert "otherlab" in access["labonly"]["why"]
+
+
+def test_partition_access_from_account_names_without_scontrol(tmp_path, monkeypatch):
+    """scontrol disabled for users: a partition named after a Slurm account is that account's own."""
+    monkeypatch.setattr(jobrun_module, "HOME", tmp_path)
+    monkeypatch.setattr(jobrun_module.getpass, "getuser", lambda: "me")
+
+    def run(cmd, **kwargs):
+        if cmd[0] == "scontrol":
+            return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="scontrol has been disabled\n")
+        out = "default\nws-me\n" if any(a.startswith("user=") for a in cmd) else "default\nws-me\nws-other\nroot\n"
+        return subprocess.CompletedProcess(cmd, 0, stdout=out, stderr="")
+    monkeypatch.setattr(jobrun_module.subprocess, "run", run)
+    monkeypatch.setattr(jobrun_module.shutil, "which", lambda name: "/usr/bin/" + name)
+    result = jobrun_module.partition_access(["main", "ws-me", "ws-other"])
+    access = result["partitions"]
+    assert result["how"] == "accounts" and result["accounts"] == ["default", "ws-me"]
+    assert access["main"]["access"] and access["main"]["account"] is None
+    assert access["ws-me"]["access"] and access["ws-me"]["account"] == "ws-me"
+    assert not access["ws-other"]["access"]
+    # cached for the next hour: no Slurm call needed
+    monkeypatch.setattr(jobrun_module.subprocess, "run", lambda *a, **k: (_ for _ in ()).throw(AssertionError("called")))
+    assert jobrun_module.partition_access(["main", "ws-other"])["partitions"]["ws-other"]["access"] is False
+
+
+def test_cluster_marks_nodes_without_access(tmp_path, monkeypatch):
+    monkeypatch.setattr(jobrun_module, "HOME", tmp_path)
+    monkeypatch.setattr(jobrun_module, "HOST", "ws")
+    monkeypatch.setattr(jobrun_module.getpass, "getuser", lambda: "me")
+    monkeypatch.setattr(jobrun_module, "_local_usage", lambda: {"cpus": 0.0, "mem": 0, "gpus": 0, "cpus_total": 16,
+                                                                "mem_total": 2 ** 36, "gpu_count": 0})
+    monkeypatch.setattr(jobrun_module, "partition_access", lambda names: {"how": "accounts", "accounts": ["default"], "partitions": {
+        "main": {"access": True, "account": None, "why": "open"}, "long": {"access": False, "account": None, "why": "x"},
+        "ws": {"access": True, "account": "ws", "why": "with -A ws"}}})
+    fake_slurm(monkeypatch, {"sinfo": SINFO, "squeue": SQUEUE})
+    nodes = {n["name"]: n for n in jobrun_module.cluster()["nodes"]}
+    assert nodes["gpu1"]["access"]  # main is open, though long is not
+    assert nodes["ws"]["access"] and nodes["ws"]["accounts"] == ["ws"]

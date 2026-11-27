@@ -372,6 +372,9 @@ by partition, with the CPU cores, RAM and GPUs allocated of the total and a traf
 
 - Expand a node to see its jobs (owner, allocation, time limit, end) and the queued jobs Slurm plans for it, with
   their expected start. Your own jobs are blue.
+- Nodes whose partitions do not admit your Slurm accounts or groups show a 🔒 (`jobboard.clusterShowNoAccess` hides
+  them); a partition that needs a specific account shows the `-A` to use. If the guess is wrong for a partition,
+  set it in `jobboard.clusterPartitionAccess`.
 - The title bar has a filter (node, job or user name, GPU model, partition), the choice between CPU/RAM/GPU rows and
   the job list of the screenshot (`jobboard.clusterNodeDetails`), the grouping and the rule for a node's light.
 - It is light on the Slurm controller: one `sinfo` and one `squeue` per refresh, shared by all windows for 10 s, every
@@ -415,6 +418,7 @@ The **VS Code settings** (search for "Job Board") cover the dashboard:
 | `clusterSeconds` | 30 | How often the Cluster view refreshes while it is expanded; 0: only with its refresh button |
 | `clusterGroupBy` | sharedPartitions | `sharedPartitions`, `partitions`, `gpuType` or `none` (see [Cluster](#cluster)) |
 | `clusterIcon` | worst | What a node's icon color shows: `worst`, `best`, `gpu`, `cpu` or `ram` |
+| `clusterShowNoAccess` · `clusterPartitionAccess` | on · {} | Show nodes you cannot use (with a lock); per-partition corrections, e.g. `{"gpu": true}` |
 | `updateWhileUnfocused` | off | Keep redrawing while VS Code is not focused (e.g. on a second monitor) |
 | `command` · `registry` | | Path to `jobrun`; registry folder (`JOBRUN_HOME`) |
 

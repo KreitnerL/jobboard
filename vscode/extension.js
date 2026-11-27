@@ -175,13 +175,18 @@ function eventText(job) {
   return `⚠ ${newest.level}: ${newest.message}${more}`;
 }
 
+// Slurm pending reasons that need a word of explanation
+const REASON_HINTS = {
+  PartitionConfig: "PartitionConfig: the partition does not admit this job's account or group, it will never start (try -A)",
+};
+
 // A job in the Slurm queue: when and where the scheduler expects to start it, and why it still waits.
 function queueText(job) {
   const parts = [];
   if (job.expected_start && job.expected_start > Date.now() / 1000) {
     parts.push(`start ~${clock(job.expected_start)}${job.sched_nodes ? ` on ${job.sched_nodes}` : ''}`);
   }
-  if (job.pending_reason) parts.push(`(${job.pending_reason})`);
+  if (job.pending_reason) parts.push(`(${REASON_HINTS[job.pending_reason] || job.pending_reason})`);
   return parts.join(' ');
 }
 
@@ -1183,8 +1188,27 @@ class ClusterProvider {
   }
 
   // Non-empty sections in display order: this machine's first, then the default partition, then the larger ones.
+  // Which nodes take your jobs: jobrun's verdict per partition, corrected by jobboard.clusterPartitionAccess; a node
+  // is usable if one of its partitions is (this machine outside Slurm always is).
+  applyAccess() {
+    const overrides = config().get('clusterPartitionAccess') || {};
+    const byName = new Map((this.data.partitions || []).map(p => [p.name, p]));
+    for (const p of byName.values()) {
+      p.usable = typeof overrides[p.name] === 'boolean' ? overrides[p.name] : p.access !== false;
+      p.overridden = typeof overrides[p.name] === 'boolean';
+    }
+    for (const node of this.data.nodes || []) {
+      const parts = node.partitions.map(name => byName.get(name)).filter(Boolean);
+      node.usable = !parts.length || parts.some(p => p.usable);
+      node.useAccounts = [...new Set(parts.filter(p => p.usable && p.account && !p.overridden).map(p => p.account))];
+      node.accessParts = parts;
+    }
+  }
+
   groups() {
-    const nodes = this.data.nodes || [];
+    this.applyAccess();
+    const show = config().get('clusterShowNoAccess') !== false;
+    const nodes = (this.data.nodes || []).filter(n => show || n.usable);
     const byName = new Map(nodes.map(n => [n.name, n]));
     const partitions = (this.data.partitions || []).map(p => ({
       key: `p:${p.name}`, label: p.name, partition: p, nodes: p.nodes.map(name => byName.get(name)).filter(Boolean)}));
@@ -1224,15 +1248,17 @@ class ClusterProvider {
     const item = new vscode.TreeItem(group.label, vscode.TreeItemCollapsibleState.Expanded);
     item.id = `cluster:${group.key}`;
     item.clusterGroup = group;
-    const up = group.nodes.filter(n => n.available);
+    const up = group.nodes.filter(n => n.available && n.usable);
+    const closed = group.nodes.filter(n => !n.usable).length;
     const free = key => up.reduce((sum, n) => sum + Math.max(0, (n[key] || 0) - held(n, key)), 0);
     const p = group.partition;
-    item.description = [`${up.length}/${group.nodes.length} nodes up`,
+    item.description = [`${group.nodes.filter(n => n.available).length}/${group.nodes.length} nodes up`,
+      closed ? `${closed} no access` : '',
       `free ${cores(free('cpus'))} cores · ${bytes(free('mem'))} · ${cores(free('gpus'))} GPU`,
       p && p.default ? 'default' : '', p ? (p.time_limit_s == null ? 'no time limit' : `limit ${duration(p.time_limit_s)}`) : '',
     ].filter(Boolean).join(' · ');
-    item.tooltip = `${group.label}: ${group.nodes.length} node${group.nodes.length === 1 ? '' : 's'}, ${up.length} taking jobs.\n` +
-      'Free: what is not allocated on the nodes that take jobs (this machine: not used either).' +
+    item.tooltip = `${group.label}: ${group.nodes.length} node${group.nodes.length === 1 ? '' : 's'}, ${up.length} taking your jobs.\n` +
+      'Free: what is not allocated on the nodes that take your jobs (this machine: not used either).' +
       (p ? `\nPartition time limit: ${p.time_limit}` : '');
     item.iconPath = new vscode.ThemeIcon(group.key === 'local' ? 'vm' : 'server-environment');
     return item;
@@ -1257,8 +1283,9 @@ class ClusterProvider {
   nodeCells(node) {
     const counts = [(node.jobs || []).length ? `${node.jobs.length} job${node.jobs.length === 1 ? '' : 's'}` : '',
       (node.pending || []).length ? `${node.pending.length} queued` : ''].filter(Boolean).join(' · ');
-    const notes = [node.local ? 'this machine' : '', node.available ? '' : `⛔ ${node.state}`].filter(Boolean).join(' · ');
-    if (nodeDetails('cluster') !== 'jobs') return [[counts, notes].filter(Boolean).join(' · ')];
+    const notes = [node.local ? 'this machine' : '', node.usable ? '' : '🔒 no access', node.available ? '' : `⛔ ${node.state}`,
+      node.usable && node.useAccounts.length ? `-A ${node.useAccounts.join(' / ')}` : ''].filter(Boolean).join(' · ');
+    if (nodeDetails('cluster') !== 'jobs') return [[notes, counts].filter(Boolean).join(' · ')];
     const f = fractions(node);
     const cells = [];
     for (const [key, label, fmt] of CLUSTER_RESOURCES) {
@@ -1266,7 +1293,7 @@ class ClusterProvider {
         cells.push('', '', '', '');
         continue;
       }
-      cells.push(`${node.available ? light(f[key])[0] : '⚪'} ${label}`, right(fmt(held(node, key))),
+      cells.push(`${node.available && node.usable ? light(f[key])[0] : '⚪'} ${label}`, right(fmt(held(node, key))),
         `/${node[key] != null ? fmt(node[key]) : '?'}`, key === 'gpus' ? node.gpu_types.join('+') : '');
     }
     // the state first in the last column: in a narrow sidebar the end of a row is cut off
@@ -1280,12 +1307,17 @@ class ClusterProvider {
     item.id = `cluster-node:${node.name}`;
     item.clusterNode = node;
     // large: the node's light stands above its resources' small ones
-    item.iconPath = node.available ? lightIcon(light(iconFraction(node, config().get('clusterIcon')))[1], 'large')
-      : new vscode.ThemeIcon('circle-slash', new vscode.ThemeColor('disabledForeground'));
+    item.iconPath = !node.usable ? new vscode.ThemeIcon('lock', new vscode.ThemeColor('disabledForeground'))
+      : node.available ? lightIcon(light(iconFraction(node, config().get('clusterIcon')))[1], 'large')
+        : new vscode.ThemeIcon('circle-slash', new vscode.ThemeColor('disabledForeground'));
     const f = fractions(node);
     const md = new vscode.MarkdownString();
     md.appendMarkdown(`**${node.name}**${node.local ? ' (this machine)' : ''} — ${node.state}${node.available ? '' : ', takes no new jobs'}\n\n`);
     if (node.partitions.length) md.appendMarkdown(`partitions: \`${node.partitions.join(', ')}\`  \n`);
+    for (const p of node.accessParts || []) {
+      const why = p.overridden ? `${p.usable ? 'usable' : 'no access'} (jobboard.clusterPartitionAccess)` : p.why || (p.usable ? 'open' : 'no access');
+      md.appendMarkdown(`${p.usable ? '✓' : '🔒'} partition \`${p.name}\`: ${why}  \n`);
+    }
     for (const [key, label, fmt] of CLUSTER_RESOURCES) {
       if (key === 'gpus' && !node.gpus) continue;
       const used = node.used && node.used[key] != null ? ` · used ${fmt(node.used[key])}` : '';
@@ -1313,7 +1345,7 @@ class ClusterProvider {
       item.clusterJobs = jobs;
       item.owner = node;
       item.resource = key;
-      item.iconPath = lightIcon(node.available ? light(f[key])[1] : 'grey', 'small');
+      item.iconPath = lightIcon(node.available && node.usable ? light(f[key])[1] : 'grey', 'small');
       const alloc = fmt(node[`${key}_alloc`] || 0);
       const used = node.used && node.used[key] != null ? `used ${fmt(node.used[key])}` : '';
       item.tooltip = `${label}: ${alloc} of ${node[key] != null ? fmt(node[key]) : '?'}${unit} allocated by Slurm` +
@@ -1496,7 +1528,7 @@ function activate(context) {
       provider.refresh(true);
       if (event.affectsConfiguration('jobboard.resourcesNodeDetails')) resources.emitter.fire();  // redraw, no new measurement
       else resources.refresh();
-      if (['clusterGroupBy', 'clusterIcon', 'clusterNodeDetails'].some(key => event.affectsConfiguration(`jobboard.${key}`))) {
+      if (['clusterGroupBy', 'clusterIcon', 'clusterNodeDetails', 'clusterShowNoAccess', 'clusterPartitionAccess'].some(key => event.affectsConfiguration(`jobboard.${key}`))) {
         cluster.emitter.fire();  // regroup and recolor what is shown, no new Slurm query
       } else if (cluster.visible() && cluster.auto()) cluster.refresh();
     }),
