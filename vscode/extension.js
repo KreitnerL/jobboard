@@ -1293,7 +1293,7 @@ class ClusterProvider {
         cells.push('', '', '', '');
         continue;
       }
-      cells.push(`${node.available && node.usable ? light(f[key])[0] : '⚪'} ${label}`, right(fmt(held(node, key))),
+      cells.push(`${node.available ? light(f[key])[0] : '⚪'} ${label}`, right(fmt(held(node, key))),
         `/${node[key] != null ? fmt(node[key]) : '?'}`, key === 'gpus' ? node.gpu_types.join('+') : '');
     }
     // the state first in the last column: in a narrow sidebar the end of a row is cut off
@@ -1307,9 +1307,9 @@ class ClusterProvider {
     item.id = `cluster-node:${node.name}`;
     item.clusterNode = node;
     // large: the node's light stands above its resources' small ones
-    item.iconPath = !node.usable ? new vscode.ThemeIcon('lock', new vscode.ThemeColor('disabledForeground'))
-      : node.available ? lightIcon(light(iconFraction(node, config().get('clusterIcon')))[1], 'large')
-        : new vscode.ThemeIcon('circle-slash', new vscode.ThemeColor('disabledForeground'));
+    // a node you cannot use keeps its load color, as a lock instead of a disc
+    item.iconPath = node.available ? lightIcon(light(iconFraction(node, config().get('clusterIcon')))[1], node.usable ? 'large' : 'lock')
+      : node.usable ? new vscode.ThemeIcon('circle-slash', new vscode.ThemeColor('disabledForeground')) : lightIcon('grey', 'lock');
     const f = fractions(node);
     const md = new vscode.MarkdownString();
     md.appendMarkdown(`**${node.name}**${node.local ? ' (this machine)' : ''} — ${node.state}${node.available ? '' : ', takes no new jobs'}\n\n`);
@@ -1345,7 +1345,7 @@ class ClusterProvider {
       item.clusterJobs = jobs;
       item.owner = node;
       item.resource = key;
-      item.iconPath = lightIcon(node.available && node.usable ? light(f[key])[1] : 'grey', 'small');
+      item.iconPath = lightIcon(node.available ? light(f[key])[1] : 'grey', 'small');
       const alloc = fmt(node[`${key}_alloc`] || 0);
       const used = node.used && node.used[key] != null ? `used ${fmt(node.used[key])}` : '';
       item.tooltip = `${label}: ${alloc} of ${node[key] != null ? fmt(node[key]) : '?'}${unit} allocated by Slurm` +

@@ -372,8 +372,9 @@ by partition, with the CPU cores, RAM and GPUs allocated of the total and a traf
 
 - Expand a node to see its jobs (owner, allocation, time limit, end) and the queued jobs Slurm plans for it, with
   their expected start. Your own jobs are blue.
-- Nodes whose partitions do not admit your Slurm accounts or groups show a 🔒 (`jobboard.clusterShowNoAccess` hides
-  them); a partition that needs a specific account shows the `-A` to use. If the guess is wrong for a partition,
+- Nodes whose partitions do not admit your Slurm accounts or groups show a lock in their load color, so you still see
+  how busy they are (`jobboard.clusterShowNoAccess` hides them); a partition that needs a specific account shows the
+  `-A` to use. If the guess is wrong for a partition,
   set it in `jobboard.clusterPartitionAccess`.
 - The title bar has a filter (node, job or user name, GPU model, partition), the choice between CPU/RAM/GPU rows and
   the job list of the screenshot (`jobboard.clusterNodeDetails`), the grouping and the rule for a node's light.
