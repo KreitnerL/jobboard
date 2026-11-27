@@ -1696,14 +1696,14 @@ def _cluster_slurm() -> dict:
     """Partitions and nodes from sinfo, the jobs on them from squeue. A failed call is reported in "error" (sinfo:
     nothing to show) or "warning" (squeue: nodes without their jobs)."""
     nodes_text, error = _slurm_call(
-        ["sinfo", "-N", "-h", "-O", "NodeList:|,Partition:|,StateLong:|,CPUsState:|,CPUsLoad:|,Memory:|,"
-                                    "AllocMem:|,FreeMem:|,Gres:|,GresUsed:|,Time:"])
+        ["sinfo", "-a", "-N", "-h", "-O", "NodeList:|,Partition:|,StateLong:|,CPUsState:|,CPUsLoad:|,Memory:|,"
+                                          "AllocMem:|,FreeMem:|,Gres:|,GresUsed:|,Time:|,Groups:"])
     if error:
         return {"error": error}
     jobs_text, warning = _slurm_call(
         ["squeue", "-h", "-t", HOLDS_RESOURCES + ",PD", "-O",
          "JobID:|,UserName:|,Partition:|,State:|,TimeLimit:|,StartTime:|,EndTime:|,NodeList:|,SchedNodes:|,"
-         "tres-alloc:|,Reason:|,Name:"])
+         "tres-alloc:|,Reason:|,Account:|,Name:"])
     partitions: dict[str, dict] = {}
     nodes: dict[str, dict] = {}
     for line in nodes_text.splitlines():
@@ -1711,10 +1711,12 @@ def _cluster_slurm() -> dict:
         if len(parts) < 11:
             continue
         name, partition, state, cpus, load, memory, alloc_mem, free_mem, gres, gres_used, limit = parts[:11]
+        groups = parts[11] if len(parts) > 11 else "all"
         default = partition.endswith("*")
         partition = partition.rstrip("*")
-        part = partitions.setdefault(partition, {"name": partition, "default": default, "time_limit": limit,
-                                                 "time_limit_s": _slurm_limit(limit), "nodes": []})
+        part = partitions.setdefault(partition, {
+            "name": partition, "default": default, "time_limit": limit, "time_limit_s": _slurm_limit(limit),
+            "groups": [] if groups in ("", "all", "(null)") else groups.split(","), "nodes": []})
         part["nodes"].append(name)
         if name in nodes:  # a node in several partitions is listed once per partition
             nodes[name]["partitions"].append(partition)
@@ -1730,13 +1732,16 @@ def _cluster_slurm() -> dict:
             "gpu_types": sorted(set(re.findall(r"(?:^|,)gpu:([^:,(]+):\d+", gres))),
             "jobs": [], "pending": [],
         }
+    queue = []  # every job's partition, account and state: evidence of which partition admits which account
     for line in (jobs_text or "").splitlines():
-        parts = line.split("|", 11)
-        if len(parts) < 12:
+        parts = line.split("|", 12)
+        if len(parts) < 13:
             continue
-        job_id, user, partition, state, limit, start, end, nodelist, sched, tres, reason, name = \
+        job_id, user, partition, state, limit, start, end, nodelist, sched, tres, reason, account, name = \
             [p.strip() for p in parts]
         pending = state == "PENDING"
+        queue.append({"slurm_id": job_id, "partition": partition, "account": account, "state": state,
+                      "reason": reason})
         hosts = expand_hosts(sched if pending else nodelist) if (sched if pending else nodelist) not in ("", "(null)") \
             else []
         if not hosts:
@@ -1754,7 +1759,7 @@ def _cluster_slurm() -> dict:
         for host in hosts:
             if host in nodes:
                 nodes[host]["pending" if pending else "jobs"].append(job)
-    result = {"partitions": list(partitions.values()), "nodes": list(nodes.values())}
+    result = {"partitions": list(partitions.values()), "nodes": list(nodes.values()), "queue": queue}
     if warning:
         result["warning"] = f"{warning}; the jobs on the nodes are not shown"
     elif not nodes:
@@ -1762,7 +1767,8 @@ def _cluster_slurm() -> dict:
     return result
 
 
-ACCESS_TTL_S = 3600  # accounts and partition rules rarely change: one sacctmgr / scontrol look an hour
+ACCESS_TTL_S = 3600  # accounts and partition rules rarely change: sacctmgr / scontrol are asked once an hour
+SEEN_TTL_S = 7 * 86400  # how long a job seen running or refused in a partition decides that partition's access
 
 
 def _slurm_lines(args: list[str]) -> list[str] | None:
@@ -1771,8 +1777,8 @@ def _slurm_lines(args: list[str]) -> list[str] | None:
 
 
 def _partition_rules() -> dict[str, dict[str, list[str]]] | None:
-    """Per partition: AllowAccounts, DenyAccounts, AllowGroups as lists (["ALL"] for no restriction), from
-    `scontrol show partition`; None where scontrol is disabled for users."""
+    """Per partition: AllowAccounts and DenyAccounts as lists (["ALL"] for no restriction), from `scontrol show
+    partition`; None where scontrol is disabled for users."""
     lines = _slurm_lines(["scontrol", "show", "partition", "-o"]) if shutil.which("scontrol") else None
     if not lines:
         return None
@@ -1781,7 +1787,7 @@ def _partition_rules() -> dict[str, dict[str, list[str]]] | None:
         fields = dict(item.split("=", 1) for item in line.split() if "=" in item)
         if "PartitionName" in fields:
             rules[fields["PartitionName"]] = {key: [v for v in fields.get(key, "").split(",") if v]
-                                              for key in ("AllowAccounts", "DenyAccounts", "AllowGroups")}
+                                              for key in ("AllowAccounts", "DenyAccounts")}
     return rules or None
 
 
@@ -1796,58 +1802,120 @@ def _unix_groups() -> set[str]:
     return names
 
 
-def partition_access(partitions: list[str]) -> dict:
-    """Which partitions accept your jobs, and with which account. Where scontrol works, from each partition's
-    AllowAccounts / DenyAccounts / AllowGroups against your Slurm accounts and Unix groups. Where it is disabled, a
-    partition named after a Slurm account counts as that account's own (a common pattern for private nodes, e.g.
-    workstations): open to you with -A NAME if you hold the account, else closed; other partitions count as open.
-    Cached for ACCESS_TTL_S per user, so sacctmgr (slurmdbd) is asked about once an hour.
-
-    Returns {"how": "scontrol" | "accounts" | None, "accounts": [...], "partitions": {name: {"access": bool,
-    "account": the -A to use or None, "why": text}}}."""
+def _access_facts() -> dict:
+    """Your Slurm accounts and default account, every account name, and the partitions' account rules (scontrol, where
+    users may run it); cached ACCESS_TTL_S per user, so sacctmgr (slurmdbd, not the controller) is asked once an hour."""
     user = getpass.getuser()
     path = HOME / f"slurm-access-{user}.json"
     cached = read_json(path, {}) or {}
-    if time.time() - cached.get("time", 0) < ACCESS_TTL_S and set(partitions) <= set(cached.get("partitions", {})):
+    if time.time() - cached.get("time", 0) < ACCESS_TTL_S and "accounts" in cached:
         return cached
-    mine = _slurm_lines(["sacctmgr", "-nP", "show", "assoc", f"user={user}", "format=account"]) \
-        if shutil.which("sacctmgr") else None
+    if not shutil.which("sacctmgr"):
+        return {"accounts": None}
+    mine = _slurm_lines(["sacctmgr", "-nP", "show", "assoc", f"user={user}", "format=account"])
     if mine is None:
-        return {"how": None, "accounts": [], "partitions": {}}
-    accounts = sorted({line.strip() for line in mine if line.strip()})
-    result: dict[str, dict] = {}
-    rules = _partition_rules()
-    if rules is not None:
-        how, groups = "scontrol", _unix_groups()
-        for name in partitions:
-            rule = rules.get(name) or {}
-            allow, deny, allow_groups = (rule.get(k) or ["ALL"] for k in ("AllowAccounts", "DenyAccounts", "AllowGroups"))
-            usable = [a for a in accounts if ("ALL" in allow or a in allow) and a not in deny]
-            in_group = "ALL" in allow_groups or bool(groups & set(allow_groups))
-            open_ = bool(usable) and in_group
-            needs = usable[0] if open_ and "ALL" not in allow else None
-            why = ("open" if open_ and not needs else f"with -A {needs}" if open_
-                   else f"only for groups {', '.join(allow_groups)}" if not in_group
-                   else f"only for accounts {', '.join(allow)}" if "ALL" not in allow else "your accounts are denied")
-            result[name] = {"access": open_, "account": needs, "why": why}
-    else:
-        how = "accounts"
-        every = _slurm_lines(["sacctmgr", "-nP", "show", "account", "format=account"]) or []
-        all_accounts = {line.strip() for line in every if line.strip()}
-        for name in partitions:
-            if name not in all_accounts:
-                result[name] = {"access": True, "account": None, "why": "open"}
-            elif name in accounts:
-                result[name] = {"access": True, "account": name, "why": f"with -A {name}"}
-            else:
-                result[name] = {"access": False, "account": None,
-                                "why": f"for account {name}, which you do not hold"}
-    access = {"time": time.time(), "how": how, "accounts": accounts, "partitions": result}
+        return {"accounts": None}
+    default = _slurm_lines(["sacctmgr", "-nP", "show", "user", user, "format=defaultaccount"]) or []
+    every = _slurm_lines(["sacctmgr", "-nP", "show", "account", "format=account"]) or []
+    facts = {"time": time.time(), "accounts": sorted({a.strip() for a in mine if a.strip()}),
+             "default": next((a.strip() for a in default if a.strip()), None),
+             "all_accounts": sorted({a.strip() for a in every if a.strip()}), "rules": _partition_rules()}
     try:
-        write_json(path, access)
+        write_json(path, facts)
     except OSError:
         pass
-    return access
+    return facts
+
+
+def _seen_access(queue: list[dict], accounts: list[str]) -> dict[str, dict]:
+    """What jobs showed about partitions and your accounts, newest first, from SEEN_TTL_S: a job running under one of
+    your accounts in a partition (anyone's job) shows that the partition admits that account; a job pending with
+    reason PartitionConfig shows that it does not. Newer evidence replaces older, and evidence expires, so a changed
+    rule is noticed. Only jobs that are in the queue anyway are read: nothing is submitted to find out."""
+    path = HOME / f"slurm-access-seen-{getpass.getuser()}.json"
+    seen = read_json(path, {}) or {}
+    now = time.time()
+    changed = False
+    for job in queue:
+        if job["account"] not in accounts or "," in job["partition"]:  # several partitions: which one refused?
+            continue
+        if job["state"] in ("RUNNING", "COMPLETING"):
+            ok = True
+        elif job["state"] == "PENDING" and job["reason"] == "PartitionConfig":
+            ok = False
+        else:
+            continue
+        key = f"{job['partition']}|{job['account']}"
+        if seen.get(key, {}).get("ok") != ok or now - seen.get(key, {}).get("at", 0) > 600:
+            seen[key] = {"ok": ok, "at": now, "job": job["slurm_id"]}
+            changed = True
+    fresh = {key: value for key, value in seen.items() if now - value["at"] < SEEN_TTL_S}
+    if changed or len(fresh) != len(seen):
+        try:
+            write_json(path, fresh)
+        except OSError:
+            pass
+    return fresh
+
+
+def partition_access(partitions: list[dict], queue: list[dict]) -> dict:
+    """Which partitions take your jobs, and with which account, per partition {"access", "account" (the -A to use, None
+    for your default account), "why", "source"}. Per partition and each of your accounts, the first that applies:
+
+    - "groups": the partition admits only certain Unix groups (sinfo), none of them yours: closed, exact;
+    - "seen": a job under that account ran in the partition, or stayed pending with PartitionConfig, within
+      SEEN_TTL_S: exact as of then;
+    - "scontrol": the partition's AllowAccounts / DenyAccounts, where users may run scontrol: exact;
+    - "names": a partition named after a Slurm account admits only that account. An assumption, true where every
+      private partition gets an account of its own name (e.g. workstations); the dashboard can ignore it;
+    - "default": nothing known: open.
+    """
+    facts = _access_facts()
+    accounts = facts.get("accounts")
+    groups = _unix_groups()
+    seen = _seen_access(queue, accounts or [])
+    result = {}
+    for part in partitions:
+        name = part["name"]
+        if part.get("groups") and not groups & set(part["groups"]):
+            result[name] = {"access": False, "account": None, "source": "groups",
+                            "why": f"only for groups {', '.join(part['groups'])}"}
+            continue
+        if not accounts:  # no sacctmgr: accounts unknown
+            result[name] = {"access": True, "account": None, "source": "default", "why": "open"}
+            continue
+        verdicts = {}  # account -> (admits, source, why)
+        rule = (facts.get("rules") or {}).get(name)
+        for account in accounts:
+            evidence = seen.get(f"{name}|{account}")
+            if evidence:
+                when = datetime.fromtimestamp(evidence["at"]).strftime("%d %b %H:%M")
+                verdicts[account] = (evidence["ok"], "seen", f"job {evidence['job']} with account {account} "
+                                     f"{'ran here' if evidence['ok'] else 'was refused (PartitionConfig)'} ({when})")
+            elif rule is not None:
+                allow, deny = rule["AllowAccounts"] or ["ALL"], rule["DenyAccounts"]
+                ok = ("ALL" in allow or account in allow) and account not in deny
+                verdicts[account] = (ok, "scontrol", f"accounts {', '.join(allow)}" if "ALL" not in allow
+                                     else "open" if ok else f"account {account} denied")
+            elif name in facts.get("all_accounts", []):
+                verdicts[account] = (account == name, "names", f"assumed for account {name} only (partition named "
+                                     "after the account)")
+            else:
+                verdicts[account] = (True, "default", "open")
+        usable = [a for a in accounts if verdicts[a][0]]
+        if usable:
+            account = None if facts.get("default") in usable else usable[0]
+            ok, source, why = verdicts[account or facts.get("default") or usable[0]]
+            result[name] = {"access": True, "account": account, "source": source,
+                            "why": f"with -A {account}: {why}" if account else why}
+        else:
+            # the weakest reason decides, so the dashboard can ignore a closed verdict that rests on an assumption
+            order = ("names", "scontrol", "seen", "groups")
+            source = min((verdicts[a][1] for a in accounts), key=lambda s: order.index(s) if s in order else 0)
+            why = next(verdicts[a][2] for a in accounts if verdicts[a][1] == source)
+            result[name] = {"access": False, "account": None, "source": source, "why": why}
+    return {"how": "scontrol" if facts.get("rules") else "accounts" if accounts else None,
+            "accounts": accounts or [], "partitions": result}
 
 
 def cluster() -> dict:
@@ -1870,7 +1938,8 @@ def cluster() -> dict:
     # Slurm's state: "ok", "missing" (no sinfo / squeue here), "error" (they failed) or "partial" (nodes, no jobs)
     status = "missing" if missing else "error" if slurm.get("error") else "partial" if slurm.get("warning") else "ok"
     message = slurm.get("error") or slurm.get("warning")
-    slurm = {"partitions": slurm.get("partitions") or [], "nodes": slurm.get("nodes") or []}
+    slurm = {"partitions": slurm.get("partitions") or [], "nodes": slurm.get("nodes") or [],
+             "queue": slurm.get("queue") or []}
     user = getpass.getuser()
     nodes = slurm["nodes"]
     for node in nodes:
@@ -1887,7 +1956,7 @@ def cluster() -> dict:
     here["local"] = True
     here["used"] = {key: usage[key] for key in ("cpus", "mem", "gpus")}
     # which partitions take your jobs; a node is usable if one of its partitions is
-    access = partition_access([p["name"] for p in slurm["partitions"]]) if slurm["partitions"] else {"how": None}
+    access = partition_access(slurm["partitions"], slurm.get("queue") or []) if slurm["partitions"] else {"how": None}
     rules = access.get("partitions") or {}
     for part in slurm["partitions"]:
         part.update(rules.get(part["name"]) or {"access": True, "account": None, "why": "unknown"})

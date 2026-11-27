@@ -1159,11 +1159,11 @@ SINFO = "\n".join([
 ])
 SQUEUE = "\n".join([
     "11|alice|main|RUNNING|1-00:00:00|2026-11-26T10:00:00|2026-11-27T10:00:00|gpu1|(null)|"
-    "cpu=8,mem=64G,node=1,billing=8,gres/gpu=2|None|train | big",
+    "cpu=8,mem=64G,node=1,billing=8,gres/gpu=2|None|lab|train | big",
     "12|me|main,long|RUNNING|4:00:00|2026-11-26T11:00:00|2026-11-26T15:00:00|gpu[1-2]|(null)|"
-    "cpu=16,mem=32G,node=2,gres/gpu=2|None|spread",
-    "13|bob|main|PENDING|40:00|2026-11-27T12:00:00|2026-11-27T12:40:00||gpu1|cpu=4,mem=24G,gres/gpu=1|Priority|next",
-    "14|bob|main|PENDING|40:00|N/A|N/A||(null)|cpu=4,mem=24G|Dependency|later",
+    "cpu=16,mem=32G,node=2,gres/gpu=2|None|lab|spread",
+    "13|bob|main|PENDING|40:00|2026-11-27T12:00:00|2026-11-27T12:40:00||gpu1|cpu=4,mem=24G,gres/gpu=1|Priority|lab|next",
+    "14|bob|main|PENDING|40:00|N/A|N/A||(null)|cpu=4,mem=24G|Dependency|lab|later",
 ])
 
 
@@ -1250,45 +1250,74 @@ def test_cluster_reports_a_slurm_controller_that_does_not_answer(tmp_path, monke
     assert {n["name"] for n in result["nodes"]} == {"gpu1", "gpu2", "ws"} and not (tmp_path / "cluster-cache.json").exists()
 
 
-def test_partition_access_from_scontrol_rules(tmp_path, monkeypatch):
-    monkeypatch.setattr(jobrun_module, "HOME", tmp_path)
-    monkeypatch.setattr(jobrun_module.getpass, "getuser", lambda: "me")
-    monkeypatch.setattr(jobrun_module, "_unix_groups", lambda: {"lab"})
-    fake_slurm(monkeypatch, {
-        "sacctmgr": "default\nproj\n",
-        "scontrol": "PartitionName=main AllowGroups=ALL AllowAccounts=ALL DenyAccounts=\n"
-                    "PartitionName=proj AllowGroups=ALL AllowAccounts=proj,other\n"
-                    "PartitionName=theirs AllowGroups=ALL AllowAccounts=theirs\n"
-                    "PartitionName=labonly AllowGroups=otherlab AllowAccounts=ALL\n"
-                    "PartitionName=denied AllowGroups=ALL AllowAccounts=ALL DenyAccounts=default,proj\n"})
-    access = jobrun_module.partition_access(["main", "proj", "theirs", "labonly", "denied"])["partitions"]
-    assert access["main"] == {"access": True, "account": None, "why": "open"}
-    assert access["proj"]["access"] and access["proj"]["account"] == "proj"
-    assert [access[p]["access"] for p in ("theirs", "labonly", "denied")] == [False, False, False]
-    assert "otherlab" in access["labonly"]["why"]
-
-
-def test_partition_access_from_account_names_without_scontrol(tmp_path, monkeypatch):
-    """scontrol disabled for users: a partition named after a Slurm account is that account's own."""
-    monkeypatch.setattr(jobrun_module, "HOME", tmp_path)
-    monkeypatch.setattr(jobrun_module.getpass, "getuser", lambda: "me")
-
+def access_slurm(monkeypatch, scontrol=None, mine="default\nproj\n", every="default\nproj\nws-other\nroot\n"):
+    """sacctmgr with your accounts (assoc), default account (user) and all accounts; scontrol with these partition
+    lines, or disabled as on clusters that keep it from users."""
     def run(cmd, **kwargs):
         if cmd[0] == "scontrol":
-            return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="scontrol has been disabled\n")
-        out = "default\nws-me\n" if any(a.startswith("user=") for a in cmd) else "default\nws-me\nws-other\nroot\n"
+            return subprocess.CompletedProcess(cmd, 0 if scontrol else 1, stdout=scontrol or "", stderr="disabled\n")
+        out = mine if "assoc" in cmd else "default\n" if "user" in cmd else every
         return subprocess.CompletedProcess(cmd, 0, stdout=out, stderr="")
     monkeypatch.setattr(jobrun_module.subprocess, "run", run)
     monkeypatch.setattr(jobrun_module.shutil, "which", lambda name: "/usr/bin/" + name)
-    result = jobrun_module.partition_access(["main", "ws-me", "ws-other"])
+
+
+def parts(*names, groups=None):
+    return [{"name": n, "groups": (groups or {}).get(n, [])} for n in names]
+
+
+def test_partition_access_from_groups_and_scontrol_rules(tmp_path, monkeypatch):
+    monkeypatch.setattr(jobrun_module, "HOME", tmp_path)
+    monkeypatch.setattr(jobrun_module.getpass, "getuser", lambda: "me")
+    monkeypatch.setattr(jobrun_module, "_unix_groups", lambda: {"lab"})
+    access_slurm(monkeypatch, scontrol="PartitionName=main AllowAccounts=ALL DenyAccounts=\n"
+                                       "PartitionName=proj AllowAccounts=proj,other\n"
+                                       "PartitionName=theirs AllowAccounts=theirs\n"
+                                       "PartitionName=denied AllowAccounts=ALL DenyAccounts=default,proj\n")
+    access = jobrun_module.partition_access(parts("main", "proj", "theirs", "denied", "labonly",
+                                                  groups={"labonly": ["otherlab"]}), [])["partitions"]
+    assert access["main"] == {"access": True, "account": None, "source": "scontrol", "why": "open"}
+    assert access["proj"]["access"] and access["proj"]["account"] == "proj"
+    assert [access[p]["access"] for p in ("theirs", "denied", "labonly")] == [False, False, False]
+    assert access["labonly"]["source"] == "groups" and "otherlab" in access["labonly"]["why"]
+
+
+def test_partition_access_assumes_account_partitions_without_scontrol(tmp_path, monkeypatch):
+    """scontrol disabled for users: a partition named after a Slurm account is assumed to be that account's own."""
+    monkeypatch.setattr(jobrun_module, "HOME", tmp_path)
+    monkeypatch.setattr(jobrun_module.getpass, "getuser", lambda: "me")
+    access_slurm(monkeypatch, mine="default\nproj\n")
+    result = jobrun_module.partition_access(parts("main", "proj", "ws-other"), [])
     access = result["partitions"]
-    assert result["how"] == "accounts" and result["accounts"] == ["default", "ws-me"]
-    assert access["main"]["access"] and access["main"]["account"] is None
-    assert access["ws-me"]["access"] and access["ws-me"]["account"] == "ws-me"
-    assert not access["ws-other"]["access"]
-    # cached for the next hour: no Slurm call needed
+    assert result["how"] == "accounts" and result["accounts"] == ["default", "proj"]
+    assert (access["main"]["access"], access["main"]["source"]) == (True, "default")
+    assert (access["proj"]["access"], access["proj"]["account"], access["proj"]["source"]) == (True, "proj", "names")
+    assert (access["ws-other"]["access"], access["ws-other"]["source"]) == (False, "names")
+    # sacctmgr is asked once an hour, not on every refresh
     monkeypatch.setattr(jobrun_module.subprocess, "run", lambda *a, **k: (_ for _ in ()).throw(AssertionError("called")))
-    assert jobrun_module.partition_access(["main", "ws-other"])["partitions"]["ws-other"]["access"] is False
+    assert jobrun_module.partition_access(parts("ws-other"), [])["partitions"]["ws-other"]["access"] is False
+
+
+def test_partition_access_follows_jobs_seen_in_the_queue(tmp_path, monkeypatch):
+    """A job running under one of your accounts opens a partition, one pending with PartitionConfig closes it; the
+    newest evidence wins and expires after SEEN_TTL_S, so a changed rule is noticed. Nothing is submitted."""
+    monkeypatch.setattr(jobrun_module, "HOME", tmp_path)
+    monkeypatch.setattr(jobrun_module.getpass, "getuser", lambda: "me")
+    access_slurm(monkeypatch, mine="default\nproj\n")
+    job = lambda partition, account, state, reason="None": {"slurm_id": "1", "partition": partition,
+                                                             "account": account, "state": state, "reason": reason}
+    queue = [job("ws-other", "proj", "RUNNING"),  # someone's job under an account you hold: open with -A proj
+             job("main", "default", "PENDING", "PartitionConfig"),  # refused: closed for your default account
+             job("main", "proj", "PENDING", "PartitionConfig"),
+             job("x,main", "default", "RUNNING"),  # several partitions: not evidence
+             job("proj", "lab", "RUNNING")]  # an account you do not hold: not evidence
+    access = jobrun_module.partition_access(parts("main", "ws-other"), queue)["partitions"]
+    assert (access["ws-other"]["access"], access["ws-other"]["account"], access["ws-other"]["source"]) == (True, "proj", "seen")
+    assert (access["main"]["access"], access["main"]["source"]) == (False, "seen")
+    # the refusal is remembered without the job, then expires
+    assert jobrun_module.partition_access(parts("main"), [])["partitions"]["main"]["access"] is False
+    monkeypatch.setattr(jobrun_module, "SEEN_TTL_S", 0)
+    assert jobrun_module.partition_access(parts("main"), [])["partitions"]["main"]["source"] == "default"
 
 
 def test_cluster_marks_nodes_without_access(tmp_path, monkeypatch):
@@ -1297,9 +1326,10 @@ def test_cluster_marks_nodes_without_access(tmp_path, monkeypatch):
     monkeypatch.setattr(jobrun_module.getpass, "getuser", lambda: "me")
     monkeypatch.setattr(jobrun_module, "_local_usage", lambda: {"cpus": 0.0, "mem": 0, "gpus": 0, "cpus_total": 16,
                                                                 "mem_total": 2 ** 36, "gpu_count": 0})
-    monkeypatch.setattr(jobrun_module, "partition_access", lambda names: {"how": "accounts", "accounts": ["default"], "partitions": {
-        "main": {"access": True, "account": None, "why": "open"}, "long": {"access": False, "account": None, "why": "x"},
-        "ws": {"access": True, "account": "ws", "why": "with -A ws"}}})
+    monkeypatch.setattr(jobrun_module, "partition_access", lambda partitions, queue: {"how": "accounts", "accounts": ["default"], "partitions": {
+        "main": {"access": True, "account": None, "why": "open", "source": "default"},
+        "long": {"access": False, "account": None, "why": "x", "source": "names"},
+        "ws": {"access": True, "account": "ws", "why": "with -A ws", "source": "names"}}})
     fake_slurm(monkeypatch, {"sinfo": SINFO, "squeue": SQUEUE})
     nodes = {n["name"]: n for n in jobrun_module.cluster()["nodes"]}
     assert nodes["gpu1"]["access"]  # main is open, though long is not

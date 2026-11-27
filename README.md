@@ -374,8 +374,10 @@ by partition, with the CPU cores, RAM and GPUs allocated of the total and a traf
   their expected start. Your own jobs are blue.
 - Nodes whose partitions do not admit your Slurm accounts or groups show a lock in their load color, so you still see
   how busy they are (`jobboard.clusterShowNoAccess` hides them); a partition that needs a specific account shows the
-  `-A` to use. If the guess is wrong for a partition,
-  set it in `jobboard.clusterPartitionAccess`.
+  `-A` to use. Access comes from the partitions' allowed groups, from jobs seen running or refused there in the last
+  7 days, from `scontrol` where users may run it, and else from an assumption: a partition named after a Slurm account
+  admits only that account (`jobboard.clusterAssumeAccountPartitions`). Nothing is submitted to find out; correct a
+  partition in `jobboard.clusterPartitionAccess`.
 - The title bar has a filter (node, job or user name, GPU model, partition), the choice between CPU/RAM/GPU rows and
   the job list of the screenshot (`jobboard.clusterNodeDetails`), the grouping and the rule for a node's light.
 - It is light on the Slurm controller: one `sinfo` and one `squeue` per refresh, shared by all windows for 10 s, every
@@ -420,6 +422,7 @@ The **VS Code settings** (search for "Job Board") cover the dashboard:
 | `clusterGroupBy` | sharedPartitions | `sharedPartitions`, `partitions`, `gpuType` or `none` (see [Cluster](#cluster)) |
 | `clusterIcon` | worst | What a node's icon color shows: `worst`, `best`, `gpu`, `cpu` or `ram` |
 | `clusterShowNoAccess` · `clusterPartitionAccess` | on · {} | Show nodes you cannot use (with a lock); per-partition corrections, e.g. `{"gpu": true}` |
+| `clusterAssumeAccountPartitions` | on | Where nothing better is known, a partition named after a Slurm account admits only that account |
 | `updateWhileUnfocused` | off | Keep redrawing while VS Code is not focused (e.g. on a second monitor) |
 | `command` · `registry` | | Path to `jobrun`; registry folder (`JOBRUN_HOME`) |
 

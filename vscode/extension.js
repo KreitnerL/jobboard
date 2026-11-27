@@ -1192,10 +1192,14 @@ class ClusterProvider {
   // is usable if one of its partitions is (this machine outside Slurm always is).
   applyAccess() {
     const overrides = config().get('clusterPartitionAccess') || {};
+    // jobrun's verdicts that rest on the naming assumption (source "names") count as unknown, i.e. open, when it is off
+    const assume = config().get('clusterAssumeAccountPartitions') !== false;
     const byName = new Map((this.data.partitions || []).map(p => [p.name, p]));
     for (const p of byName.values()) {
-      p.usable = typeof overrides[p.name] === 'boolean' ? overrides[p.name] : p.access !== false;
+      const ignored = p.source === 'names' && !assume;
       p.overridden = typeof overrides[p.name] === 'boolean';
+      p.usable = p.overridden ? overrides[p.name] : ignored || p.access !== false;
+      if (ignored) p.account = null;
     }
     for (const node of this.data.nodes || []) {
       const parts = node.partitions.map(name => byName.get(name)).filter(Boolean);
@@ -1528,7 +1532,7 @@ function activate(context) {
       provider.refresh(true);
       if (event.affectsConfiguration('jobboard.resourcesNodeDetails')) resources.emitter.fire();  // redraw, no new measurement
       else resources.refresh();
-      if (['clusterGroupBy', 'clusterIcon', 'clusterNodeDetails', 'clusterShowNoAccess', 'clusterPartitionAccess'].some(key => event.affectsConfiguration(`jobboard.${key}`))) {
+      if (['clusterGroupBy', 'clusterIcon', 'clusterNodeDetails', 'clusterShowNoAccess', 'clusterPartitionAccess', 'clusterAssumeAccountPartitions'].some(key => event.affectsConfiguration(`jobboard.${key}`))) {
         cluster.emitter.fire();  // regroup and recolor what is shown, no new Slurm query
       } else if (cluster.visible() && cluster.auto()) cluster.refresh();
     }),
